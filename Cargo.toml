@@ -1,0 +1,25 @@
+[package]
+name = "poa-consensus"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Partial Order Alignment with consensus CLI and Rust library"
+license = "MIT"
+
+[lib]
+name = "poa_consensus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "poa-consensus"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["dep:clap", "dep:needletail"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+needletail = { version = "0.5", optional = true }
+
+[dev-dependencies]
