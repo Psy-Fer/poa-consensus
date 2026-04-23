@@ -1,4 +1,4 @@
-use crate::config::{AlignmentMode, PoaConfig};
+use crate::config::PoaConfig;
 use crate::error::PoaError;
 use crate::types::{Consensus, GraphStats};
 
@@ -18,6 +18,103 @@ fn safe_add(a: i32, b: i32) -> i32 {
 
 /// Sentinel topo index meaning "came from the virtual start node".
 const VIRTUAL: usize = usize::MAX;
+
+// ─── Band helpers ─────────────────────────────────────────────────────────────
+
+/// Returned by `compute_effective_band` to mean "no band restriction".
+const UNBANDED: usize = usize::MAX;
+
+fn compute_effective_band(cfg: &PoaConfig, read_len: usize) -> usize {
+    if cfg.adaptive_band {
+        let w = cfg.adaptive_band_b + (cfg.adaptive_band_f * read_len as f32).ceil() as usize;
+        let w = if cfg.band_width > 0 {
+            w.max(cfg.band_width)
+        } else {
+            w
+        };
+        w.max(1)
+    } else if cfg.band_width > 0 {
+        cfg.band_width
+    } else {
+        UNBANDED
+    }
+}
+
+/// Lowest j>=1 reachable from topo position `t` within band `w`.
+/// The j=0 column is handled separately, gated via `in_band_at`.
+#[inline]
+fn j_lo_at(t: usize, w: usize) -> usize {
+    if w == UNBANDED {
+        1
+    } else {
+        t.saturating_sub(w).max(1)
+    }
+}
+
+/// Highest j reachable from topo position `t` within band `w`.
+#[inline]
+fn j_hi_at(t: usize, w: usize, l: usize) -> usize {
+    if w == UNBANDED { l } else { (t + w).min(l) }
+}
+
+/// True if cell (t, j) is within the diagonal band.
+/// j=0 is in-band only when `t <= w` (i.e. `t.saturating_sub(w) == 0`).
+#[inline]
+fn in_band_at(t: usize, j: usize, w: usize, l: usize) -> bool {
+    if w == UNBANDED {
+        return true;
+    }
+    j >= t.saturating_sub(w) && j <= (t + w).min(l)
+}
+
+/// Cells per row in band-indexed storage.
+/// Unbanded: l+1 (direct j indexing). Banded: 2*w+2 (index 0 = j=0, index k>=1 = j=j_lo+k-1).
+#[inline]
+fn row_stride_for(w: usize, l: usize) -> usize {
+    if w == UNBANDED { l + 1 } else { 2 * w + 2 }
+}
+
+/// Local column index within a band-indexed row.
+/// Unbanded: returns `j` directly. Banded: j=0 -> 0, j>=1 -> 1 + (j - j_lo_at(t, w)).
+#[inline]
+fn local_j(t: usize, j: usize, w: usize) -> usize {
+    if w == UNBANDED {
+        j
+    } else if j == 0 {
+        0
+    } else {
+        j - j_lo_at(t, w) + 1
+    }
+}
+
+/// DP table backed by a flat Vec with band-indexed row layout.
+struct DpTable {
+    data: Vec<Cell>,
+    rs: usize,
+    w: usize,
+}
+
+impl DpTable {
+    fn new(n: usize, w: usize, l: usize) -> Self {
+        let rs = row_stride_for(w, l);
+        DpTable {
+            data: vec![Cell::unset(); n * rs],
+            rs,
+            w,
+        }
+    }
+
+    #[inline]
+    fn get(&self, t: usize, j: usize) -> Cell {
+        self.data[t * self.rs + local_j(t, j, self.w)]
+    }
+
+    #[inline]
+    fn set(&mut self, t: usize, j: usize, cell: Cell) {
+        let idx = t * self.rs + local_j(t, j, self.w);
+        self.data[idx] = cell;
+    }
+}
 
 // ─── Graph types ─────────────────────────────────────────────────────────────
 
@@ -130,46 +227,35 @@ fn topological_order(nodes: &[Node]) -> (Vec<usize>, Vec<usize>) {
 
 // ─── DP alignment ────────────────────────────────────────────────────────────
 
-/// Align `query` into the graph. Returns alignment ops in forward order.
+/// Align `query` into the graph using band width `w` (`UNBANDED` = full NW).
+/// Returns alignment ops in forward order, or `Err(BandTooNarrow)` when the
+/// traceback path reaches the band edge (alignment result would be incorrect).
 fn align(
     nodes: &[Node],
     topo: &[usize],
     rank_of: &[usize],
     query: &[u8],
     cfg: &PoaConfig,
-) -> Vec<AlignOp> {
+    w: usize,
+) -> Result<Vec<AlignOp>, PoaError> {
     let n = topo.len();
     let l = query.len();
 
     let go = cfg.gap_open; // negative
     let ge = cfg.gap_extend; // negative
 
-    // Three tables: M, I, D, each [n][l+1].
-    let mut m: Vec<Vec<Cell>> = vec![vec![Cell::unset(); l + 1]; n];
-    let mut ins: Vec<Vec<Cell>> = vec![vec![Cell::unset(); l + 1]; n];
-    let mut del: Vec<Vec<Cell>> = vec![vec![Cell::unset(); l + 1]; n];
+    let mut m = DpTable::new(n, w, l);
+    let mut ins = DpTable::new(n, w, l);
+    let mut del = DpTable::new(n, w, l);
 
-    // ── Initialisation ────────────────────────────────────────────────────────
-    // Virtual start: m[*][0] for source nodes represents the free start.
-    // We seed m[source][0] = 0 directly in the main loop via the VIRTUAL sentinel.
-    //
-    // j-axis: inserting query[0..j] before any graph node.
-    // These cells live at t=0 but conceptually in the I table.
-    // They are only reachable from source nodes.
-    //
-    // D-axis at j=0: skipping graph nodes without consuming query bases.
-
-    // ── Main loop ─────────────────────────────────────────────────────────────
-    for t in 0..n {
-        let node_idx = topo[t];
+    for (t, &node_idx) in topo.iter().enumerate() {
         let node_base = nodes[node_idx].base;
         let is_source = nodes[node_idx].in_edges.is_empty();
 
-        // ── j = 0: deletions only (gap in query at this column) ───────────────
-        {
+        // ── j = 0: del only; in-band when t <= w ──────────────────────────────
+        if in_band_at(t, 0, w, l) {
             let (mut best, mut best_pred) = (UNSET, 0usize);
             if is_source {
-                // Virtual start at j=0 for source: cost of opening a deletion here.
                 let val = go + ge;
                 if val > best {
                     best = val;
@@ -178,29 +264,33 @@ fn align(
             }
             for &p in &nodes[node_idx].in_edges {
                 let p_t = rank_of[p];
-                // Extend deletion from M predecessor
-                let vm = safe_add(m[p_t][0].score, go + ge);
+                let vm = safe_add(m.get(p_t, 0).score, go + ge);
                 if vm > best {
                     best = vm;
                     best_pred = p_t;
                 }
-                // Extend deletion from D predecessor
-                let vd = safe_add(del[p_t][0].score, ge);
+                let vd = safe_add(del.get(p_t, 0).score, ge);
                 if vd > best {
                     best = vd;
                     best_pred = p_t;
                 }
             }
             if best != UNSET {
-                del[t][0] = Cell {
-                    score: best,
-                    pred_t: best_pred,
-                };
+                del.set(
+                    t,
+                    0,
+                    Cell {
+                        score: best,
+                        pred_t: best_pred,
+                    },
+                );
             }
         }
 
-        // ── j = 1..=l ─────────────────────────────────────────────────────────
-        for j in 1..=l {
+        // ── j = j_lo..=j_hi ───────────────────────────────────────────────────
+        let j_lo = j_lo_at(t, w);
+        let j_hi = j_hi_at(t, w, l);
+        for j in j_lo..=j_hi {
             let q_base = query[j - 1];
             let score_fn = if node_base == q_base {
                 cfg.match_score
@@ -208,12 +298,10 @@ fn align(
                 cfg.mismatch_score
             };
 
-            // ── M[t][j]: align query[j-1] to node at topo[t] ─────────────────
+            // M[t][j] ─────────────────────────────────────────────────────────
             {
                 let (mut best, mut best_pred) = (UNSET, VIRTUAL);
-
                 if is_source && j == 1 {
-                    // Virtual predecessor at (VIRTUAL, 0): score = 0.
                     let val = score_fn;
                     if val > best {
                         best = val;
@@ -221,9 +309,6 @@ fn align(
                     }
                 }
                 if is_source && j > 1 {
-                    // Must have consumed j-1 insertions to reach here from the virtual start.
-                    // Cost: (j-1) insertions = gap_open + (j-1)*gap_extend (the I table
-                    // at position j-1 for this source node, which we compute inline).
                     let val = safe_add(go + (j as i32 - 1) * ge, score_fn);
                     if val > best {
                         best = val;
@@ -232,74 +317,74 @@ fn align(
                 }
                 for &p in &nodes[node_idx].in_edges {
                     let p_t = rank_of[p];
-                    // From M
-                    let vm = safe_add(m[p_t][j - 1].score, score_fn);
-                    if vm > best {
-                        best = vm;
-                        best_pred = p_t;
-                    }
-                    // From I
-                    let vi = safe_add(ins[p_t][j - 1].score, score_fn);
-                    if vi > best {
-                        best = vi;
-                        best_pred = p_t;
-                    }
-                    // From D
-                    let vd = safe_add(del[p_t][j - 1].score, score_fn);
-                    if vd > best {
-                        best = vd;
-                        best_pred = p_t;
+                    if in_band_at(p_t, j - 1, w, l) {
+                        let vm = safe_add(m.get(p_t, j - 1).score, score_fn);
+                        if vm > best {
+                            best = vm;
+                            best_pred = p_t;
+                        }
+                        let vi = safe_add(ins.get(p_t, j - 1).score, score_fn);
+                        if vi > best {
+                            best = vi;
+                            best_pred = p_t;
+                        }
+                        let vd = safe_add(del.get(p_t, j - 1).score, score_fn);
+                        if vd > best {
+                            best = vd;
+                            best_pred = p_t;
+                        }
                     }
                 }
                 if best != UNSET {
-                    m[t][j] = Cell {
-                        score: best,
-                        pred_t: best_pred,
-                    };
+                    m.set(
+                        t,
+                        j,
+                        Cell {
+                            score: best,
+                            pred_t: best_pred,
+                        },
+                    );
                 }
             }
 
-            // ── I[t][j]: insert query[j-1] (gap in graph at this query position) ──
-            // Insertions stay at the same topo position t.
+            // I[t][j] ─────────────────────────────────────────────────────────
             {
                 let (mut best, mut best_pred) = (UNSET, VIRTUAL);
-
                 if is_source && j == 1 {
-                    // Open insertion from virtual start.
                     let val = go + ge;
                     if val > best {
                         best = val;
                         best_pred = VIRTUAL;
                     }
                 }
-
-                // Open from M[t][j-1]
-                let vm = safe_add(m[t][j - 1].score, go + ge);
-                if vm > best {
-                    best = vm;
-                    best_pred = t;
+                if in_band_at(t, j - 1, w, l) {
+                    let vm = safe_add(m.get(t, j - 1).score, go + ge);
+                    if vm > best {
+                        best = vm;
+                        best_pred = t;
+                    }
+                    let vi = safe_add(ins.get(t, j - 1).score, ge);
+                    if vi > best {
+                        best = vi;
+                        best_pred = t;
+                    }
                 }
-                // Extend from I[t][j-1]
-                let vi = safe_add(ins[t][j - 1].score, ge);
-                if vi > best {
-                    best = vi;
-                    best_pred = t;
-                }
-
                 if best != UNSET {
-                    ins[t][j] = Cell {
-                        score: best,
-                        pred_t: best_pred,
-                    };
+                    ins.set(
+                        t,
+                        j,
+                        Cell {
+                            score: best,
+                            pred_t: best_pred,
+                        },
+                    );
                 }
             }
 
-            // ── D[t][j]: delete graph node (gap in read at this graph node) ──
+            // D[t][j] ─────────────────────────────────────────────────────────
             {
                 let (mut best, mut best_pred) = (UNSET, 0usize);
-
                 if is_source {
-                    // Open deletion from virtual start at this j.
                     let val = go + ge;
                     if val > best {
                         best = val;
@@ -308,77 +393,68 @@ fn align(
                 }
                 for &p in &nodes[node_idx].in_edges {
                     let p_t = rank_of[p];
-                    // Open deletion from M
-                    let vm = safe_add(m[p_t][j].score, go + ge);
-                    if vm > best {
-                        best = vm;
-                        best_pred = p_t;
-                    }
-                    // Open deletion from I
-                    let vi = safe_add(ins[p_t][j].score, go + ge);
-                    if vi > best {
-                        best = vi;
-                        best_pred = p_t;
-                    }
-                    // Extend deletion from D
-                    let vd = safe_add(del[p_t][j].score, ge);
-                    if vd > best {
-                        best = vd;
-                        best_pred = p_t;
+                    if in_band_at(p_t, j, w, l) {
+                        let vm = safe_add(m.get(p_t, j).score, go + ge);
+                        if vm > best {
+                            best = vm;
+                            best_pred = p_t;
+                        }
+                        let vi = safe_add(ins.get(p_t, j).score, go + ge);
+                        if vi > best {
+                            best = vi;
+                            best_pred = p_t;
+                        }
+                        let vd = safe_add(del.get(p_t, j).score, ge);
+                        if vd > best {
+                            best = vd;
+                            best_pred = p_t;
+                        }
                     }
                 }
                 if best != UNSET {
-                    del[t][j] = Cell {
-                        score: best,
-                        pred_t: best_pred,
-                    };
+                    del.set(
+                        t,
+                        j,
+                        Cell {
+                            score: best,
+                            pred_t: best_pred,
+                        },
+                    );
                 }
             }
         }
     }
 
-    // ── Find best terminal cell ───────────────────────────────────────────────
-    let best_t;
-    let best_state;
+    // ── Find best terminal cell at column l ───────────────────────────────────
+    // Both Global and SemiGlobal scan all topo positions at column l.
+    // (SemiGlobal free-end-gaps are achieved by not penalising leading/trailing
+    // graph nodes that are skipped; the DP initialisation handles free start and
+    // this terminal scan handles free end.)
+    // When every topo position has j=l outside its band, the alignment cannot
+    // complete — the band is definitively too narrow.
+    let terminal_best = (0..n)
+        .filter(|&t| in_band_at(t, l, w, l))
+        .flat_map(|t| {
+            [
+                (t, State::M, m.get(t, l).score),
+                (t, State::I, ins.get(t, l).score),
+                (t, State::D, del.get(t, l).score),
+            ]
+        })
+        .filter(|&(_, _, sc)| sc != UNSET)
+        .max_by_key(|&(_, _, sc)| sc)
+        .map(|(t, s, _)| (t, s));
 
-    match cfg.alignment_mode {
-        AlignmentMode::Global => {
-            // Terminal: any topo position at column l.
-            let (bt, bs, _) = (0..n)
-                .flat_map(|t| {
-                    [
-                        (t, State::M, m[t][l].score),
-                        (t, State::I, ins[t][l].score),
-                        (t, State::D, del[t][l].score),
-                    ]
-                })
-                .filter(|&(_, _, sc)| sc != UNSET)
-                .max_by_key(|&(_, _, sc)| sc)
-                .unwrap_or((0, State::M, UNSET));
-            best_t = bt;
-            best_state = bs;
+    let (best_t, best_state) = match terminal_best {
+        Some(result) => result,
+        None if w != UNBANDED && l > 0 => {
+            return Err(PoaError::BandTooNarrow {
+                band_width: w,
+                read_len: l,
+            });
         }
-        AlignmentMode::SemiGlobal => {
-            // Free terminal deletions: find best score at column l ignoring trailing
-            // graph nodes (we may end anywhere in the graph).
-            // Also free leading deletions: initialise source nodes at cost 0.
-            // Here we treat it as: best cell at query column l in any state.
-            // (Free-end-gap for the graph axis, full query must be consumed.)
-            let (bt, bs, _) = (0..n)
-                .flat_map(|t| {
-                    [
-                        (t, State::M, m[t][l].score),
-                        (t, State::I, ins[t][l].score),
-                        (t, State::D, del[t][l].score),
-                    ]
-                })
-                .filter(|&(_, _, sc)| sc != UNSET)
-                .max_by_key(|&(_, _, sc)| sc)
-                .unwrap_or((0, State::M, UNSET));
-            best_t = bt;
-            best_state = bs;
-        }
-    }
+        None => (0, State::M),
+    };
 
     // ── Traceback ─────────────────────────────────────────────────────────────
     let mut ops: Vec<AlignOp> = Vec::with_capacity(l + n / 4);
@@ -388,9 +464,9 @@ fn align(
 
     loop {
         let cell = match cur_state {
-            State::M => m[t][j],
-            State::I => ins[t][j],
-            State::D => del[t][j],
+            State::M => m.get(t, j),
+            State::I => ins.get(t, j),
+            State::D => del.get(t, j),
         };
 
         if cell.score == UNSET {
@@ -401,7 +477,6 @@ fn align(
             State::M => {
                 ops.push(AlignOp::Match(topo[t]));
                 if cell.pred_t == VIRTUAL {
-                    // Emit remaining insertions before the first graph node.
                     for k in (1..j).rev() {
                         ops.push(AlignOp::Insert(query[k - 1]));
                     }
@@ -409,23 +484,18 @@ fn align(
                 }
                 t = cell.pred_t;
                 j -= 1;
-                // Determine which state we came from by comparing which table has
-                // the higher score at the predecessor cell.
                 cur_state = best_prev_state(&m, &ins, &del, t, j);
             }
             State::I => {
                 ops.push(AlignOp::Insert(query[j - 1]));
                 j -= 1;
                 if cell.pred_t == VIRTUAL {
-                    // Virtual start reached; j might still be > 0 if we arrived here
-                    // from inline source initialisation — emit any remaining insertions.
                     for k in (1..j).rev() {
                         ops.push(AlignOp::Insert(query[k - 1]));
                     }
                     break;
                 }
-                // Insertion stays at the same t; check whether we came from M or I.
-                cur_state = if m[t][j].score >= ins[t][j].score {
+                cur_state = if m.get(t, j).score >= ins.get(t, j).score {
                     State::M
                 } else {
                     State::I
@@ -437,7 +507,6 @@ fn align(
                     break;
                 }
                 t = cell.pred_t;
-                // j does not change for a deletion.
                 cur_state = best_prev_state(&m, &ins, &del, t, j);
             }
         }
@@ -448,21 +517,15 @@ fn align(
     }
 
     ops.reverse();
-    ops
+
+    Ok(ops)
 }
 
-/// After a Match or Delete step, pick which state at (t, j) we came from.
 #[inline]
-fn best_prev_state(
-    m: &[Vec<Cell>],
-    ins: &[Vec<Cell>],
-    del: &[Vec<Cell>],
-    t: usize,
-    j: usize,
-) -> State {
-    let sm = m[t][j].score;
-    let si = ins[t][j].score;
-    let sd = del[t][j].score;
+fn best_prev_state(m: &DpTable, ins: &DpTable, del: &DpTable, t: usize, j: usize) -> State {
+    let sm = m.get(t, j).score;
+    let si = ins.get(t, j).score;
+    let sd = del.get(t, j).score;
     if sm != UNSET && sm >= si && sm >= sd {
         State::M
     } else if si != UNSET && si >= sd {
@@ -666,7 +729,9 @@ impl PoaGraph {
             return Err(PoaError::EmptyInput);
         }
 
-        if self.config.warn_on_long_unbanded && self.config.band_width == 0 && read.len() > 1000 {
+        let w = compute_effective_band(&self.config, read.len());
+
+        if self.config.warn_on_long_unbanded && w == UNBANDED && read.len() > 1000 {
             eprintln!(
                 "poa-consensus: warning: read length {} bp with band_width=0 (unbanded). \
                  Memory usage is O(n*m). Consider setting band_width or adaptive_band=true. \
@@ -676,7 +741,7 @@ impl PoaGraph {
         }
 
         let (topo, rank_of) = topological_order(&self.nodes);
-        let ops = align(&self.nodes, &topo, &rank_of, read, &self.config);
+        let ops = align(&self.nodes, &topo, &rank_of, read, &self.config, w)?;
         add_to_graph(&mut self.nodes, read, &ops);
         self.n_reads += 1;
         Ok(())
