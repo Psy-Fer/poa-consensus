@@ -170,3 +170,18 @@
 //!   length variation.
 //! - Setting `gap_open = 0` recovers linear gap behaviour where only
 //!   `gap_extend` matters.
+
+pub mod config;
+pub mod error;
+pub mod graph;
+pub mod orient;
+pub mod types;
+
+#[cfg(test)]
+mod tests;
+
+pub use config::{AlignmentMode, ConsensusMode, PoaConfig};
+pub use error::PoaError;
+pub use graph::PoaGraph;
+pub use orient::{auto_orient, orient_to_seed, reverse_complement};
+pub use types::{Consensus, GraphStats, Strand};
