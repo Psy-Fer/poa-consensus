@@ -409,6 +409,91 @@ fn diag_sca8_real_sequences_with_flank() {
     );
 }
 
+// ── Banded DP ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn banded_matches_unbanded_small() {
+    // Banded and unbanded must produce identical results when the band is wide
+    // enough to cover the optimal path.
+    let reads = vec![
+        b("CAGCAGCAGCAGCAG"),
+        b("CAGCAGCAGCAGCAG"),
+        b("CAGCAGCAGCAGCAGCAG"),
+        b("CAGCAGCAGCAGCAG"),
+    ];
+    let unbanded = consensus(&reads, 0);
+    let cfg_banded = PoaConfig {
+        band_width: 50,
+        ..Default::default()
+    };
+    let banded = consensus_cfg(&reads, 0, cfg_banded);
+    assert_eq!(unbanded, banded, "banded vs unbanded mismatch");
+}
+
+#[test]
+fn adaptive_band_matches_unbanded() {
+    let reads = vec![
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCATCAT"),
+        b("CATCATCAT"),
+    ];
+    let unbanded = consensus(&reads, 0);
+    let cfg = PoaConfig {
+        adaptive_band: true,
+        adaptive_band_b: 5,
+        adaptive_band_f: 0.1,
+        ..Default::default()
+    };
+    let adaptive = consensus_cfg(&reads, 0, cfg);
+    assert_eq!(unbanded, adaptive, "adaptive band vs unbanded mismatch");
+}
+
+#[test]
+fn band_too_narrow_returns_error() {
+    // seed = 1 A, read = 10 A's: the read is 10 bp but the 1-node graph with
+    // band_width=2 can only reach j_hi=min(10, 0+2)=2 at t=0. Column j=10 is
+    // never in-band, so the terminal scan finds no cells and BandTooNarrow fires.
+    let seed = b("A");
+    let read = b("AAAAAAAAAA");
+    let cfg = PoaConfig {
+        band_width: 2,
+        ..Default::default()
+    };
+    let mut graph = PoaGraph::new(&seed, cfg).unwrap();
+    let result = graph.add_read(&read);
+    assert!(
+        matches!(result, Err(PoaError::BandTooNarrow { .. })),
+        "expected BandTooNarrow, got {:?}",
+        result.map(|_| ())
+    );
+}
+
+#[test]
+fn large_length_variance_banded() {
+    // 3 reads of 15 bp majority + 1 read of 60 bp outlier.
+    // Band must be wide enough to cover the 45-base insertion from the outlier.
+    // With band_width=50 the banded result should match unbanded.
+    let maj = b("CAGCAGCAGCAGCAG");
+    let outlier = b("CAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAG");
+    let reads = vec![maj.clone(), maj.clone(), maj.clone(), outlier];
+    let unbanded = consensus(&reads, 0);
+    let cfg = PoaConfig {
+        band_width: 50,
+        ..Default::default()
+    };
+    let banded = consensus_cfg(&reads, 0, cfg);
+    assert_eq!(
+        banded.len(),
+        unbanded.len(),
+        "banded length mismatch with large variance"
+    );
+    assert_eq!(
+        banded, unbanded,
+        "banded result mismatch with large variance"
+    );
+}
+
 // ── Semi-global alignment ─────────────────────────────────────────────────────
 
 #[test]
