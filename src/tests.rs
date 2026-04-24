@@ -1,6 +1,4 @@
-use crate::{
-    self as poa_consensus, AlignmentMode, ConsensusMode, PoaConfig, PoaError, PoaGraph,
-};
+use crate::{self as poa_consensus, AlignmentMode, ConsensusMode, PoaConfig, PoaError, PoaGraph};
 
 fn b(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
@@ -1121,14 +1119,20 @@ fn fn_consensus_empty_input() {
 fn fn_consensus_seed_out_of_bounds() {
     let reads: Vec<&[u8]> = vec![b"ACGT", b"ACGT"];
     let result = poa_consensus::consensus(&reads, 5, &PoaConfig::default());
-    assert!(matches!(result, Err(PoaError::SeedOutOfBounds { index: 5, len: 2 })));
+    assert!(matches!(
+        result,
+        Err(PoaError::SeedOutOfBounds { index: 5, len: 2 })
+    ));
 }
 
 #[test]
 fn fn_consensus_config_respected() {
     // min_reads=5 with only 3 reads → InsufficientDepth
     let reads: Vec<&[u8]> = vec![b"CATCATCAT", b"CATCATCAT", b"CATCATCAT"];
-    let cfg = PoaConfig { min_reads: 5, ..Default::default() };
+    let cfg = PoaConfig {
+        min_reads: 5,
+        ..Default::default()
+    };
     let result = poa_consensus::consensus(&reads, 0, &cfg);
     assert!(matches!(result, Err(PoaError::InsufficientDepth { .. })));
 }
@@ -1137,7 +1141,9 @@ fn fn_consensus_config_respected() {
 fn fn_consensus_multi_two_alleles() {
     let allele_a: &[u8] = b"CATCATCAT";
     let allele_b: &[u8] = b"CATCGTCAT";
-    let reads: Vec<&[u8]> = vec![allele_a, allele_a, allele_a, allele_a, allele_b, allele_b, allele_b, allele_b];
+    let reads: Vec<&[u8]> = vec![
+        allele_a, allele_a, allele_a, allele_a, allele_b, allele_b, allele_b, allele_b,
+    ];
     let results = poa_consensus::consensus_multi(&reads, 0, &PoaConfig::default()).unwrap();
     assert_eq!(results.len(), 2, "expected 2 alleles");
 }
@@ -1152,7 +1158,10 @@ fn fn_consensus_multi_empty_input() {
 fn fn_consensus_multi_seed_out_of_bounds() {
     let reads: Vec<&[u8]> = vec![b"ACGT", b"ACGT"];
     let result = poa_consensus::consensus_multi(&reads, 99, &PoaConfig::default());
-    assert!(matches!(result, Err(PoaError::SeedOutOfBounds { index: 99, len: 2 })));
+    assert!(matches!(
+        result,
+        Err(PoaError::SeedOutOfBounds { index: 99, len: 2 })
+    ));
 }
 
 // ── Two-pass adaptive mode ─────────────────────────────────────────────────────
@@ -1184,28 +1193,36 @@ fn adaptive_noisy_tightens_coverage() {
     // 4 correct reads + 4 reads each with a unique error → singleton fraction high.
     // Adaptive mode should tighten coverage and return a single clean consensus.
     let correct: Vec<u8> = b("CATCATCATCATCAT");
-    let mut r1 = correct.clone(); r1[0]  = b'G';
-    let mut r2 = correct.clone(); r2[3]  = b'G';
-    let mut r3 = correct.clone(); r3[6]  = b'G';
-    let mut r4 = correct.clone(); r4[9]  = b'G';
-    let reads: Vec<&[u8]> = vec![
-        &correct, &correct, &correct, &correct,
-        &r1, &r2, &r3, &r4,
-    ];
+    let mut r1 = correct.clone();
+    r1[0] = b'G';
+    let mut r2 = correct.clone();
+    r2[3] = b'G';
+    let mut r3 = correct.clone();
+    r3[6] = b'G';
+    let mut r4 = correct.clone();
+    r4[9] = b'G';
+    let reads: Vec<&[u8]> = vec![&correct, &correct, &correct, &correct, &r1, &r2, &r3, &r4];
     let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].sequence, correct, "noisy reads should be filtered");
+    assert_eq!(
+        results[0].sequence, correct,
+        "noisy reads should be filtered"
+    );
 }
 
 #[test]
 fn adaptive_partial_reads_switches_semi_global() {
     // Seed extends well beyond several partial reads → high coverage CV.
     // Adaptive mode should switch to semi-global and return a correct consensus.
-    let full: Vec<u8>    = b("GGGCATCATCATCATAAA");
+    let full: Vec<u8> = b("GGGCATCATCATCATAAA");
     let partial: Vec<u8> = b("CATCATCAT");
     let reads: Vec<&[u8]> = vec![
-        full.as_slice(), full.as_slice(), full.as_slice(),
-        partial.as_slice(), partial.as_slice(), partial.as_slice(),
+        full.as_slice(),
+        full.as_slice(),
+        full.as_slice(),
+        partial.as_slice(),
+        partial.as_slice(),
+        partial.as_slice(),
     ];
     // Just verify it completes without error and returns a single result.
     let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
@@ -1222,5 +1239,65 @@ fn adaptive_empty_input() {
 fn adaptive_seed_out_of_bounds() {
     let reads: Vec<&[u8]> = vec![b"ACGT", b"ACGT"];
     let result = poa_consensus::consensus_adaptive(&reads, 9, &PoaConfig::default());
-    assert!(matches!(result, Err(PoaError::SeedOutOfBounds { index: 9, len: 2 })));
+    assert!(matches!(
+        result,
+        Err(PoaError::SeedOutOfBounds { index: 9, len: 2 })
+    ));
+}
+
+// ── Remaining TODO tests ───────────────────────────────────────────────────────
+
+#[test]
+fn reads_too_long_unbanded() {
+    // A read > 1000 bp with band_width=0 should increment the warning counter.
+    let long: Vec<u8> = b"A".repeat(1001);
+    let cfg = PoaConfig {
+        warn_on_long_unbanded: true,
+        band_width: 0,
+        adaptive_band: false,
+        ..Default::default()
+    };
+    let mut graph = PoaGraph::new(&long, cfg).unwrap();
+    graph.add_read(&long).unwrap();
+    assert!(
+        graph.warnings_emitted() > 0,
+        "expected at least one long-unbanded warning"
+    );
+}
+
+#[test]
+fn reads_too_long_unbanded_suppressed() {
+    // warn_on_long_unbanded=false should keep the counter at zero.
+    let long: Vec<u8> = b"A".repeat(1001);
+    let cfg = PoaConfig {
+        warn_on_long_unbanded: false,
+        band_width: 0,
+        adaptive_band: false,
+        ..Default::default()
+    };
+    let mut graph = PoaGraph::new(&long, cfg).unwrap();
+    graph.add_read(&long).unwrap();
+    assert_eq!(graph.warnings_emitted(), 0, "warning should be suppressed");
+}
+
+#[test]
+fn multi_allele_low_per_allele_depth() {
+    // Total reads (7) exceeds min_reads (4), but the minor allele group (3 reads)
+    // does not — verifying that depth is checked per group, not on the total.
+    let allele_a: &[u8] = b"CATCATCAT";
+    let allele_b: &[u8] = b"CATCGTCAT";
+    let cfg = PoaConfig {
+        min_reads: 4,
+        ..Default::default()
+    };
+    // 4 reads of allele_a, 3 reads of allele_b → total 7 >= min_reads 4, minor group 3 < 4
+    let reads: Vec<&[u8]> = vec![
+        allele_a, allele_a, allele_a, allele_a, allele_b, allele_b, allele_b,
+    ];
+    let result = poa_consensus::consensus_multi(&reads, 0, &cfg);
+    assert!(
+        matches!(result, Err(PoaError::InsufficientDepth { .. })),
+        "expected InsufficientDepth for minor allele group, got {:?}",
+        result.map(|v| v.len())
+    );
 }

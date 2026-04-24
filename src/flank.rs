@@ -55,7 +55,11 @@ fn find_flank_end(read: &[u8], flank: &[u8]) -> Option<usize> {
 
     for i in 1..=m {
         for j in 1..=n {
-            let sub = if flank[i - 1] == read[j - 1] { 2i32 } else { -1i32 };
+            let sub = if flank[i - 1] == read[j - 1] {
+                2i32
+            } else {
+                -1i32
+            };
             let mat = dp[(i - 1) * cols + (j - 1)] + sub;
             let del = dp[(i - 1) * cols + j] + GAP; // consume flank char, skip read base
             let ins = dp[i * cols + (j - 1)] + GAP; // consume read char, skip flank base
@@ -105,7 +109,8 @@ mod tests {
     #[test]
     fn exact_flanks() {
         let read = b"GGGGGCATCATCATCATAAAAA";
-        let seg = extract_flanked_region(read, b"GGGGG", b"AAAAA").expect("should find both flanks");
+        let seg =
+            extract_flanked_region(read, b"GGGGG", b"AAAAA").expect("should find both flanks");
         assert_eq!(seg, b"CATCATCATCAT");
     }
 
@@ -140,7 +145,8 @@ mod tests {
         // left:  GGGGG → GGGAG (1 mismatch)
         // right: AAAAA → AAATA (1 mismatch)
         let read = b"GGGAGCATCATCATCATAAATA";
-        let seg = extract_flanked_region(read, b"GGGGG", b"AAAAA").expect("noisy flanks should still align");
+        let seg = extract_flanked_region(read, b"GGGGG", b"AAAAA")
+            .expect("noisy flanks should still align");
         assert_eq!(seg, b"CATCATCATCAT");
     }
 

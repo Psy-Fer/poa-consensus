@@ -268,8 +268,7 @@ pub fn consensus_adaptive(
 
     // ── Decision ─────────────────────────────────────────────────────────────
     let n = reads.len();
-    let allele_threshold =
-        (n as f64 * config.min_allele_freq).ceil() as usize;
+    let allele_threshold = (n as f64 * config.min_allele_freq).ceil() as usize;
 
     // Multi-allele: few bubbles with a well-supported minority arm.
     // Re-use the pass-1 graph; consensus_multi rebuilds per-allele sub-graphs.

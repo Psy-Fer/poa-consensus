@@ -140,6 +140,8 @@ pub struct PoaGraph {
     reads: Vec<Vec<u8>>,
     /// (from_node, to_node) → sorted list of read indices that traversed that edge
     edge_reads: HashMap<(usize, usize), Vec<u32>>,
+    /// number of times the long-unbanded warning was emitted
+    warnings: usize,
 }
 
 // ─── DP cell types ───────────────────────────────────────────────────────────
@@ -905,6 +907,7 @@ impl PoaGraph {
             n_reads: 1,
             reads: vec![seed.to_vec()],
             edge_reads,
+            warnings: 0,
         })
     }
 
@@ -922,6 +925,7 @@ impl PoaGraph {
                  Suppress with warn_on_long_unbanded=false.",
                 read.len()
             );
+            self.warnings += 1;
         }
 
         let (topo, rank_of) = topological_order(&self.nodes);
@@ -1008,6 +1012,12 @@ impl PoaGraph {
 
     pub fn stats(&self) -> GraphStats {
         compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads)
+    }
+
+    /// Number of long-unbanded warnings emitted during `add_read` calls.
+    /// Non-zero means at least one read exceeded 1 kb with `band_width = 0`.
+    pub fn warnings_emitted(&self) -> usize {
+        self.warnings
     }
 
     /// Build one consensus per detected allele by partitioning reads at the
