@@ -1,4 +1,4 @@
-use crate::config::PoaConfig;
+use crate::config::{ConsensusMode, PoaConfig};
 use crate::error::PoaError;
 use crate::types::{Consensus, GraphStats};
 
@@ -126,6 +126,8 @@ struct Node {
     in_edges: Vec<usize>,
     /// reads that produced a Match op at this node (not Delete ops)
     coverage: u32,
+    /// reads that produced a Delete op at this node (traversed without consuming a base)
+    delete_count: u32,
 }
 
 pub struct PoaGraph {
@@ -180,6 +182,7 @@ fn push_node(nodes: &mut Vec<Node>, base: u8) -> usize {
         out_edges: Vec::new(),
         in_edges: Vec::new(),
         coverage: 0,
+        delete_count: 0,
     });
     idx
 }
@@ -573,8 +576,8 @@ fn add_to_graph(nodes: &mut Vec<Node>, query: &[u8], ops: &[AlignOp]) {
                 prev = Some(new_idx);
             }
             AlignOp::Delete(node_idx) => {
-                // Traverse this node without consuming a query base.
-                // Do NOT increment coverage: the read is skipping this node.
+                // Traverse without consuming a query base; counts as a gap vote for MF.
+                nodes[node_idx].delete_count += 1;
                 if let Some(p) = prev {
                     increment_or_add_edge(nodes, p, node_idx);
                 }
@@ -617,6 +620,28 @@ fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usiz
     }
     path.reverse();
     path
+}
+
+// ─── Majority-frequency consensus ────────────────────────────────────────────
+
+/// Column-wise plurality vote: include a node when its base votes outnumber its
+/// gap votes AND enough reads voted at that column to meet `min_cov`.
+///
+/// `coverage` = reads that matched the node. `delete_count` = reads that deleted
+/// it (traversed without consuming a base). Reads that took a different branch
+/// through a bubble don't vote at this column at all, so the denominator is
+/// `coverage + delete_count`, not `n_reads`.
+fn majority_frequency(nodes: &[Node], topo: &[usize], min_cov: u32) -> Vec<(usize, u8)> {
+    topo.iter()
+        .copied()
+        .filter(|&idx| {
+            let cov = nodes[idx].coverage;
+            let del = nodes[idx].delete_count;
+            let total = cov + del;
+            total >= min_cov && cov * 2 >= total
+        })
+        .map(|idx| (idx, nodes[idx].base))
+        .collect()
 }
 
 // ─── Graph statistics ─────────────────────────────────────────────────────────
@@ -770,35 +795,40 @@ impl PoaGraph {
         }
 
         let (topo, rank_of) = topological_order(&self.nodes);
-        let path = heaviest_path(&self.nodes, &topo, &rank_of);
-
         let min_cov = self.min_coverage();
 
-        // Trim leading nodes below min_cov
-        let start = path
-            .iter()
-            .position(|&(node_idx, _)| self.nodes[node_idx].coverage >= min_cov)
-            .unwrap_or(0);
+        let filtered: Vec<(usize, u8)> = match self.config.consensus_mode {
+            ConsensusMode::HeaviestPath => {
+                let path = heaviest_path(&self.nodes, &topo, &rank_of);
 
-        // Trim trailing nodes below min_cov
-        let end = path
-            .iter()
-            .rposition(|&(node_idx, _)| self.nodes[node_idx].coverage >= min_cov)
-            .map(|i| i + 1)
-            .unwrap_or(path.len());
+                // Trim leading nodes below min_cov
+                let start = path
+                    .iter()
+                    .position(|&(node_idx, _)| self.nodes[node_idx].coverage >= min_cov)
+                    .unwrap_or(0);
 
-        let effective = if start < end {
-            &path[start..end]
-        } else {
-            &path[..]
+                // Trim trailing nodes below min_cov
+                let end = path
+                    .iter()
+                    .rposition(|&(node_idx, _)| self.nodes[node_idx].coverage >= min_cov)
+                    .map(|i| i + 1)
+                    .unwrap_or(path.len());
+
+                let effective = if start < end {
+                    &path[start..end]
+                } else {
+                    &path[..]
+                };
+
+                // Filter interior minority detours
+                effective
+                    .iter()
+                    .filter(|&&(node_idx, _)| self.nodes[node_idx].coverage >= min_cov)
+                    .copied()
+                    .collect()
+            }
+            ConsensusMode::MajorityFrequency => majority_frequency(&self.nodes, &topo, min_cov),
         };
-
-        // Filter interior minority detours
-        let filtered: Vec<(usize, u8)> = effective
-            .iter()
-            .filter(|&&(node_idx, _)| self.nodes[node_idx].coverage >= min_cov)
-            .copied()
-            .collect();
 
         let sequence: Vec<u8> = filtered.iter().map(|&(_, base)| base).collect();
         let coverage: Vec<u32> = filtered
