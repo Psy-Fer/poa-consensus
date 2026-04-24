@@ -16,10 +16,10 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-cli = ["dep:clap", "dep:needletail"]
+cli = ["dep:clap", "dep:noodles"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
-needletail = { version = "0.5", optional = true }
+noodles = { version = "0.109", features = ["fasta", "fastq"], optional = true }
 
 [dev-dependencies]
