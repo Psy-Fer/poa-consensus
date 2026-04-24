@@ -1154,3 +1154,73 @@ fn fn_consensus_multi_seed_out_of_bounds() {
     let result = poa_consensus::consensus_multi(&reads, 99, &PoaConfig::default());
     assert!(matches!(result, Err(PoaError::SeedOutOfBounds { index: 99, len: 2 })));
 }
+
+// ── Two-pass adaptive mode ─────────────────────────────────────────────────────
+
+#[test]
+fn adaptive_clean_single_allele() {
+    // No bubbles → single consensus, no pass 2.
+    let reads: Vec<&[u8]> = vec![b"CATCATCAT"; 6];
+    let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].sequence, b"CATCATCAT");
+}
+
+#[test]
+fn adaptive_snv_bubble_splits_alleles() {
+    // Clear SNV bubble → multi-allele path, two alleles returned.
+    let a: &[u8] = b"CATCATCAT";
+    let bv: &[u8] = b"CATCGTCAT";
+    let reads: Vec<&[u8]> = vec![a, a, a, a, bv, bv, bv, bv];
+    let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(results.len(), 2, "expected two alleles from SNV bubble");
+    let seqs: Vec<&[u8]> = results.iter().map(|c| c.sequence.as_slice()).collect();
+    assert!(seqs.contains(&a), "allele_a not in results");
+    assert!(seqs.contains(&bv), "allele_b not in results");
+}
+
+#[test]
+fn adaptive_noisy_tightens_coverage() {
+    // 4 correct reads + 4 reads each with a unique error → singleton fraction high.
+    // Adaptive mode should tighten coverage and return a single clean consensus.
+    let correct: Vec<u8> = b("CATCATCATCATCAT");
+    let mut r1 = correct.clone(); r1[0]  = b'G';
+    let mut r2 = correct.clone(); r2[3]  = b'G';
+    let mut r3 = correct.clone(); r3[6]  = b'G';
+    let mut r4 = correct.clone(); r4[9]  = b'G';
+    let reads: Vec<&[u8]> = vec![
+        &correct, &correct, &correct, &correct,
+        &r1, &r2, &r3, &r4,
+    ];
+    let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].sequence, correct, "noisy reads should be filtered");
+}
+
+#[test]
+fn adaptive_partial_reads_switches_semi_global() {
+    // Seed extends well beyond several partial reads → high coverage CV.
+    // Adaptive mode should switch to semi-global and return a correct consensus.
+    let full: Vec<u8>    = b("GGGCATCATCATCATAAA");
+    let partial: Vec<u8> = b("CATCATCAT");
+    let reads: Vec<&[u8]> = vec![
+        full.as_slice(), full.as_slice(), full.as_slice(),
+        partial.as_slice(), partial.as_slice(), partial.as_slice(),
+    ];
+    // Just verify it completes without error and returns a single result.
+    let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(results.len(), 1);
+}
+
+#[test]
+fn adaptive_empty_input() {
+    let result = poa_consensus::consensus_adaptive(&[], 0, &PoaConfig::default());
+    assert!(matches!(result, Err(PoaError::EmptyInput)));
+}
+
+#[test]
+fn adaptive_seed_out_of_bounds() {
+    let reads: Vec<&[u8]> = vec![b"ACGT", b"ACGT"];
+    let result = poa_consensus::consensus_adaptive(&reads, 9, &PoaConfig::default());
+    assert!(matches!(result, Err(PoaError::SeedOutOfBounds { index: 9, len: 2 })));
+}

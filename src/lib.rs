@@ -188,16 +188,19 @@ pub use graph::PoaGraph;
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
 pub use types::{Consensus, GraphStats, Strand};
 
-/// Build a single-allele consensus from `reads`.
-///
-/// `seed_idx` is the index of the read used to initialise the graph; choose a
-/// median-length read for best results.  All validation (empty input, insufficient
-/// depth, out-of-bounds seed) is delegated to [`PoaGraph`].
-pub fn consensus(
-    reads: &[&[u8]],
-    seed_idx: usize,
-    config: &PoaConfig,
-) -> Result<Consensus, PoaError> {
+// ── Internal helper ───────────────────────────────────────────────────────────
+
+fn build_graph(reads: &[&[u8]], seed_idx: usize, config: PoaConfig) -> Result<PoaGraph, PoaError> {
+    let mut graph = PoaGraph::new(reads[seed_idx], config)?;
+    for (i, read) in reads.iter().enumerate() {
+        if i != seed_idx {
+            graph.add_read(read)?;
+        }
+    }
+    Ok(graph)
+}
+
+fn validate(reads: &[&[u8]], seed_idx: usize) -> Result<(), PoaError> {
     if reads.is_empty() {
         return Err(PoaError::EmptyInput);
     }
@@ -207,13 +210,22 @@ pub fn consensus(
             len: reads.len(),
         });
     }
-    let mut graph = PoaGraph::new(reads[seed_idx], config.clone())?;
-    for (i, read) in reads.iter().enumerate() {
-        if i != seed_idx {
-            graph.add_read(read)?;
-        }
-    }
-    graph.consensus()
+    Ok(())
+}
+
+// ── Public convenience wrappers ───────────────────────────────────────────────
+
+/// Build a single-allele consensus from `reads`.
+///
+/// `seed_idx` is the index of the read used to initialise the graph; choose a
+/// median-length read for best results.
+pub fn consensus(
+    reads: &[&[u8]],
+    seed_idx: usize,
+    config: &PoaConfig,
+) -> Result<Consensus, PoaError> {
+    validate(reads, seed_idx)?;
+    build_graph(reads, seed_idx, config.clone())?.consensus()
 }
 
 /// Build a multi-allele consensus from `reads`.
@@ -225,20 +237,70 @@ pub fn consensus_multi(
     seed_idx: usize,
     config: &PoaConfig,
 ) -> Result<Vec<Consensus>, PoaError> {
-    if reads.is_empty() {
-        return Err(PoaError::EmptyInput);
+    validate(reads, seed_idx)?;
+    build_graph(reads, seed_idx, config.clone())?.consensus_multi()
+}
+
+/// Two-pass adaptive consensus.
+///
+/// **Pass 1** builds a graph with the supplied config and computes [`GraphStats`].
+/// **Pass 2** is selected by inspecting those stats:
+///
+/// | Condition | Pass-2 action |
+/// |---|---|
+/// | 1-3 bubbles, minority arm ≥ `min_allele_freq × n` | `consensus_multi` on pass-1 graph |
+/// | `single_support_fraction > 0.3` | Tighten `min_coverage_fraction` to ≥ 0.6, rebuild |
+/// | Coverage CV > 1.5 and mode is `Global` | Switch to `SemiGlobal`, rebuild |
+/// | Otherwise | Return pass-1 single consensus; no rebuild |
+///
+/// Always returns a `Vec<Consensus>`: one element for single-allele outcomes,
+/// two for diploid.
+pub fn consensus_adaptive(
+    reads: &[&[u8]],
+    seed_idx: usize,
+    config: &PoaConfig,
+) -> Result<Vec<Consensus>, PoaError> {
+    validate(reads, seed_idx)?;
+
+    // ── Pass 1 ───────────────────────────────────────────────────────────────
+    let graph = build_graph(reads, seed_idx, config.clone())?;
+    let stats = graph.stats();
+
+    // ── Decision ─────────────────────────────────────────────────────────────
+    let n = reads.len();
+    let allele_threshold =
+        (n as f64 * config.min_allele_freq).ceil() as usize;
+
+    // Multi-allele: few bubbles with a well-supported minority arm.
+    // Re-use the pass-1 graph; consensus_multi rebuilds per-allele sub-graphs.
+    if stats.bubble_count >= 1
+        && stats.bubble_count <= 3
+        && stats.max_bubble_depth >= allele_threshold
+    {
+        return graph.consensus_multi();
     }
-    if seed_idx >= reads.len() {
-        return Err(PoaError::SeedOutOfBounds {
-            index: seed_idx,
-            len: reads.len(),
-        });
+
+    // Noisy input: high fraction of singleton-supported nodes.
+    // Tighten the coverage threshold and rebuild.
+    if stats.single_support_fraction > 0.3 {
+        let mut cfg2 = config.clone();
+        cfg2.min_coverage_fraction = cfg2.min_coverage_fraction.max(0.6);
+        return Ok(vec![build_graph(reads, seed_idx, cfg2)?.consensus()?]);
     }
-    let mut graph = PoaGraph::new(reads[seed_idx], config.clone())?;
-    for (i, read) in reads.iter().enumerate() {
-        if i != seed_idx {
-            graph.add_read(read)?;
-        }
+
+    // Uneven boundary coverage (high CV) suggests partial reads in global mode.
+    // Switch to semi-global alignment and rebuild.
+    let cv = if stats.coverage_mean > 0.0 {
+        stats.coverage_variance.sqrt() / stats.coverage_mean
+    } else {
+        0.0
+    };
+    if cv > 1.5 && config.alignment_mode == AlignmentMode::Global {
+        let mut cfg2 = config.clone();
+        cfg2.alignment_mode = AlignmentMode::SemiGlobal;
+        return Ok(vec![build_graph(reads, seed_idx, cfg2)?.consensus()?]);
     }
-    graph.consensus_multi()
+
+    // No second pass needed.
+    Ok(vec![graph.consensus()?])
 }
