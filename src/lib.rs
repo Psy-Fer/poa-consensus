@@ -173,6 +173,7 @@
 
 pub mod config;
 pub mod error;
+pub mod flank;
 pub mod graph;
 pub mod orient;
 pub mod types;
@@ -182,6 +183,7 @@ mod tests;
 
 pub use config::{AlignmentMode, ConsensusMode, PoaConfig};
 pub use error::PoaError;
+pub use flank::extract_flanked_region;
 pub use graph::PoaGraph;
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
 pub use types::{Consensus, GraphStats, Strand};

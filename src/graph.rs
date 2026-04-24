@@ -749,11 +749,7 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
                 count += 1;
             }
         }
-        if count == 0 {
-            0.0
-        } else {
-            sum / count as f64
-        }
+        if count == 0 { 0.0 } else { sum / count as f64 }
     };
 
     GraphStats {
@@ -800,7 +796,11 @@ fn find_bubbles(
                 .filter(|&&(_, w)| w >= threshold)
                 .map(|&(to, _)| to)
                 .collect();
-            if arms.len() >= 2 { Some((node_idx, arms)) } else { None }
+            if arms.len() >= 2 {
+                Some((node_idx, arms))
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -818,8 +818,12 @@ fn partition_reads_by_bubble(
     // Keep the two arms with the most read support.
     let mut arm_order: Vec<usize> = (0..arm_starts.len()).collect();
     arm_order.sort_unstable_by(|&a, &b| {
-        let wa = edge_reads.get(&(entry_node, arm_starts[a])).map_or(0, |v| v.len());
-        let wb = edge_reads.get(&(entry_node, arm_starts[b])).map_or(0, |v| v.len());
+        let wa = edge_reads
+            .get(&(entry_node, arm_starts[a]))
+            .map_or(0, |v| v.len());
+        let wb = edge_reads
+            .get(&(entry_node, arm_starts[b]))
+            .map_or(0, |v| v.len());
         wb.cmp(&wa)
     });
     let n_arms = arm_order.len().min(2);
@@ -1021,8 +1025,12 @@ impl PoaGraph {
         }
 
         let (topo, _) = topological_order(&self.nodes);
-        let bubbles =
-            find_bubbles(&self.nodes, &topo, self.n_reads, self.config.min_allele_freq);
+        let bubbles = find_bubbles(
+            &self.nodes,
+            &topo,
+            self.n_reads,
+            self.config.min_allele_freq,
+        );
 
         if bubbles.is_empty() {
             return Ok(vec![self.consensus()?]);
@@ -1040,12 +1048,7 @@ impl PoaGraph {
             })
             .unwrap();
 
-        let groups = partition_reads_by_bubble(
-            &self.edge_reads,
-            *entry,
-            arm_starts,
-            self.n_reads,
-        );
+        let groups = partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads);
 
         if groups.len() < 2 {
             return Ok(vec![self.consensus()?]);

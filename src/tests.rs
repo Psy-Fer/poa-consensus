@@ -797,7 +797,11 @@ fn consensus_multi_length_variation() {
         .collect();
     let g = multi_graph(&reads, 0);
     let results = g.consensus_multi().unwrap();
-    assert_eq!(results.len(), 2, "expected 2 alleles for length-variation input");
+    assert_eq!(
+        results.len(),
+        2,
+        "expected 2 alleles for length-variation input"
+    );
     let lens: Vec<usize> = results.iter().map(|c| c.sequence.len()).collect();
     assert!(lens.contains(&14), "expected 14-bp allele; got {:?}", lens);
     assert!(lens.contains(&17), "expected 17-bp allele; got {:?}", lens);
@@ -809,7 +813,10 @@ fn consensus_multi_insufficient_depth_per_allele() {
     let allele_a = b("CATCATCAT");
     let allele_b = b("CATCGTCAT");
     let reads = vec![allele_a.clone(), allele_a, allele_b.clone(), allele_b];
-    let cfg = PoaConfig { min_reads: 3, ..Default::default() };
+    let cfg = PoaConfig {
+        min_reads: 3,
+        ..Default::default()
+    };
     let mut g = PoaGraph::new(&reads[0], cfg).unwrap();
     for r in &reads[1..] {
         g.add_read(r).unwrap();
@@ -839,7 +846,12 @@ fn long_repeat_length_majority_wins() {
     let mut reads: Vec<Vec<u8>> = vec![maj.clone(); 8];
     reads.extend(vec![out; 2]);
     let result = consensus(&reads, 0);
-    assert_eq!(result.len(), 60, "expected 60-bp majority, got {} bp", result.len());
+    assert_eq!(
+        result.len(),
+        60,
+        "expected 60-bp majority, got {} bp",
+        result.len()
+    );
 }
 
 #[test]
@@ -851,7 +863,10 @@ fn long_repeat_snv_correction() {
     let mut reads: Vec<Vec<u8>> = vec![correct.clone(); 9];
     reads.push(noisy);
     let result = consensus(&reads, 0);
-    assert_eq!(result, correct, "SNV from single noisy read should not affect consensus");
+    assert_eq!(
+        result, correct,
+        "SNV from single noisy read should not affect consensus"
+    );
 }
 
 #[test]
@@ -862,9 +877,15 @@ fn long_banded_matches_unbanded() {
     let mut reads: Vec<Vec<u8>> = vec![base.clone(); 4];
     reads.push(long);
     let unbanded = consensus(&reads, 0);
-    let cfg = PoaConfig { band_width: 30, ..Default::default() };
+    let cfg = PoaConfig {
+        band_width: 30,
+        ..Default::default()
+    };
     let banded = consensus_cfg(&reads, 0, cfg);
-    assert_eq!(banded, unbanded, "banded(30) should match unbanded for small divergence");
+    assert_eq!(
+        banded, unbanded,
+        "banded(30) should match unbanded for small divergence"
+    );
 }
 
 #[test]
@@ -882,7 +903,10 @@ fn long_adaptive_band_matches_unbanded() {
         ..Default::default()
     };
     let adaptive = consensus_cfg(&reads, 0, cfg);
-    assert_eq!(adaptive, unbanded, "adaptive band should match unbanded for small divergence");
+    assert_eq!(
+        adaptive, unbanded,
+        "adaptive band should match unbanded for small divergence"
+    );
 }
 
 #[test]
@@ -925,10 +949,21 @@ fn consensus_multi_snv_in_long_context() {
         g.add_read(r).unwrap();
     }
     let results = g.consensus_multi().unwrap();
-    assert_eq!(results.len(), 2, "expected 2 alleles for SNV; got {}", results.len());
+    assert_eq!(
+        results.len(),
+        2,
+        "expected 2 alleles for SNV; got {}",
+        results.len()
+    );
     let seqs: Vec<Vec<u8>> = results.into_iter().map(|c| c.sequence).collect();
-    assert!(seqs.iter().any(|s| s == &a), "allele_a (A at pos 10) not found in results");
-    assert!(seqs.iter().any(|s| s == &bv), "allele_b (all-T) not found in results");
+    assert!(
+        seqs.iter().any(|s| s == &a),
+        "allele_a (A at pos 10) not found in results"
+    );
+    assert!(
+        seqs.iter().any(|s| s == &bv),
+        "allele_b (all-T) not found in results"
+    );
 }
 
 #[test]
@@ -950,9 +985,22 @@ fn consensus_multi_skewed_allele_ratio() {
     }
     let results = g.consensus_multi().unwrap();
     let lens: Vec<usize> = results.iter().map(|c| c.sequence.len()).collect();
-    assert_eq!(results.len(), 2, "expected 2 alleles at 7:3; got {:?}", lens);
-    assert!(lens.contains(&26), "expected 26-bp majority allele; got {:?}", lens);
-    assert!(lens.contains(&38), "expected 38-bp minor allele; got {:?}", lens);
+    assert_eq!(
+        results.len(),
+        2,
+        "expected 2 alleles at 7:3; got {:?}",
+        lens
+    );
+    assert!(
+        lens.contains(&26),
+        "expected 26-bp majority allele; got {:?}",
+        lens
+    );
+    assert!(
+        lens.contains(&38),
+        "expected 38-bp minor allele; got {:?}",
+        lens
+    );
 }
 
 #[test]
@@ -966,9 +1014,15 @@ fn long_reads_noise_and_banding() {
     let mut reads: Vec<Vec<u8>> = vec![correct.clone(); 6];
     reads.extend(vec![err1; 2]);
     reads.extend(vec![err2; 2]);
-    let cfg = PoaConfig { band_width: 40, ..Default::default() };
+    let cfg = PoaConfig {
+        band_width: 40,
+        ..Default::default()
+    };
     let result = consensus_cfg(&reads, 0, cfg);
-    assert_eq!(result, correct, "banded consensus should correct isolated noise in 63-bp reads");
+    assert_eq!(
+        result, correct,
+        "banded consensus should correct isolated noise in 63-bp reads"
+    );
 }
 
 // ── Non-repeat longer-sequence tests ─────────────────────────────────────────
@@ -981,7 +1035,11 @@ const BASE_60: &[u8] = b"ATCGATCGTTACGATCGTAGCTAGTCATGCTAATCGTAGCGATCGTAACGATCGA
 #[test]
 fn long_nonrepeat_consensus_correctness() {
     let reads = vec![BASE_60.to_vec(); 6];
-    assert_eq!(consensus(&reads, 0), BASE_60, "6 identical non-repeat reads");
+    assert_eq!(
+        consensus(&reads, 0),
+        BASE_60,
+        "6 identical non-repeat reads"
+    );
 }
 
 #[test]
@@ -991,7 +1049,11 @@ fn long_nonrepeat_snv_correction() {
     noisy[30] = b'G';
     let mut reads: Vec<Vec<u8>> = vec![BASE_60.to_vec(); 9];
     reads.push(noisy);
-    assert_eq!(consensus(&reads, 0), BASE_60, "single noisy read must not flip consensus base");
+    assert_eq!(
+        consensus(&reads, 0),
+        BASE_60,
+        "single noisy read must not flip consensus base"
+    );
 }
 
 #[test]
@@ -1003,9 +1065,15 @@ fn long_nonrepeat_banded_matches_unbanded() {
     let mut reads: Vec<Vec<u8>> = vec![BASE_60.to_vec(); 4];
     reads.push(long);
     let unbanded = consensus(&reads, 0);
-    let cfg = PoaConfig { band_width: 30, ..Default::default() };
+    let cfg = PoaConfig {
+        band_width: 30,
+        ..Default::default()
+    };
     let banded = consensus_cfg(&reads, 0, cfg);
-    assert_eq!(banded, unbanded, "banded(30) should match unbanded on non-repeat sequence");
+    assert_eq!(
+        banded, unbanded,
+        "banded(30) should match unbanded on non-repeat sequence"
+    );
 }
 
 #[test]
@@ -1022,6 +1090,12 @@ fn consensus_multi_nonrepeat_snv() {
     let results = g.consensus_multi().unwrap();
     assert_eq!(results.len(), 2, "expected 2 alleles for non-repeat SNV");
     let seqs: Vec<Vec<u8>> = results.into_iter().map(|c| c.sequence).collect();
-    assert!(seqs.iter().any(|s| s.as_slice() == BASE_60), "allele_a not recovered");
-    assert!(seqs.iter().any(|s| s == &allele_b), "allele_b not recovered");
+    assert!(
+        seqs.iter().any(|s| s.as_slice() == BASE_60),
+        "allele_a not recovered"
+    );
+    assert!(
+        seqs.iter().any(|s| s == &allele_b),
+        "allele_b not recovered"
+    );
 }
