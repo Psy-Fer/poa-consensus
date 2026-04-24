@@ -385,15 +385,12 @@ fn align(
             }
 
             // D[t][j] ─────────────────────────────────────────────────────────
+            // No is_source init here: source-deletion initialization belongs only
+            // in the j=0 column. Setting D[source][j≥1]=const here would let the
+            // traceback reach D[source] at any j>0 and break early via pred=VIRTUAL,
+            // leaving read characters unconsumed and producing wrong alignment ops.
             {
                 let (mut best, mut best_pred) = (UNSET, 0usize);
-                if is_source {
-                    let val = go + ge;
-                    if val > best {
-                        best = val;
-                        best_pred = VIRTUAL;
-                    }
-                }
                 for &p in &nodes[node_idx].in_edges {
                     let p_t = rank_of[p];
                     if in_band_at(p_t, j, w, l) {
@@ -698,29 +695,71 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
         }
     };
 
-    // Bubble count: nodes with 2+ out-edges each above min_allele_freq threshold.
+    // Bubble count and max_bubble_depth.
+    // A bubble entry is a node with 2+ out-edges each above the min_allele_freq threshold.
+    // max_bubble_depth = the highest minority-arm weight across all bubbles, i.e. the
+    // strongest signal for a second allele.
     let threshold = (n_reads as f64 * min_allele_freq).ceil() as i32;
-    let bubble_count = nodes
-        .iter()
-        .filter(|nd| {
-            nd.out_edges
-                .iter()
-                .filter(|&&(_, w)| w >= threshold)
-                .count()
-                >= 2
-        })
-        .count();
+    let mut bubble_count = 0usize;
+    let mut max_bubble_depth = 0usize;
+    for nd in nodes {
+        let mut qualifying: Vec<i32> = nd
+            .out_edges
+            .iter()
+            .filter(|&&(_, w)| w >= threshold)
+            .map(|&(_, w)| w)
+            .collect();
+        if qualifying.len() >= 2 {
+            bubble_count += 1;
+            qualifying.sort_unstable_by(|a, b| b.cmp(a)); // descending
+            max_bubble_depth = max_bubble_depth.max(qualifying[1] as usize);
+        }
+    }
+
+    // Mean per-column Shannon entropy (bits).
+    // At each node, the "column" has two outcomes: base (coverage) or gap (delete_count).
+    // Entropy is 0 when all reads agree and 1 bit when perfectly split.
+    // Nodes that were never voted on (coverage=0, delete_count=0) are skipped.
+    let mean_column_entropy = {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for nd in nodes {
+            let cov = nd.coverage as f64;
+            let del = nd.delete_count as f64;
+            let total = cov + del;
+            if total > 0.0 {
+                let h = binary_entropy(cov / total);
+                sum += h;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            0.0
+        } else {
+            sum / count as f64
+        }
+    };
 
     GraphStats {
         node_count,
         edge_count,
         bubble_count,
-        max_bubble_depth: 0, // full bubble traversal deferred to multi-allele pass
+        max_bubble_depth,
         coverage_mean,
         coverage_variance,
         edge_weight_gini,
         single_support_fraction,
-        mean_column_entropy: 0.0, // MSA column entropy deferred to MF consensus pass
+        mean_column_entropy,
+    }
+}
+
+#[inline]
+fn binary_entropy(p: f64) -> f64 {
+    if p <= 0.0 || p >= 1.0 {
+        0.0
+    } else {
+        let q = 1.0 - p;
+        -(p * p.log2() + q * q.log2())
     }
 }
 
