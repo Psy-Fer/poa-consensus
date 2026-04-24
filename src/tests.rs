@@ -642,3 +642,96 @@ fn mf_single_outlier_not_inflated() {
     let reads = vec![b("CATCATCAT"), b("CATCATCAT"), b("CATCATCATCAT")];
     assert_eq!(mf_consensus(&reads, 0).len(), 9);
 }
+
+// ── GraphStats ────────────────────────────────────────────────────────────────
+
+fn build_graph(reads: &[Vec<u8>], seed_idx: usize) -> PoaGraph {
+    let mut graph = PoaGraph::new(&reads[seed_idx], PoaConfig::default()).unwrap();
+    for (i, read) in reads.iter().enumerate() {
+        if i != seed_idx {
+            graph.add_read(read).unwrap();
+        }
+    }
+    graph
+}
+
+#[test]
+fn stats_clean_linear_no_bubbles() {
+    // Identical reads produce a clean linear graph with no bubbles.
+    let reads = vec![
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+    ];
+    let st = build_graph(&reads, 0).stats();
+    assert_eq!(st.bubble_count, 0);
+    assert_eq!(st.max_bubble_depth, 0);
+    assert_eq!(st.node_count, 9);
+    // All reads match every node: delete_count=0 everywhere → entropy=0.
+    assert_eq!(st.mean_column_entropy, 0.0);
+}
+
+#[test]
+fn stats_bubble_detected() {
+    // 3 reads with CATCATCAT, 1 with CGTCATCAT → SNV bubble at position 1 (A vs G).
+    let reads = vec![
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CGTCATCAT"),
+    ];
+    let st = build_graph(&reads, 0).stats();
+    assert_eq!(st.bubble_count, 1, "expected 1 bubble");
+    // Minority arm has 1 read (the CGT read creates a G branch at position 1).
+    assert_eq!(st.max_bubble_depth, 1, "minority arm weight should be 1");
+}
+
+#[test]
+fn stats_entropy_nonzero_on_length_variation() {
+    // Seed has 3 leading X nodes that other reads delete.
+    // The X nodes get delete_count=3, coverage=1 → entropy > 0.
+    // (Shorter reads aligned to a longer graph in global mode don't generate trailing
+    // deletes — they simply stop at the best-scoring diagonal. Leading deletes DO fire
+    // because the traceback reaches t=0, j=0 via the D-chain at the j=0 column.)
+    let reads = vec![
+        b("XXXCATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+    ];
+    let st = build_graph(&reads, 0).stats();
+    // X nodes: coverage=1, delete_count=3 → p=0.25, binary_entropy(0.25) ≈ 0.811 bits.
+    assert!(
+        st.mean_column_entropy > 0.0,
+        "expected nonzero entropy, got {}",
+        st.mean_column_entropy
+    );
+}
+
+#[test]
+fn stats_node_edge_counts() {
+    // 2 reads with length variation: 9-node backbone + 3 extra nodes from longer read.
+    // The longer read aligns as Insert(CAT) + Match(nodes 0-8), creating nodes 9,10,11
+    // with edges 9→10, 10→11, 11→0. Backbone edges 0→1..7→8 already existed = 8.
+    let reads = vec![b("CATCATCAT"), b("CATCATCATCAT")];
+    let st = build_graph(&reads, 0).stats();
+    assert_eq!(st.node_count, 12, "9 + 3 extra nodes");
+    // 8 backbone + 3 new edges (9→10, 10→11, 11→0) = 11 total.
+    assert_eq!(st.edge_count, 11);
+}
+
+#[test]
+fn stats_coverage_mean_uniform() {
+    // All 4 reads match all 9 nodes → coverage=4 everywhere → variance=0.
+    let reads = vec![
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+    ];
+    let st = build_graph(&reads, 0).stats();
+    assert!((st.coverage_mean - 4.0).abs() < 1e-10);
+    assert!(st.coverage_variance < 1e-10);
+}
+
