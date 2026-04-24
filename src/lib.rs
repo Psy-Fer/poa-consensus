@@ -3,9 +3,173 @@
 //! A pure-Rust banded Partial Order Alignment (POA) library for building a
 //! consensus sequence from a set of reads.
 //!
-//! POA builds a directed acyclic graph (DAG) from the reads, aligns each read
-//! into the graph using dynamic programming, and extracts a consensus by
-//! following the heaviest (most-supported) path through the graph.
+//! POA builds a directed acyclic graph (DAG) from the reads, aligns each
+//! subsequent read into the graph using affine-gap dynamic programming, and
+//! extracts a consensus by following the heaviest (most-supported) path through
+//! the graph.  It handles length variation between reads naturally: inserts and
+//! deletions create separate branches in the graph, and the heaviest-path
+//! extraction resolves them by read support rather than by fixed rules.
+//!
+//! ## When to use this crate
+//!
+//! This crate is optimised for **short to medium reads** (50 bp to ~20 kb with
+//! banded DP) where the graph stays small enough for in-memory DP — short
+//! tandem repeat (STR) loci, amplicon consensus, per-locus nanopore or HiFi
+//! read sets.
+//!
+//! The nearest alternative on crates.io is
+//! [`poasta`](https://crates.io/crates/poasta) (Broad Institute, pure Rust,
+//! gap-affine A\* alignment).  `poasta` excels at larger graphs such as
+//! bacterial genes and HLA loci.  For STR reads where graphs are small and
+//! throughput across many loci matters, a well-tuned banded DP is faster and
+//! simpler.  Both crates are pure Rust; neither wraps a C library.
+//!
+//! ## Quick start
+//!
+//! ### Functional API (single call)
+//!
+//! ```rust
+//! use poa_consensus::{consensus, consensus_multi, PoaConfig};
+//!
+//! let reads: Vec<&[u8]> = vec![
+//!     b"CATCATCAT",
+//!     b"CATCATCAT",
+//!     b"CATCGTCAT",
+//!     b"CATCATCAT",
+//! ];
+//!
+//! // Single-allele consensus; seed_idx=0 seeds the graph with reads[0].
+//! let result = consensus(&reads, 0, &PoaConfig::default())?;
+//! println!("{}", String::from_utf8_lossy(&result.sequence));
+//!
+//! // Multi-allele: returns one Consensus per detected allele.
+//! let alleles = consensus_multi(&reads, 0, &PoaConfig::default())?;
+//! # Ok::<(), poa_consensus::PoaError>(())
+//! ```
+//!
+//! ### Stateful API (inspect graph between reads)
+//!
+//! ```rust
+//! use poa_consensus::{PoaGraph, PoaConfig};
+//!
+//! let reads: &[&[u8]] = &[b"CATCATCAT", b"CATCATCAT", b"CATCGTCAT"];
+//!
+//! let mut graph = PoaGraph::new(reads[0], PoaConfig::default())?;
+//! for read in &reads[1..] {
+//!     graph.add_read(read)?;
+//! }
+//! let consensus = graph.consensus()?;
+//! let stats     = graph.stats();
+//! println!("bubbles: {}", stats.bubble_count);
+//! # Ok::<(), poa_consensus::PoaError>(())
+//! ```
+//!
+//! ### Two-pass adaptive mode
+//!
+//! ```rust
+//! use poa_consensus::{consensus_adaptive, PoaConfig};
+//!
+//! let reads: Vec<&[u8]> = vec![
+//!     b"CATCATCAT", b"CATCATCAT", b"CATCATCAT",
+//!     b"CATCGTCAT", b"CATCGTCAT", b"CATCGTCAT",
+//! ];
+//! // Pass 1 builds the graph and computes GraphStats.
+//! // Pass 2 is selected automatically: multi-allele split, noise tightening,
+//! // or semi-global switch, depending on what the stats reveal.
+//! let alleles = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
+//! # Ok::<(), poa_consensus::PoaError>(())
+//! ```
+//!
+//! ## Seed selection
+//!
+//! The seed read initialises the graph as a linear chain of nodes.  All other
+//! reads are aligned into this initial structure, so a poor seed degrades
+//! alignment quality for every subsequent read.
+//!
+//! **Choose a median-length read.**  The seed acts as the backbone; reads
+//! shorter than the seed produce terminal deletions and reads longer than the
+//! seed produce extensions.  A median-length seed minimises both.  In
+//! high-throughput use (many loci), `reads.iter().enumerate().min_by_key(|(_, r)| r.len().abs_diff(median_len))` is a one-liner.
+//!
+//! **Avoid outliers.**  The longest and shortest reads are the most likely to
+//! be error-prone or to span a different number of repeat units.  Using one as
+//! the seed skews the initial graph in a direction that the alignment of
+//! subsequent reads must then correct.
+//!
+//! **Orient reads before selecting the seed.**  Mixed-strand input produces a
+//! garbage graph silently.  Call [`auto_orient`] before POA construction; it
+//! uses k-mer matching (O(n) per read, no alignment) and returns borrowed
+//! slices for reads already on the correct strand.
+//!
+//! Seed selection is the caller's responsibility.  The API takes an explicit
+//! `seed_idx` so that the selection logic can live in the caller and be tuned
+//! per application.
+//!
+//! ## Band width and scale
+//!
+//! The DP matrix has one row per read base and one column per graph node.
+//! Unbanded alignment is O(read_len × graph_nodes) memory and time — manageable
+//! for reads up to ~1 kb but prohibitive above that.
+//!
+//! | Read length | Band width | Memory per read (3 matrices, i32) |
+//! |---|---|---|
+//! | 600 bp | unbanded | ~1.4 MB |
+//! | 600 bp | 100 | ~2.4 KB |
+//! | 20 kb | unbanded | ~9.6 GB |
+//! | 20 kb | adaptive (w≈210) | ~200 MB |
+//!
+//! **Rules of thumb:**
+//!
+//! - Reads ≤ 1 kb: unbanded (`band_width = 0`) is fine.
+//! - Reads 1 kb–20 kb: set `band_width` to at least twice the expected
+//!   length difference between reads, or enable `adaptive_band = true` (abPOA
+//!   formula: `w = adaptive_band_b + adaptive_band_f × read_len`).
+//! - Reads > 20 kb: adaptive banding is required; consider `poasta` for graphs
+//!   that approach bacterial-gene size.
+//!
+//! A band that is too narrow returns `Err(PoaError::BandTooNarrow)` when the
+//! terminal column is unreachable.  The library never silently produces a wrong
+//! alignment — it errors instead.  [`PoaGraph::warnings_emitted`] counts how
+//! many times a long-unbanded warning fired during `add_read` calls.
+//!
+//! ## Coverage and depth
+//!
+//! **`min_reads`** (default: 1) is the minimum number of reads required to
+//! attempt consensus.  `consensus()` returns `Err(InsufficientDepth)` below
+//! this threshold.  For reliable results, use at least 5 reads; 10+ is
+//! preferable for heterozygous sites.
+//!
+//! **Boundary trim** removes leading and trailing nodes whose coverage falls
+//! below the majority threshold `(n/2 + 1).max(2)` (or
+//! `min_coverage_fraction × n` if set explicitly).  This corrects for seed
+//! reads that happen to be longer or shorter than the true consensus length.
+//!
+//! **In multi-allele mode**, `min_reads` is applied per allele group, not to
+//! the total read count.  With 10 reads split 5/5, each group must independently
+//! satisfy `min_reads`.
+//!
+//! ## Known limitations
+//!
+//! **Phase-shift majority trim.** When the majority of reads are phase-shifted
+//! relative to the seed (e.g. most reads start one repeat unit later), boundary
+//! trim may incorrectly remove the seed's first node because its Match coverage
+//! is low.  The long-term fix is to use [`extract_flanked_region`] to anchor
+//! reads to a common reference point before POA; this eliminates phase ambiguity
+//! entirely.
+//!
+//! **Rotation-ambiguous repeats without flanking sequence.** Trinucleotide
+//! repeats like GAA can appear as GAA, AAG, or AGA depending on where the read
+//! starts relative to the period.  Without flanking anchors, POA on a mixed
+//! rotational-phase read set produces unreliable output.  The fix is the same:
+//! run [`extract_flanked_region`] first so that every read enters POA already
+//! anchored at the same phase.
+//!
+//! **Long expansions and partial reads.** When the repeat is longer than most
+//! reads, reads that do not span the full locus create artifactual terminal
+//! deletions that do not increment node coverage, making boundary nodes appear
+//! low-coverage and vulnerable to trim.  Use `AlignmentMode::SemiGlobal` (free
+//! terminal gaps) to prevent partial reads from distorting the boundary, or
+//! apply [`extract_flanked_region`] to exclude non-spanning reads before POA.
 //!
 //! ---
 //!
