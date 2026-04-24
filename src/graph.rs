@@ -1,6 +1,7 @@
 use crate::config::{ConsensusMode, PoaConfig};
 use crate::error::PoaError;
 use crate::types::{Consensus, GraphStats};
+use std::collections::HashMap;
 
 // ─── Sentinel ────────────────────────────────────────────────────────────────
 
@@ -135,6 +136,10 @@ pub struct PoaGraph {
     config: PoaConfig,
     /// number of reads integrated (seed + subsequent)
     n_reads: usize,
+    /// original reads stored for per-allele sub-graph reconstruction
+    reads: Vec<Vec<u8>>,
+    /// (from_node, to_node) → sorted list of read indices that traversed that edge
+    edge_reads: HashMap<(usize, usize), Vec<u32>>,
 }
 
 // ─── DP cell types ───────────────────────────────────────────────────────────
@@ -537,7 +542,13 @@ fn best_prev_state(m: &DpTable, ins: &DpTable, del: &DpTable, t: usize, j: usize
 
 // ─── Graph update ─────────────────────────────────────────────────────────────
 
-fn add_to_graph(nodes: &mut Vec<Node>, query: &[u8], ops: &[AlignOp]) {
+fn add_to_graph(
+    nodes: &mut Vec<Node>,
+    edge_reads: &mut HashMap<(usize, usize), Vec<u32>>,
+    query: &[u8],
+    ops: &[AlignOp],
+    read_idx: u32,
+) {
     let mut prev: Option<usize> = None;
     let mut q_idx: usize = 0;
 
@@ -546,21 +557,24 @@ fn add_to_graph(nodes: &mut Vec<Node>, query: &[u8], ops: &[AlignOp]) {
             AlignOp::Match(node_idx) => {
                 let q_base = query[q_idx];
                 q_idx += 1;
-                if nodes[node_idx].base == q_base {
+                let cur = if nodes[node_idx].base == q_base {
                     nodes[node_idx].coverage += 1;
                     if let Some(p) = prev {
                         increment_or_add_edge(nodes, p, node_idx);
+                        edge_reads.entry((p, node_idx)).or_default().push(read_idx);
                     }
-                    prev = Some(node_idx);
+                    node_idx
                 } else {
                     let new_idx = push_node(nodes, q_base);
                     nodes[new_idx].coverage = 1;
                     if let Some(p) = prev {
                         nodes[p].out_edges.push((new_idx, 1));
                         nodes[new_idx].in_edges.push(p);
+                        edge_reads.entry((p, new_idx)).or_default().push(read_idx);
                     }
-                    prev = Some(new_idx);
-                }
+                    new_idx
+                };
+                prev = Some(cur);
             }
             AlignOp::Insert(q_base) => {
                 q_idx += 1;
@@ -569,6 +583,7 @@ fn add_to_graph(nodes: &mut Vec<Node>, query: &[u8], ops: &[AlignOp]) {
                 if let Some(p) = prev {
                     nodes[p].out_edges.push((new_idx, 1));
                     nodes[new_idx].in_edges.push(p);
+                    edge_reads.entry((p, new_idx)).or_default().push(read_idx);
                 }
                 prev = Some(new_idx);
             }
@@ -577,6 +592,7 @@ fn add_to_graph(nodes: &mut Vec<Node>, query: &[u8], ops: &[AlignOp]) {
                 nodes[node_idx].delete_count += 1;
                 if let Some(p) = prev {
                     increment_or_add_edge(nodes, p, node_idx);
+                    edge_reads.entry((p, node_idx)).or_default().push(read_idx);
                 }
                 prev = Some(node_idx);
             }
@@ -763,6 +779,101 @@ fn binary_entropy(p: f64) -> f64 {
     }
 }
 
+// ─── Multi-allele helpers ─────────────────────────────────────────────────────
+
+/// Returns `(entry_node_idx, arm_start_node_idxs)` for every bubble in the
+/// graph — nodes that have 2+ outgoing edges each above the min_allele_freq
+/// threshold. The list is in topological order.
+fn find_bubbles(
+    nodes: &[Node],
+    topo: &[usize],
+    n_reads: usize,
+    min_allele_freq: f64,
+) -> Vec<(usize, Vec<usize>)> {
+    let threshold = ((n_reads as f64 * min_allele_freq).ceil() as i32).max(1);
+    topo.iter()
+        .copied()
+        .filter_map(|node_idx| {
+            let arms: Vec<usize> = nodes[node_idx]
+                .out_edges
+                .iter()
+                .filter(|&&(_, w)| w >= threshold)
+                .map(|&(to, _)| to)
+                .collect();
+            if arms.len() >= 2 { Some((node_idx, arms)) } else { None }
+        })
+        .collect()
+}
+
+/// Partition reads into allele groups by examining which arm of `entry_node`
+/// each read traversed, using per-edge read membership recorded in `edge_reads`.
+/// Reads not observed on any qualifying arm are absorbed into the largest group.
+/// Returns at most 2 groups (the two highest-support arms).
+fn partition_reads_by_bubble(
+    edge_reads: &HashMap<(usize, usize), Vec<u32>>,
+    entry_node: usize,
+    arm_starts: &[usize],
+    n_reads: usize,
+) -> Vec<Vec<usize>> {
+    // Keep the two arms with the most read support.
+    let mut arm_order: Vec<usize> = (0..arm_starts.len()).collect();
+    arm_order.sort_unstable_by(|&a, &b| {
+        let wa = edge_reads.get(&(entry_node, arm_starts[a])).map_or(0, |v| v.len());
+        let wb = edge_reads.get(&(entry_node, arm_starts[b])).map_or(0, |v| v.len());
+        wb.cmp(&wa)
+    });
+    let n_arms = arm_order.len().min(2);
+
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_arms];
+    let mut assigned = vec![false; n_reads];
+
+    for (slot, &arm_idx) in arm_order[..n_arms].iter().enumerate() {
+        let arm_start = arm_starts[arm_idx];
+        if let Some(reads) = edge_reads.get(&(entry_node, arm_start)) {
+            for &r in reads {
+                let r = r as usize;
+                if r < n_reads && !assigned[r] {
+                    groups[slot].push(r);
+                    assigned[r] = true;
+                }
+            }
+        }
+    }
+
+    // Reads not on any arm (e.g. Delete traversals that skipped the entry)
+    // go to the largest group.
+    let largest = groups
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, g)| g.len())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    for (r, &done) in assigned.iter().enumerate() {
+        if !done {
+            groups[largest].push(r);
+        }
+    }
+
+    groups.retain(|g| !g.is_empty());
+    groups
+}
+
+/// Index within `group` of the read whose length is closest to the median.
+fn choose_seed(group: &[usize], reads: &[Vec<u8>]) -> usize {
+    if group.len() == 1 {
+        return 0;
+    }
+    let mut lens: Vec<usize> = group.iter().map(|&i| reads[i].len()).collect();
+    lens.sort_unstable();
+    let median = lens[lens.len() / 2];
+    group
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &i)| reads[i].len().abs_diff(median))
+        .map(|(slot, _)| slot)
+        .unwrap_or(0)
+}
+
 // ─── PoaGraph public API ─────────────────────────────────────────────────────
 
 impl PoaGraph {
@@ -777,14 +888,19 @@ impl PoaGraph {
             nodes[idx].coverage = 1;
         }
         let n = nodes.len();
+        // Record the seed (read 0) as traversing each backbone edge.
+        let mut edge_reads: HashMap<(usize, usize), Vec<u32>> = HashMap::new();
         for i in 0..n.saturating_sub(1) {
             add_edge(&mut nodes, i, i + 1);
+            edge_reads.insert((i, i + 1), vec![0u32]);
         }
 
         Ok(PoaGraph {
             nodes,
             config,
             n_reads: 1,
+            reads: vec![seed.to_vec()],
+            edge_reads,
         })
     }
 
@@ -806,7 +922,9 @@ impl PoaGraph {
 
         let (topo, rank_of) = topological_order(&self.nodes);
         let ops = align(&self.nodes, &topo, &rank_of, read, &self.config, w)?;
-        add_to_graph(&mut self.nodes, read, &ops);
+        let read_idx = self.n_reads as u32;
+        add_to_graph(&mut self.nodes, &mut self.edge_reads, read, &ops, read_idx);
+        self.reads.push(read.to_vec());
         self.n_reads += 1;
         Ok(())
     }
@@ -886,6 +1004,74 @@ impl PoaGraph {
 
     pub fn stats(&self) -> GraphStats {
         compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads)
+    }
+
+    /// Build one consensus per detected allele by partitioning reads at the
+    /// strongest bubble and running a fresh POA for each allele group.
+    ///
+    /// Returns a single-element `Vec` when no bubble is found (homozygous site
+    /// or insufficient allele frequency). Returns `Err(InsufficientDepth)` when
+    /// any allele group has fewer reads than `config.min_reads`.
+    pub fn consensus_multi(&self) -> Result<Vec<Consensus>, PoaError> {
+        if self.n_reads < self.config.min_reads {
+            return Err(PoaError::InsufficientDepth {
+                got: self.n_reads,
+                min: self.config.min_reads,
+            });
+        }
+
+        let (topo, _) = topological_order(&self.nodes);
+        let bubbles =
+            find_bubbles(&self.nodes, &topo, self.n_reads, self.config.min_allele_freq);
+
+        if bubbles.is_empty() {
+            return Ok(vec![self.consensus()?]);
+        }
+
+        // Pick the bubble whose minor arm has the most support (strongest het signal).
+        let (entry, arm_starts) = bubbles
+            .iter()
+            .max_by_key(|(entry, arms)| {
+                arms.iter()
+                    .filter_map(|&arm| self.edge_reads.get(&(*entry, arm)))
+                    .map(|v| v.len())
+                    .min()
+                    .unwrap_or(0)
+            })
+            .unwrap();
+
+        let groups = partition_reads_by_bubble(
+            &self.edge_reads,
+            *entry,
+            arm_starts,
+            self.n_reads,
+        );
+
+        if groups.len() < 2 {
+            return Ok(vec![self.consensus()?]);
+        }
+
+        let mut results = Vec::with_capacity(groups.len());
+        for group in &groups {
+            if group.len() < self.config.min_reads {
+                return Err(PoaError::InsufficientDepth {
+                    got: group.len(),
+                    min: self.config.min_reads,
+                });
+            }
+            let seed_slot = choose_seed(group, &self.reads);
+            let seed = &self.reads[group[seed_slot]];
+            let mut sub = PoaGraph::new(seed, self.config.clone())?;
+            for (slot, &read_idx) in group.iter().enumerate() {
+                if slot == seed_slot {
+                    continue;
+                }
+                sub.add_read(&self.reads[read_idx])?;
+            }
+            results.push(sub.consensus()?);
+        }
+
+        Ok(results)
     }
 
     fn min_coverage(&self) -> u32 {
