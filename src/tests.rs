@@ -1,4 +1,4 @@
-use crate::{AlignmentMode, PoaConfig, PoaError, PoaGraph};
+use crate::{AlignmentMode, ConsensusMode, PoaConfig, PoaError, PoaGraph};
 
 fn b(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
@@ -563,4 +563,82 @@ fn mixed_strand_input() {
     }
     let result = graph.consensus().unwrap().sequence;
     assert_eq!(result.len(), 9, "mixed strand: got len {}", result.len());
+}
+
+// ── Majority-frequency consensus ──────────────────────────────────────────────
+
+fn mf_cfg() -> PoaConfig {
+    PoaConfig {
+        consensus_mode: ConsensusMode::MajorityFrequency,
+        ..Default::default()
+    }
+}
+
+fn mf_consensus(reads: &[Vec<u8>], seed_idx: usize) -> Vec<u8> {
+    consensus_cfg(reads, seed_idx, mf_cfg())
+}
+
+#[test]
+fn mf_identical_reads() {
+    let reads = vec![b("CATCATCAT"), b("CATCATCAT"), b("CATCATCAT")];
+    assert_eq!(mf_consensus(&reads, 0), b("CATCATCAT"));
+}
+
+#[test]
+fn mf_matches_hb_on_clean_input() {
+    // On a read set with no noise, MF and HB should agree.
+    let reads = vec![
+        b("CAGCAGCAG"),
+        b("CAGCAGCAG"),
+        b("CAGCAGCAGCAG"),
+        b("CAGCAGCAG"),
+    ];
+    let hb = consensus(&reads, 0);
+    let mf = mf_consensus(&reads, 0);
+    assert_eq!(hb, mf, "HB and MF disagree on clean input");
+}
+
+#[test]
+fn mf_boundary_trim_leading() {
+    // Seed has 3 extra leading bases not present in the majority.
+    // MF should exclude them because gap votes outnumber base votes.
+    let reads = vec![
+        b("XXXCATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+    ];
+    let result = s(&mf_consensus(&reads, 0));
+    assert_eq!(result, "CATCATCAT", "got: {}", result);
+}
+
+#[test]
+fn mf_boundary_trim_trailing() {
+    let reads = vec![
+        b("CATCATCATXXX"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+    ];
+    let result = s(&mf_consensus(&reads, 0));
+    assert_eq!(result, "CATCATCAT", "got: {}", result);
+}
+
+#[test]
+fn mf_majority_base_wins() {
+    // 3 reads have CAT, 1 has CGT at position 1. MF should pick A.
+    let reads = vec![
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CATCATCAT"),
+        b("CGTCATCAT"),
+    ];
+    assert_eq!(s(&mf_consensus(&reads, 0)), "CATCATCAT");
+}
+
+#[test]
+fn mf_single_outlier_not_inflated() {
+    // One read has an extra CAT; MF should not include it.
+    let reads = vec![b("CATCATCAT"), b("CATCATCAT"), b("CATCATCATCAT")];
+    assert_eq!(mf_consensus(&reads, 0).len(), 9);
 }
