@@ -187,3 +187,58 @@ pub use flank::extract_flanked_region;
 pub use graph::PoaGraph;
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
 pub use types::{Consensus, GraphStats, Strand};
+
+/// Build a single-allele consensus from `reads`.
+///
+/// `seed_idx` is the index of the read used to initialise the graph; choose a
+/// median-length read for best results.  All validation (empty input, insufficient
+/// depth, out-of-bounds seed) is delegated to [`PoaGraph`].
+pub fn consensus(
+    reads: &[&[u8]],
+    seed_idx: usize,
+    config: &PoaConfig,
+) -> Result<Consensus, PoaError> {
+    if reads.is_empty() {
+        return Err(PoaError::EmptyInput);
+    }
+    if seed_idx >= reads.len() {
+        return Err(PoaError::SeedOutOfBounds {
+            index: seed_idx,
+            len: reads.len(),
+        });
+    }
+    let mut graph = PoaGraph::new(reads[seed_idx], config.clone())?;
+    for (i, read) in reads.iter().enumerate() {
+        if i != seed_idx {
+            graph.add_read(read)?;
+        }
+    }
+    graph.consensus()
+}
+
+/// Build a multi-allele consensus from `reads`.
+///
+/// Returns one [`Consensus`] per detected allele.  If no heterozygous bubble is
+/// found the result is a single-element `Vec` equivalent to calling [`consensus`].
+pub fn consensus_multi(
+    reads: &[&[u8]],
+    seed_idx: usize,
+    config: &PoaConfig,
+) -> Result<Vec<Consensus>, PoaError> {
+    if reads.is_empty() {
+        return Err(PoaError::EmptyInput);
+    }
+    if seed_idx >= reads.len() {
+        return Err(PoaError::SeedOutOfBounds {
+            index: seed_idx,
+            len: reads.len(),
+        });
+    }
+    let mut graph = PoaGraph::new(reads[seed_idx], config.clone())?;
+    for (i, read) in reads.iter().enumerate() {
+        if i != seed_idx {
+            graph.add_read(read)?;
+        }
+    }
+    graph.consensus_multi()
+}

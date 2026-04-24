@@ -1,4 +1,6 @@
-use crate::{AlignmentMode, ConsensusMode, PoaConfig, PoaError, PoaGraph};
+use crate::{
+    self as poa_consensus, AlignmentMode, ConsensusMode, PoaConfig, PoaError, PoaGraph,
+};
 
 fn b(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
@@ -1098,4 +1100,57 @@ fn consensus_multi_nonrepeat_snv() {
         seqs.iter().any(|s| s == &allele_b),
         "allele_b not recovered"
     );
+}
+
+// ── Functional convenience wrappers ───────────────────────────────────────────
+
+#[test]
+fn fn_consensus_basic() {
+    let reads: Vec<&[u8]> = vec![b"CATCATCAT", b"CATCATCAT", b"CATCATCAT"];
+    let result = poa_consensus::consensus(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(result.sequence, b"CATCATCAT");
+}
+
+#[test]
+fn fn_consensus_empty_input() {
+    let result = poa_consensus::consensus(&[], 0, &PoaConfig::default());
+    assert!(matches!(result, Err(PoaError::EmptyInput)));
+}
+
+#[test]
+fn fn_consensus_seed_out_of_bounds() {
+    let reads: Vec<&[u8]> = vec![b"ACGT", b"ACGT"];
+    let result = poa_consensus::consensus(&reads, 5, &PoaConfig::default());
+    assert!(matches!(result, Err(PoaError::SeedOutOfBounds { index: 5, len: 2 })));
+}
+
+#[test]
+fn fn_consensus_config_respected() {
+    // min_reads=5 with only 3 reads → InsufficientDepth
+    let reads: Vec<&[u8]> = vec![b"CATCATCAT", b"CATCATCAT", b"CATCATCAT"];
+    let cfg = PoaConfig { min_reads: 5, ..Default::default() };
+    let result = poa_consensus::consensus(&reads, 0, &cfg);
+    assert!(matches!(result, Err(PoaError::InsufficientDepth { .. })));
+}
+
+#[test]
+fn fn_consensus_multi_two_alleles() {
+    let allele_a: &[u8] = b"CATCATCAT";
+    let allele_b: &[u8] = b"CATCGTCAT";
+    let reads: Vec<&[u8]> = vec![allele_a, allele_a, allele_a, allele_a, allele_b, allele_b, allele_b, allele_b];
+    let results = poa_consensus::consensus_multi(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(results.len(), 2, "expected 2 alleles");
+}
+
+#[test]
+fn fn_consensus_multi_empty_input() {
+    let result = poa_consensus::consensus_multi(&[], 0, &PoaConfig::default());
+    assert!(matches!(result, Err(PoaError::EmptyInput)));
+}
+
+#[test]
+fn fn_consensus_multi_seed_out_of_bounds() {
+    let reads: Vec<&[u8]> = vec![b"ACGT", b"ACGT"];
+    let result = poa_consensus::consensus_multi(&reads, 99, &PoaConfig::default());
+    assert!(matches!(result, Err(PoaError::SeedOutOfBounds { index: 99, len: 2 })));
 }
