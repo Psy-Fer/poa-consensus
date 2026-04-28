@@ -17,9 +17,11 @@ required-features = ["cli"]
 
 [features]
 cli = ["dep:clap", "dep:noodles"]
+plot = ["dep:kuva"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
 noodles = { version = "0.109", features = ["fasta", "fastq"], optional = true }
+kuva = { version = "0.1.6", optional = true }
 
 [dev-dependencies]

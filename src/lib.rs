@@ -342,6 +342,9 @@ pub mod graph;
 pub mod orient;
 pub mod types;
 
+#[cfg(feature = "plot")]
+pub mod plot;
+
 #[cfg(test)]
 mod tests;
 

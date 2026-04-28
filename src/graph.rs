@@ -1020,6 +1020,64 @@ impl PoaGraph {
         self.warnings
     }
 
+    /// Return all edge weights in the graph (one entry per directed edge).
+    ///
+    /// Useful for plotting the edge-weight distribution to assess how evenly
+    /// reads are distributed across graph paths.
+    pub fn edge_weights(&self) -> Vec<i32> {
+        self.nodes
+            .iter()
+            .flat_map(|n| n.out_edges.iter().map(|&(_, w)| w))
+            .collect()
+    }
+
+    /// Return per-node coverage in topological order.
+    ///
+    /// Each value is the number of reads that traversed that node via a Match
+    /// operation. Delete traversals do not increment coverage.
+    pub fn node_coverages(&self) -> Vec<u32> {
+        let (topo, _) = topological_order(&self.nodes);
+        topo.iter().map(|&i| self.nodes[i].coverage).collect()
+    }
+
+    /// Align `read` into the current graph and return the alignment operations
+    /// without modifying the graph.
+    ///
+    /// Also returns the effective band width used (`usize::MAX` = unbanded) and
+    /// the topological rank of every node, so callers can project AlignOps into
+    /// a 2D (graph_rank, read_position) coordinate space for plotting.
+    ///
+    /// This is a read-only operation — the graph is not changed.
+    pub fn align_read_ops(
+        &self,
+        read: &[u8],
+    ) -> Result<(Vec<AlignOp>, usize, Vec<usize>), PoaError> {
+        let (topo, rank_of) = topological_order(&self.nodes);
+        let w = compute_effective_band(&self.config, read.len());
+        let ops = align(&self.nodes, &topo, &rank_of, read, &self.config, w)?;
+        Ok((ops, w, rank_of))
+    }
+
+    /// Like [`align_read_ops`] but always runs unbanded, regardless of the
+    /// graph's configured band width.
+    ///
+    /// Used by the plot layer to recover the true alignment path for reads
+    /// that fail with [`PoaError::BandTooNarrow`] under the normal config.
+    pub fn align_read_ops_unbanded(
+        &self,
+        read: &[u8],
+    ) -> Result<(Vec<AlignOp>, Vec<usize>), PoaError> {
+        let (topo, rank_of) = topological_order(&self.nodes);
+        let ops = align(&self.nodes, &topo, &rank_of, read, &self.config, UNBANDED)?;
+        Ok((ops, rank_of))
+    }
+
+    /// Number of nodes currently in the graph (equals the longest path before
+    /// any reads are added, and grows as new insert-nodes are created).
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Build one consensus per detected allele by partitioning reads at the
     /// strongest bubble and running a fresh POA for each allele group.
     ///
