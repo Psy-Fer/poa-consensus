@@ -3,8 +3,15 @@ name = "poa-consensus"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Partial Order Alignment with consensus CLI and Rust library"
+description = "Banded Partial Order Alignment (POA) consensus for short tandem repeat and amplicon reads"
 license = "MIT"
+repository = "https://github.com/Psy-Fer/poa-consensus"
+homepage = "https://github.com/Psy-Fer/poa-consensus"
+documentation = "https://docs.rs/poa-consensus"
+readme = "README.md"
+authors = ["James Ferguson <j.ferguson@garvan.org.au>"]
+keywords = ["bioinformatics", "consensus", "alignment", "genomics", "nanopore"]
+categories = ["science", "algorithms"]
 
 [lib]
 name = "poa_consensus"
