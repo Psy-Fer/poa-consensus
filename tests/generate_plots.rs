@@ -5,6 +5,8 @@
 //!
 //! Inspect the output in `test_plots/` to visually verify plot quality.
 
+#![cfg(feature = "plot")]
+
 use std::fs;
 use std::path::PathBuf;
 

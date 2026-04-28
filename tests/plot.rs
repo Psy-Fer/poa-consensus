@@ -3,6 +3,8 @@
 //! Run with:
 //!   cargo test --features plot --test plot
 
+#![cfg(feature = "plot")]
+
 use poa_consensus::plot::{
     coverage_svg, edge_weight_histogram_svg, graph_stats_svg, node_coverage_histogram_svg,
 };
