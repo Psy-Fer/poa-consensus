@@ -25,14 +25,25 @@ const VIRTUAL: usize = usize::MAX;
 /// Returned by `compute_effective_band` to mean "no band restriction".
 const UNBANDED: usize = usize::MAX;
 
-fn compute_effective_band(cfg: &PoaConfig, read_len: usize) -> usize {
+/// Compute the effective band width for aligning `read_len` bases against a
+/// graph with `graph_nodes` nodes.
+///
+/// Each Insert operation from a previous read adds a node to the graph,
+/// shifting the topological rank of every subsequent node by one.  Over many
+/// reads this "graph expansion" can push the correct alignment path far from
+/// the read-position diagonal even for a low-error read.  The accumulated
+/// rank shift is approximately `graph_nodes - read_len`, so the band must
+/// cover both per-read drift *and* that expansion:
+///
+///   w = b + f × max(read_len, graph_nodes)
+///
+/// For `adaptive_band = false` the fixed `band_width` is returned unchanged
+/// (the caller chose it explicitly).
+fn compute_effective_band(cfg: &PoaConfig, read_len: usize, graph_nodes: usize) -> usize {
     if cfg.adaptive_band {
-        let w = cfg.adaptive_band_b + (cfg.adaptive_band_f * read_len as f32).ceil() as usize;
-        let w = if cfg.band_width > 0 {
-            w.max(cfg.band_width)
-        } else {
-            w
-        };
+        let span = read_len.max(graph_nodes);
+        let w = cfg.adaptive_band_b + (cfg.adaptive_band_f * span as f32).ceil() as usize;
+        let w = if cfg.band_width > 0 { w.max(cfg.band_width) } else { w };
         w.max(1)
     } else if cfg.band_width > 0 {
         cfg.band_width
@@ -916,7 +927,7 @@ impl PoaGraph {
             return Err(PoaError::EmptyInput);
         }
 
-        let w = compute_effective_band(&self.config, read.len());
+        let w = compute_effective_band(&self.config, read.len(), self.nodes.len());
 
         if self.config.warn_on_long_unbanded && w == UNBANDED && read.len() > 1000 {
             eprintln!(
@@ -1053,7 +1064,7 @@ impl PoaGraph {
         read: &[u8],
     ) -> Result<(Vec<AlignOp>, usize, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
-        let w = compute_effective_band(&self.config, read.len());
+        let w = compute_effective_band(&self.config, read.len(), self.nodes.len());
         let ops = align(&self.nodes, &topo, &rank_of, read, &self.config, w)?;
         Ok((ops, w, rank_of))
     }
