@@ -329,7 +329,13 @@ pub fn band_svg(graph: &PoaGraph, read: &[u8]) -> String {
     let x_vals: Vec<f64> = (0..n_nodes).map(|i| i as f64).collect();
     let lower: Vec<f64> = x_vals
         .iter()
-        .map(|&x| if unbanded { 0.0 } else { (x - w as f64).max(0.0) })
+        .map(|&x| {
+            if unbanded {
+                0.0
+            } else {
+                (x - w as f64).max(0.0)
+            }
+        })
         .collect();
     let upper: Vec<f64> = x_vals
         .iter()
@@ -405,7 +411,13 @@ pub fn band_with_reads_svg(graph: &PoaGraph, reads: &[&[u8]], seed_idx: usize) -
     let x_vals: Vec<f64> = (0..n_nodes).map(|i| i as f64).collect();
     let lower: Vec<f64> = x_vals
         .iter()
-        .map(|&x| if unbanded { 0.0 } else { (x - w as f64).max(0.0) })
+        .map(|&x| {
+            if unbanded {
+                0.0
+            } else {
+                (x - w as f64).max(0.0)
+            }
+        })
         .collect();
     let upper: Vec<f64> = x_vals
         .iter()

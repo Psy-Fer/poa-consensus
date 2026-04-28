@@ -9,8 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use poa_consensus::plot::{
-    alignment_density_svg, band_svg, band_with_reads_svg, coverage_svg,
-    edge_weight_histogram_svg, graph_stats_svg, node_coverage_histogram_svg,
+    alignment_density_svg, band_svg, band_with_reads_svg, coverage_svg, edge_weight_histogram_svg,
+    graph_stats_svg, node_coverage_histogram_svg,
 };
 use poa_consensus::{AlignmentMode, PoaConfig, PoaGraph, consensus, consensus_multi};
 
@@ -76,7 +76,10 @@ fn plot_simple_edge_weights() {
         g.add_read(r).unwrap();
     }
     let weights = g.edge_weights();
-    save("simple_edge_weights.svg", &edge_weight_histogram_svg(&weights));
+    save(
+        "simple_edge_weights.svg",
+        &edge_weight_histogram_svg(&weights),
+    );
 }
 
 #[test]
@@ -382,7 +385,10 @@ fn plot_band_with_reads_clean() {
     for r in &reads[1..] {
         g.add_read(r).unwrap();
     }
-    save("band_with_reads_clean.svg", &band_with_reads_svg(&g, &reads, 0));
+    save(
+        "band_with_reads_clean.svg",
+        &band_with_reads_svg(&g, &reads, 0),
+    );
 }
 
 /// Noisy reads, tight band — SNP reads drift but stay inside; seed bold.
