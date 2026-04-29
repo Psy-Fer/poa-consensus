@@ -1,5 +1,11 @@
 # poa-consensus
 
+**This repo is currently under active development with parts of the core algorithms changing as I test various methods**
+
+Please wait for a release before "trusting" anything from this repo.
+
+---
+
 A pure-Rust banded Partial Order Alignment (POA) library for building consensus sequences from a set of reads.
 
 POA aligns reads into a directed acyclic graph (DAG) using affine-gap dynamic programming (separate scoring for gap open and gap extension) and extracts consensus by following the heaviest (most-supported) path. Insertions and deletions create branches resolved by read support.
