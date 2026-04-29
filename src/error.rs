@@ -5,7 +5,7 @@ pub enum PoaError {
     EmptyInput,
     InsufficientDepth { got: usize, min: usize },
     SeedOutOfBounds { index: usize, len: usize },
-    BandTooNarrow { band_width: usize, read_len: usize },
+    BandTooNarrow { configured: usize, required: usize },
 }
 
 impl fmt::Display for PoaError {
@@ -23,14 +23,11 @@ impl fmt::Display for PoaError {
             PoaError::SeedOutOfBounds { index, len } => {
                 write!(f, "seed index {index} is out of bounds for {len} reads")
             }
-            PoaError::BandTooNarrow {
-                band_width,
-                read_len,
-            } => {
+            PoaError::BandTooNarrow { configured, required } => {
                 write!(
                     f,
-                    "band width {band_width} is too narrow for read length {read_len}; \
-                     alignment reached the band edge and may be incorrect"
+                    "band width {configured} too narrow; estimated {required} required — \
+                     retry with a wider band or enable adaptive_band"
                 )
             }
         }

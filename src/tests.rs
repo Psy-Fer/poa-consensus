@@ -451,11 +451,12 @@ fn adaptive_band_matches_unbanded() {
 
 #[test]
 fn band_too_narrow_returns_error() {
-    // seed = 1 A, read = 10 A's: the read is 10 bp but the 1-node graph with
-    // band_width=2 can only reach j_hi=min(10, 0+2)=2 at t=0. Column j=10 is
-    // never in-band, so the terminal scan finds no cells and BandTooNarrow fires.
+    // seed = 1 A, read = 30 A's: smart retry widens the band (w=2 → ~18) but
+    // a 1-node graph with centre=1 can only reach j_hi=1+18=19 at t=0. Column
+    // j=30 is never in-band even after retry, so the terminal scan returns
+    // BandTooNarrow which propagates to the caller.
     let seed = b("A");
-    let read = b("AAAAAAAAAA");
+    let read = b("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); // 30 A's
     let cfg = PoaConfig {
         band_width: 2,
         ..Default::default()
@@ -906,6 +907,74 @@ fn long_adaptive_band_matches_unbanded() {
     assert_eq!(
         adaptive, unbanded,
         "adaptive band should match unbanded for small divergence"
+    );
+}
+
+// ── Performance optimisation tests ───────────────────────────────────────────
+
+#[test]
+fn skip_fires_on_clean_reads() {
+    // Zero-error reads: the diagonal skip fires on ~100% of rows.
+    // Verify correctness — narrow band with skip active must produce the same
+    // consensus as unbanded and must equal the read itself.
+    let read: Vec<u8> = "CAT".repeat(10).into_bytes(); // 30 bp, 10 identical reads
+    let reads: Vec<Vec<u8>> = vec![read.clone(); 10];
+    let unbanded = consensus(&reads, 0);
+    let cfg = PoaConfig {
+        band_width: 5,
+        ..Default::default()
+    };
+    let banded = consensus_cfg(&reads, 0, cfg);
+    assert_eq!(banded, unbanded, "diagonal skip: banded must match unbanded on identical reads");
+    assert_eq!(banded, read, "diagonal skip: consensus of identical reads must equal the read");
+}
+
+#[test]
+fn tracking_band_survives_phase_shift() {
+    // One read with a 10-bp prefix insertion shifts the alignment diagonal by 10.
+    // With a fixed-diagonal band of 5 this would be BandTooNarrow; with the
+    // tracking band the band re-centres after the shift, and smart retry widens
+    // the initial band so alignment succeeds.
+    let base: Vec<u8> = "ACGT".repeat(15).into_bytes(); // 60 bp
+    let shifted: Vec<u8> = {
+        let mut s = b"AAAAAAAAAA".to_vec(); // 10 bp prefix → diagonal drift +10
+        s.extend_from_slice(&base);
+        s
+    }; // 70 bp
+    let mut reads: Vec<Vec<u8>> = vec![base.clone(); 4];
+    reads.push(shifted);
+    let unbanded = consensus(&reads, 0);
+    let cfg = PoaConfig {
+        band_width: 5,
+        ..Default::default()
+    };
+    let banded = consensus_cfg(&reads, 0, cfg);
+    assert_eq!(
+        banded, unbanded,
+        "tracking band: must match unbanded on reads with a large phase shift"
+    );
+}
+
+#[test]
+fn sv_retry_correct() {
+    // One outlier read with a 15-bp expansion against 5 short reads. band_width=3
+    // is too narrow to track the diagonal shift: approaching-edge fires on every
+    // row (right_margin = w = 3 < GAP_MARGIN), forcing a smart retry with a wider
+    // band (~17). The retry band covers j=l=24 at the last graph node, so the
+    // alignment succeeds without a second retry. Majority consensus is "CAT"×3.
+    let short: Vec<u8> = "CAT".repeat(3).into_bytes(); // 9 bp
+    let expanded: Vec<u8> = "CAT".repeat(8).into_bytes(); // 24 bp (+15 bp expansion)
+    let mut reads: Vec<Vec<u8>> = vec![short.clone(); 5];
+    reads.push(expanded);
+    let unbanded = consensus(&reads, 0);
+    let cfg = PoaConfig {
+        band_width: 3,
+        ..Default::default()
+    };
+    let banded = consensus_cfg(&reads, 0, cfg);
+    assert_eq!(
+        banded, unbanded,
+        "sv_retry: smart retry must produce correct consensus when SV read forces band widening"
     );
 }
 
