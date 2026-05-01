@@ -450,11 +450,10 @@ fn adaptive_band_matches_unbanded() {
 }
 
 #[test]
-fn band_too_narrow_returns_error() {
-    // seed = 1 A, read = 30 A's: smart retry widens the band (w=2 → ~18) but
-    // a 1-node graph with centre=1 can only reach j_hi=1+18=19 at t=0. Column
-    // j=30 is never in-band even after retry, so the terminal scan returns
-    // BandTooNarrow which propagates to the caller.
+fn band_too_narrow_fallback_to_unbanded() {
+    // seed = 1 A, read = 30 A's: the 2-pass banded retry exhausts all banded
+    // options but the 3-pass unbanded fallback recovers.  BandTooNarrow is now
+    // an internal signal, not a user-visible error.
     let seed = b("A");
     let read = b("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); // 30 A's
     let cfg = PoaConfig {
@@ -464,8 +463,8 @@ fn band_too_narrow_returns_error() {
     let mut graph = PoaGraph::new(&seed, cfg).unwrap();
     let result = graph.add_read(&read);
     assert!(
-        matches!(result, Err(PoaError::BandTooNarrow { .. })),
-        "expected BandTooNarrow, got {:?}",
+        result.is_ok(),
+        "3-pass retry must recover via unbanded fallback, got {:?}",
         result.map(|_| ())
     );
 }

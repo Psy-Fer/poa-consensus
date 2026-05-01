@@ -570,8 +570,15 @@ fn best_prev_state(m: &DpTable, ins: &DpTable, del: &DpTable, t: usize, j: usize
 }
 
 /// Align `query` against the graph, retrying with a wider band if the first
-/// attempt returns `BandTooNarrow`.  At most two alignment passes are run; the
-/// first pass exits early on edge approach, so retry cost dominates.
+/// Align `query` against the graph, retrying with progressively wider bands if
+/// the first attempt returns `BandTooNarrow`.
+///
+/// Pass 1: the initial band `w`. Exits early if the approaching-edge detector
+///   fires, saving most of the DP work.
+/// Pass 2: `required` from pass 1, which corrects for the drift observed so far.
+///   Wider DP may expose new drift that was hidden by the narrower band.
+/// Pass 3 (fallback): unbanded. Always correct; used only when pass 2 also fails.
+///   For reads under ~1 kb the unbanded DP is negligible in cost.
 fn align_with_retry(
     nodes: &[Node],
     topo: &[usize],
@@ -580,17 +587,22 @@ fn align_with_retry(
     cfg: &PoaConfig,
     w: usize,
 ) -> Result<Vec<AlignOp>, PoaError> {
-    match align(nodes, topo, rank_of, query, cfg, w) {
+    let r1 = align(nodes, topo, rank_of, query, cfg, w);
+    let required = match r1 {
+        Ok(ops) => return Ok(ops),
+        Err(PoaError::BandTooNarrow { required, .. }) => required,
+        Err(e) => return Err(e),
+    };
+
+    // Pass 2: use the estimated required width.
+    let w2 = required.max(w + 1);
+    let r2 = align(nodes, topo, rank_of, query, cfg, w2);
+    match r2 {
         Ok(ops) => Ok(ops),
-        Err(PoaError::BandTooNarrow { required, .. }) => {
-            // Add 25 % headroom; fall back to unbanded if the required width
-            // is already large enough that unbanded is safer.
-            let w2 = if required >= UNBANDED / 2 {
-                UNBANDED
-            } else {
-                (required + required / 4).max(required + GAP_MARGIN * 2)
-            };
-            align(nodes, topo, rank_of, query, cfg, w2)
+        Err(PoaError::BandTooNarrow { .. }) => {
+            // Pass 2 exposed new drift hidden by the narrower band. Fall back
+            // to unbanded which is always correct.
+            align(nodes, topo, rank_of, query, cfg, UNBANDED)
         }
         Err(e) => Err(e),
     }
