@@ -28,7 +28,31 @@ pub struct GraphStats {
 #[derive(Debug, Clone)]
 pub struct Consensus {
     pub sequence: Vec<u8>,
-    /// Per-base coverage along the consensus path.
+    /// Per-base match-read count along the consensus path.
     pub coverage: Vec<u32>,
+    /// Incoming edge weight on the heaviest path for each base.
+    /// For the first base (no incoming path edge) the node's coverage is used.
+    /// For `ConsensusMode::MajorityFrequency` every position uses node coverage.
+    pub path_weights: Vec<i32>,
+    /// Total reads used to build this consensus (seed + all `add_read` calls).
+    pub n_reads: usize,
     pub graph_stats: GraphStats,
+}
+
+impl Consensus {
+    /// Per-base fraction of reads supporting each consensus base, in [0.0, 1.0].
+    ///
+    /// The numerator is `path_weights[i]` (the number of reads that traversed
+    /// the incoming edge at this position).  The denominator is `n_reads`.
+    /// For partial-read inputs, positions covered only by the spanning seed
+    /// will have weight 1 and a low fraction.
+    pub fn weight_fraction(&self) -> Vec<f32> {
+        if self.n_reads == 0 {
+            return vec![0.0; self.path_weights.len()];
+        }
+        self.path_weights
+            .iter()
+            .map(|&w| (w as f32 / self.n_reads as f32).clamp(0.0, 1.0))
+            .collect()
+    }
 }

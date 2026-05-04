@@ -1,4 +1,5 @@
 use crate::{self as poa_consensus, AlignmentMode, ConsensusMode, PoaConfig, PoaError, PoaGraph};
+use crate::graph::AlignOp;
 
 fn b(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
@@ -515,6 +516,277 @@ fn partial_reads_semi_global() {
         result.len(),
         s(&result)
     );
+}
+
+// ── Partial read coverage behaviour ──────────────────────────────────────────
+
+#[test]
+fn one_spanning_many_partial_default_min_cov_truncates() {
+    // With default min_cov (≈ n/2 + 1), a single spanning read never provides
+    // enough coverage to keep boundary nodes when partial reads dominate.
+    // This test documents the known behaviour so a future change doesn't
+    // silently alter it.
+    let spanning = b("ACGTACGTACGT"); // 12 bp
+    let partial = b("ACGTACGT");      //  8 bp (covers prefix only)
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::SemiGlobal,
+        ..Default::default()
+    };
+    // 1 spanning + 4 partial = 5 reads; default min_cov = 5/2+1 = 3.
+    // Boundary nodes only have coverage 1 (from spanning seed) → trimmed.
+    let reads = vec![
+        spanning.clone(),
+        partial.clone(), partial.clone(), partial.clone(), partial.clone(),
+    ];
+    let result = consensus_cfg(&reads, 0, cfg);
+    assert!(
+        result.len() < 12,
+        "expected boundary trim with default min_cov, got len {} seq '{}'",
+        result.len(), s(&result)
+    );
+}
+
+#[test]
+fn one_spanning_many_partial_low_min_cov_reaches_partial_end() {
+    // Lowering min_coverage_fraction removes the boundary-trim truncation,
+    // but the (weight-1) normalisation in the heaviest path is a separate gate:
+    // edges traversed by only one read contribute score 0, and `find` prefers
+    // the shortest equal-score terminus.  So the consensus extends to the end
+    // of the partial reads (position 8) but not to the spanning-only tail
+    // (positions 8-11) because those edges score 0.
+    //
+    // To get the full-length consensus you need ≥ 2 reads covering the tail;
+    // see `two_spanning_many_partial_full_length` below.
+    let spanning = b("ACGTACGTACGT");
+    let partial = b("ACGTACGT");
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::SemiGlobal,
+        min_coverage_fraction: 0.1,
+        ..Default::default()
+    };
+    let reads = vec![
+        spanning.clone(),
+        partial.clone(), partial.clone(), partial.clone(), partial.clone(),
+    ];
+    let result = consensus_cfg(&reads, 0, cfg);
+    assert!(
+        result.len() >= 8,
+        "consensus should reach at least the partial read end, got len {} seq '{}'",
+        result.len(), s(&result)
+    );
+}
+
+#[test]
+fn two_spanning_many_partial_full_length() {
+    // With ≥ 2 spanning reads the tail edges (nodes 8-11) get weight ≥ 2,
+    // contributing a positive score to the heaviest path.  The boundary trim
+    // uses min_cov = ceil(6 * 0.1) = 1, which the spanning reads satisfy.
+    // Result: full 12-bp consensus.
+    let spanning = b("ACGTACGTACGT");
+    let partial = b("ACGTACGT");
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::SemiGlobal,
+        min_coverage_fraction: 0.1,
+        ..Default::default()
+    };
+    let reads = vec![
+        spanning.clone(), spanning.clone(),         // 2 spanning → tail edges weight=2
+        partial.clone(), partial.clone(), partial.clone(), partial.clone(),
+    ];
+    let result = consensus_cfg(&reads, 0, cfg);
+    assert_eq!(
+        result.len(), 12,
+        "two spanning reads should yield full-length consensus, got len {} seq '{}'",
+        result.len(), s(&result)
+    );
+}
+
+#[test]
+fn overlapping_partial_reads_assemble_beyond_seed_length() {
+    // Left-partial + right-partial reads that together span a longer sequence
+    // than any individual read.  The seed covers only the left half; reads
+    // covering the right half extend the graph via Insert ops.  With
+    // min_coverage_fraction = 0.1, the assembled consensus is longer than the seed.
+    //
+    // Sequence: ACGTACGTACGTACGT (16 bp)
+    // Left reads (12 bp):  ACGTACGTACGT
+    // Right reads (12 bp): ACGTACGTACGT  (offset 4 in the full sequence → ACGTACGTACGT)
+    // Together they overlap for 8 bp and cover the full 16 bp.
+    let left  = b("ACGTACGTACGT");   // covers positions 0-11
+    let right = b("ACGTACGTACGT");   // same sequence; in a real scenario these
+                                     // would be from a different region, but here
+                                     // we just verify the graph can grow past seed length.
+    // Use an explicit short seed so the right reads extend the graph.
+    let seed  = b("ACGTACGT");       // 8 bp seed
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::SemiGlobal,
+        min_coverage_fraction: 0.1,
+        ..Default::default()
+    };
+    // 1 seed + 3 left (12 bp) + 3 right (12 bp) = 7 reads.
+    // min_cov = ceil(7 * 0.1) = 1; boundary nodes survive.
+    let reads = vec![
+        seed.clone(),
+        left.clone(), left.clone(), left.clone(),
+        right.clone(), right.clone(), right.clone(),
+    ];
+    let result = consensus_cfg(&reads, 0, cfg);
+    assert!(
+        result.len() >= seed.len(),
+        "assembled consensus should be at least as long as the seed, got len {} seq '{}'",
+        result.len(), s(&result)
+    );
+}
+
+#[test]
+fn coverage_vec_reflects_partial_read_depth() {
+    // The Consensus::coverage field must show lower values at positions that
+    // only spanning reads covered and higher values where partial reads also
+    // contributed.
+    let spanning = b("ACGTACGTACGT"); // 12 bp
+    let partial  = b("ACGTACGT");     //  8 bp (covers prefix nodes)
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::SemiGlobal,
+        min_coverage_fraction: 0.1,
+        ..Default::default()
+    };
+    let mut graph = PoaGraph::new(&spanning, cfg).unwrap();
+    for _ in 0..4 {
+        graph.add_read(&partial).unwrap();
+    }
+    let cons = graph.consensus().unwrap();
+    // First 8 positions covered by all 5 reads (spanning + 4 partial).
+    let prefix_min = cons.coverage[..8].iter().copied().min().unwrap_or(0);
+    // Last 4 positions covered only by the spanning seed.
+    let suffix_max = cons.coverage[8..].iter().copied().max().unwrap_or(0);
+    assert!(
+        prefix_min > suffix_max,
+        "prefix coverage ({}) should exceed suffix coverage ({})",
+        prefix_min, suffix_max
+    );
+}
+
+// ── path_weights and weight_fraction ─────────────────────────────────────────
+
+#[test]
+fn path_weights_reflect_edge_support() {
+    // 1 spanning seed + 4 partial reads covering the first 8 of 12 nodes.
+    // Interior edges (0-7) should have weight 5 (seed + 4 partial).
+    // The partial reads end at node 7, so the consensus (heaviest path) stops
+    // there.  All 8 weights should be ≥ 2 (shared) and n_reads should be 5.
+    let spanning = b("ACGTACGTACGT");
+    let partial  = b("ACGTACGT");
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::SemiGlobal,
+        min_coverage_fraction: 0.1,
+        ..Default::default()
+    };
+    let mut graph = PoaGraph::new(&spanning, cfg).unwrap();
+    for _ in 0..4 { graph.add_read(&partial).unwrap(); }
+    let cons = graph.consensus().unwrap();
+
+    assert_eq!(cons.n_reads, 5);
+    assert_eq!(cons.path_weights.len(), cons.sequence.len());
+    // Every weight in the consensus should reflect multi-read support.
+    for (i, &w) in cons.path_weights.iter().enumerate() {
+        assert!(w >= 2, "position {i}: weight {w} should be ≥ 2 (shared by seed + partial)");
+    }
+}
+
+#[test]
+fn weight_fraction_in_unit_interval() {
+    let reads = vec![b("ACGTACGT"); 5];
+    let cons = consensus_cfg(&reads, 0, PoaConfig::default());
+    // Build Consensus directly to check the fraction helper.
+    let mut graph = PoaGraph::new(&reads[0], PoaConfig::default()).unwrap();
+    for r in &reads[1..] { graph.add_read(r).unwrap(); }
+    let c = graph.consensus().unwrap();
+    let fracs = c.weight_fraction();
+    assert_eq!(fracs.len(), cons.len());
+    for (i, &f) in fracs.iter().enumerate() {
+        assert!((0.0..=1.0).contains(&f), "position {i}: fraction {f} out of [0,1]");
+    }
+    // All reads identical → all fractions should be 1.0.
+    for (i, &f) in fracs.iter().enumerate() {
+        assert!((f - 1.0).abs() < 1e-6, "position {i}: expected fraction 1.0, got {f}");
+    }
+}
+
+#[test]
+fn weight_fraction_drops_at_single_read_positions() {
+    // Non-repetitive spanning sequence so partial reads have exactly one valid
+    // alignment position (avoids the rotation-phase tie-break issue that arises
+    // with periodic sequences like ACGTACGTACGT).
+    //
+    // 2 spanning reads (needed so tail edges score > 0 and enter the path) +
+    // 4 partial reads covering only the first 8 of 12 bases.
+    // Tail positions (8-11) are supported only by the 2 spanning reads;
+    // their fraction (2/6 ≈ 0.33) should be below the prefix fraction (6/6 = 1.0).
+    let spanning = b("ACGTTGCAATGC"); // 12 bp, no 8-mer repeats
+    let partial  = b("ACGTTGCA");     //  8 bp, uniquely matches positions 0-7
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::SemiGlobal,
+        min_coverage_fraction: 0.1,
+        ..Default::default()
+    };
+    let mut graph = PoaGraph::new(&spanning, cfg.clone()).unwrap();
+    graph.add_read(&spanning).unwrap();
+    for _ in 0..4 { graph.add_read(&partial).unwrap(); }
+    let cons = graph.consensus().unwrap();
+    let fracs = cons.weight_fraction();
+
+    assert_eq!(cons.sequence.len(), 12, "expected full-length consensus");
+    let prefix_frac: f32 = fracs[..8].iter().copied().sum::<f32>() / 8.0;
+    let suffix_frac: f32 = fracs[8..].iter().copied().sum::<f32>() / 4.0;
+    assert!(
+        prefix_frac > suffix_frac,
+        "prefix avg fraction ({prefix_frac:.2}) should exceed suffix ({suffix_frac:.2})"
+    );
+}
+
+// Semi-global op-level tests: verify the alignment ops themselves, not just
+// the consensus.  These catch bugs that happen to not affect the output length
+// but still corrupt edge weights or delete_counts.
+
+#[test]
+fn semi_global_no_prefix_deletes_for_mid_start_read() {
+    // Seed "GGACGT", partial read "ACGT" matches the suffix perfectly.
+    // In global mode the aligner is forced to start from the source (G,G) and
+    // emits Delete ops for those prefix nodes.  Semi-global lets the read start
+    // at the first matching node and must produce zero Deletes.
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::SemiGlobal,
+        band_width: 0,
+        ..Default::default()
+    };
+    let graph = PoaGraph::new(b"GGACGT", cfg).unwrap();
+    let (ops, _) = graph.align_read_ops_unbanded(b"ACGT").unwrap();
+    let n_del = ops.iter().filter(|op| matches!(op, AlignOp::Delete(_))).count();
+    let n_mat = ops.iter().filter(|op| matches!(op, AlignOp::Match(_))).count();
+    assert_eq!(n_del, 0, "semi-global: expected no prefix Deletes, got {:?}", ops);
+    assert_eq!(n_mat, 4, "semi-global: expected 4 Matches, got {:?}", ops);
+}
+
+#[test]
+fn global_produces_prefix_deletes_for_mid_start_read() {
+    // Same setup, global mode: the alignment is forced through the GG prefix,
+    // producing Delete ops for those nodes.
+    let cfg = PoaConfig { band_width: 0, ..Default::default() };
+    let graph = PoaGraph::new(b"GGACGT", cfg).unwrap();
+    let (ops, _) = graph.align_read_ops_unbanded(b"ACGT").unwrap();
+    let n_del = ops.iter().filter(|op| matches!(op, AlignOp::Delete(_))).count();
+    assert!(n_del > 0, "global: expected prefix Delete ops for mid-start read");
+}
+
+#[test]
+fn semi_global_spanning_read_matches_global() {
+    // A read that spans the full seed is not partial; semi-global and global
+    // must produce the same consensus.
+    let reads = vec![b("ACGTACGT"); 4];
+    let global = consensus(&reads, 0);
+    let cfg = PoaConfig { alignment_mode: AlignmentMode::SemiGlobal, ..Default::default() };
+    let semi = consensus_cfg(&reads, 0, cfg);
+    assert_eq!(global, semi, "spanning reads: semi-global must equal global");
 }
 
 // ── Reverse complement / orientation ─────────────────────────────────────────

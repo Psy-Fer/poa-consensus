@@ -1,4 +1,4 @@
-use crate::config::{ConsensusMode, PoaConfig};
+use crate::config::{AlignmentMode, ConsensusMode, PoaConfig};
 use crate::error::PoaError;
 use crate::types::{Consensus, GraphStats};
 use std::collections::HashMap;
@@ -369,9 +369,10 @@ fn align(
             // M[t][j]
             {
                 let (mut best, mut best_pred) = (UNSET, VIRTUAL);
-                if is_source && j == 1 {
-                    let val = score_fn;
-                    if val > best { best = val; best_pred = VIRTUAL; }
+                if j == 1 && (is_source || cfg.alignment_mode == AlignmentMode::SemiGlobal) {
+                    // Source nodes start clean at j=1.
+                    // Semi-global: any node can begin alignment here (free graph prefix).
+                    if score_fn > best { best = score_fn; best_pred = VIRTUAL; }
                 }
                 if is_source && j > 1 {
                     let val = safe_add(go + (j as i32 - 1) * ge, score_fn);
@@ -670,9 +671,10 @@ fn add_to_graph(
 
 // ─── Heaviest path ────────────────────────────────────────────────────────────
 
-fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usize, u8)> {
+fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usize, u8, i32)> {
     let n = topo.len();
-    let mut cum: Vec<(i64, Option<usize>)> = vec![(0, None); n];
+    // (cumulative_score, predecessor_t, edge_weight_from_predecessor)
+    let mut cum: Vec<(i64, Option<usize>, i32)> = vec![(0, None, 0); n];
 
     for t in 0..n {
         let node_idx = topo[t];
@@ -681,7 +683,7 @@ fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usiz
             let succ_t = rank_of[succ_idx];
             let candidate = curr + (weight - 1) as i64;
             if candidate > cum[succ_t].0 {
-                cum[succ_t] = (candidate, Some(t));
+                cum[succ_t] = (candidate, Some(t), weight);
             }
         }
     }
@@ -690,10 +692,18 @@ fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usiz
     // Prefer shortest path among equal-weight termini.
     let best_t = (0..n).find(|&t| cum[t].0 == max_cum).unwrap_or(0);
 
-    let mut path: Vec<(usize, u8)> = Vec::new();
+    let mut path: Vec<(usize, u8, i32)> = Vec::new();
     let mut t = best_t;
     loop {
-        path.push((topo[t], nodes[topo[t]].base));
+        let node_idx = topo[t];
+        // For the first node (no predecessor edge) use coverage so the fraction
+        // helper has a meaningful denominator at position 0.
+        let w = if cum[t].1.is_none() {
+            nodes[node_idx].coverage as i32
+        } else {
+            cum[t].2
+        };
+        path.push((node_idx, nodes[node_idx].base, w));
         match cum[t].1 {
             None => break,
             Some(pred_t) => t = pred_t,
@@ -712,7 +722,7 @@ fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usiz
 /// it (traversed without consuming a base). Reads that took a different branch
 /// through a bubble don't vote at this column at all, so the denominator is
 /// `coverage + delete_count`, not `n_reads`.
-fn majority_frequency(nodes: &[Node], topo: &[usize], min_cov: u32) -> Vec<(usize, u8)> {
+fn majority_frequency(nodes: &[Node], topo: &[usize], min_cov: u32) -> Vec<(usize, u8, i32)> {
     topo.iter()
         .copied()
         .filter(|&idx| {
@@ -721,7 +731,7 @@ fn majority_frequency(nodes: &[Node], topo: &[usize], min_cov: u32) -> Vec<(usiz
             let total = cov + del;
             total >= min_cov && cov * 2 >= total
         })
-        .map(|idx| (idx, nodes[idx].base))
+        .map(|idx| (idx, nodes[idx].base, nodes[idx].coverage as i32))
         .collect()
 }
 
@@ -998,26 +1008,27 @@ impl PoaGraph {
             let (topo, _) = topological_order(&self.nodes);
             let sequence: Vec<u8> = topo.iter().map(|&idx| self.nodes[idx].base).collect();
             let coverage: Vec<u32> = topo.iter().map(|_| 1).collect();
+            let path_weights: Vec<i32> = topo.iter().map(|_| 1).collect();
             let graph_stats =
                 compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
-            return Ok(Consensus { sequence, coverage, graph_stats });
+            return Ok(Consensus { sequence, coverage, path_weights, n_reads: 1, graph_stats });
         }
 
         let (topo, rank_of) = topological_order(&self.nodes);
         let min_cov = self.min_coverage();
 
-        let filtered: Vec<(usize, u8)> = match self.config.consensus_mode {
+        let filtered: Vec<(usize, u8, i32)> = match self.config.consensus_mode {
             ConsensusMode::HeaviestPath => {
                 let path = heaviest_path(&self.nodes, &topo, &rank_of);
 
                 let start = path
                     .iter()
-                    .position(|&(node_idx, _)| self.nodes[node_idx].coverage >= min_cov)
+                    .position(|&(node_idx, _, _)| self.nodes[node_idx].coverage >= min_cov)
                     .unwrap_or(0);
 
                 let end = path
                     .iter()
-                    .rposition(|&(node_idx, _)| self.nodes[node_idx].coverage >= min_cov)
+                    .rposition(|&(node_idx, _, _)| self.nodes[node_idx].coverage >= min_cov)
                     .map(|i| i + 1)
                     .unwrap_or(path.len());
 
@@ -1025,22 +1036,23 @@ impl PoaGraph {
 
                 effective
                     .iter()
-                    .filter(|&&(node_idx, _)| self.nodes[node_idx].coverage >= min_cov)
+                    .filter(|&&(node_idx, _, _)| self.nodes[node_idx].coverage >= min_cov)
                     .copied()
                     .collect()
             }
             ConsensusMode::MajorityFrequency => majority_frequency(&self.nodes, &topo, min_cov),
         };
 
-        let sequence: Vec<u8> = filtered.iter().map(|&(_, base)| base).collect();
+        let sequence: Vec<u8> = filtered.iter().map(|&(_, base, _)| base).collect();
         let coverage: Vec<u32> = filtered
             .iter()
-            .map(|&(node_idx, _)| self.nodes[node_idx].coverage)
+            .map(|&(node_idx, _, _)| self.nodes[node_idx].coverage)
             .collect();
+        let path_weights: Vec<i32> = filtered.iter().map(|&(_, _, w)| w).collect();
 
         let graph_stats = compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
 
-        Ok(Consensus { sequence, coverage, graph_stats })
+        Ok(Consensus { sequence, coverage, path_weights, n_reads: self.n_reads, graph_stats })
     }
 
     pub fn stats(&self) -> GraphStats {
