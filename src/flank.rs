@@ -241,9 +241,9 @@ mod tests {
         let rf = b"TTAAGGCCTTAAGGCCTTAA";
         let repeat = b"CAGCAGCAG";
         let mut lf_noisy = *lf;
-        lf_noisy[0]  ^= 1; // flip lsb to change base
-        lf_noisy[3]  ^= 1;
-        lf_noisy[7]  ^= 1;
+        lf_noisy[0] ^= 1; // flip lsb to change base
+        lf_noisy[3] ^= 1;
+        lf_noisy[7] ^= 1;
         lf_noisy[11] ^= 1;
         lf_noisy[14] ^= 1;
         lf_noisy[18] ^= 1;
@@ -252,8 +252,15 @@ mod tests {
         read2.extend_from_slice(repeat);
         read2.extend_from_slice(rf);
         // Only proceed if we actually have 6 mismatches (sanity check in test)
-        let mismatches = lf_noisy.iter().zip(lf.iter()).filter(|(a,b)| a != b).count();
-        assert_eq!(mismatches, 6, "test setup: expected 6 mismatches in noisy flank");
+        let mismatches = lf_noisy
+            .iter()
+            .zip(lf.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            mismatches, 6,
+            "test setup: expected 6 mismatches in noisy flank"
+        );
         let seg = extract_flanked_region(&read2, lf, rf)
             .expect("20 bp flank should survive 6 mismatches (30% error)");
         assert_eq!(seg, repeat.as_ref());
@@ -355,8 +362,15 @@ mod tests {
         let seg = extract_flanked_region(read, b"CAT", b"GGG")
             .expect("degenerate flank returns something");
         // Anchors at first CAT, missing the leading repeat unit.
-        assert_eq!(seg.len() % 3, 0, "result is still a whole number of CAT units");
-        assert!(seg.len() < 12, "but it is shorter than the full repeat (known anchor drift)");
+        assert_eq!(
+            seg.len() % 3,
+            0,
+            "result is still a whole number of CAT units"
+        );
+        assert!(
+            seg.len() < 12,
+            "but it is shorter than the full repeat (known anchor drift)"
+        );
     }
 
     // ── Realistic STR scenarios ───────────────────────────────────────────────
@@ -365,11 +379,11 @@ mod tests {
     fn cag_repeat_10bp_flanks_one_error_each() {
         // HD / SCA-like locus: CAG repeat, 10 bp flanks, 1 error per flank.
         // Represents a typical HiFi read (rare errors).
-        let left_true  = b"ATCGATCGAT"; // 10 bp unique
+        let left_true = b"ATCGATCGAT"; // 10 bp unique
         let right_true = b"TAGCTAGCTA"; // 10 bp unique
-        let repeat     = b"CAGCAGCAGCAGCAGCAGCAG"; // 7 × CAG
+        let repeat = b"CAGCAGCAGCAGCAGCAGCAG"; // 7 × CAG
         // 1 error each flank:
-        let left_noisy  = b"ATCGATCGTT"; // pos 8 A→T
+        let left_noisy = b"ATCGATCGTT"; // pos 8 A→T
         let right_noisy = b"TAGCTAGCCA"; // pos 8 T→C
         let read: Vec<u8> = [left_noisy.as_ref(), repeat, right_noisy].concat();
         let seg = extract_flanked_region(&read, left_true, right_true)
@@ -382,9 +396,9 @@ mod tests {
         // FRDA-like locus: GAA repeat, 20 bp flanks, 2 errors in left flank.
         // Left flank ends in "GAA" (= repeat unit) but unique prefix saves it.
         // Represents a safe ONT R10 scenario.
-        let left_true  = b"TTCCTGCAGTTCCTGCAGAA"; // 20 bp, last 3 = GAA
+        let left_true = b"TTCCTGCAGTTCCTGCAGAA"; // 20 bp, last 3 = GAA
         let right_true = b"TTCTTGCAGTTCTTGCAGTT"; // 20 bp unique
-        let repeat     = b"GAAGAAGAAGAAGAAGAAGAA"; // 7 × GAA
+        let repeat = b"GAAGAAGAAGAAGAAGAAGAA"; // 7 × GAA
         // 2 errors in left flank (10% of 20 bp = realistic ONT rate):
         let mut left_noisy = *left_true;
         left_noisy[2] ^= 2; // flip a bit to change base
@@ -403,10 +417,15 @@ mod tests {
         let lf = b"AATTCCGGAATTCCGGAATT";
         let rf = b"TTAAGGCCTTAAGGCCTTAA";
         let mut lf_noisy = *lf;
-        for pos in [1, 4, 8, 12, 15, 18] { // 6 positions
+        for pos in [1, 4, 8, 12, 15, 18] {
+            // 6 positions
             lf_noisy[pos] ^= 1;
         }
-        let mismatches = lf_noisy.iter().zip(lf.iter()).filter(|(a,b)| a != b).count();
+        let mismatches = lf_noisy
+            .iter()
+            .zip(lf.iter())
+            .filter(|(a, b)| a != b)
+            .count();
         assert_eq!(mismatches, 6);
         let mut read: Vec<u8> = Vec::new();
         read.extend_from_slice(&lf_noisy);

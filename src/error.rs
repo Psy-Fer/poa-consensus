@@ -23,7 +23,10 @@ impl fmt::Display for PoaError {
             PoaError::SeedOutOfBounds { index, len } => {
                 write!(f, "seed index {index} is out of bounds for {len} reads")
             }
-            PoaError::BandTooNarrow { configured, required } => {
+            PoaError::BandTooNarrow {
+                configured,
+                required,
+            } => {
                 write!(
                     f,
                     "band width {configured} too narrow; estimated {required} required — \

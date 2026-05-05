@@ -6,7 +6,7 @@
 //! Run with:
 //!   cargo test --test accuracy -- --nocapture
 
-use poa_consensus::{consensus, consensus_multi, PoaConfig};
+use poa_consensus::{PoaConfig, consensus, consensus_multi};
 
 // ── Simulator ─────────────────────────────────────────────────────────────────
 
@@ -19,7 +19,12 @@ struct Sim {
 
 impl Sim {
     fn new(sub_rate: f64, ins_rate: f64, del_rate: f64, seed: u64) -> Self {
-        Self { sub_rate, ins_rate, del_rate, seed }
+        Self {
+            sub_rate,
+            ins_rate,
+            del_rate,
+            seed,
+        }
     }
 
     fn simulate(&self, template: &[u8], n_reads: usize) -> Vec<Vec<u8>> {
@@ -68,7 +73,7 @@ fn random_base_not(exclude: u8, state: &mut u64) -> u8 {
         b'A' => [b'C', b'G', b'T'],
         b'C' => [b'A', b'G', b'T'],
         b'G' => [b'A', b'C', b'T'],
-        _    => [b'A', b'C', b'G'],
+        _ => [b'A', b'C', b'G'],
     };
     opts[(xorshift(state) % 3) as usize]
 }
@@ -177,7 +182,7 @@ fn str_majority_repeat_count_wins() {
 #[test]
 fn str_with_errors_majority_length_wins() {
     // Majority: 8 GAA repeats; minority: 10 repeats. Both with ONT errors.
-    let template_a = repeat(b"GAA", 8);  // 24 bp
+    let template_a = repeat(b"GAA", 8); // 24 bp
     let template_b = repeat(b"GAA", 10); // 30 bp
     let mut reads = Sim::new(0.05, 0.02, 0.02, 4).simulate(&template_a, 15);
     reads.extend(Sim::new(0.05, 0.02, 0.02, 5).simulate(&template_b, 5));
@@ -205,18 +210,41 @@ fn two_allele_snp_recovery() {
     let mut reads = sim_a.simulate(allele_a, 10);
     reads.extend(sim_b.simulate(allele_b, 10));
     let alleles = consensus_multi(&refs(&reads), 0, &PoaConfig::default()).unwrap();
-    assert_eq!(alleles.len(), 2, "expected 2 alleles, got {}", alleles.len());
-    let best_a = alleles.iter().map(|a| identity(allele_a, &a.sequence)).fold(0.0_f64, f64::max);
-    let best_b = alleles.iter().map(|a| identity(allele_b, &a.sequence)).fold(0.0_f64, f64::max);
-    assert!(best_a >= 0.90, "allele A recovery: expected ≥90%, got {:.1}%", best_a * 100.0);
-    assert!(best_b >= 0.90, "allele B recovery: expected ≥90%, got {:.1}%", best_b * 100.0);
+    assert_eq!(
+        alleles.len(),
+        2,
+        "expected 2 alleles, got {}",
+        alleles.len()
+    );
+    let best_a = alleles
+        .iter()
+        .map(|a| identity(allele_a, &a.sequence))
+        .fold(0.0_f64, f64::max);
+    let best_b = alleles
+        .iter()
+        .map(|a| identity(allele_b, &a.sequence))
+        .fold(0.0_f64, f64::max);
+    assert!(
+        best_a >= 0.90,
+        "allele A recovery: expected ≥90%, got {:.1}%",
+        best_a * 100.0
+    );
+    assert!(
+        best_b >= 0.90,
+        "allele B recovery: expected ≥90%, got {:.1}%",
+        best_b * 100.0
+    );
 }
 
 #[test]
 fn frda_gaa_simulated_ont() {
     // FRDA locus: flanking sequence + GAA repeat + flanking sequence, ONT error profile.
-    let template: Vec<u8> =
-        [b"ACGTACGTACGT".as_slice(), &repeat(b"GAA", 20), b"TGCATGCATGCA"].concat();
+    let template: Vec<u8> = [
+        b"ACGTACGTACGT".as_slice(),
+        &repeat(b"GAA", 20),
+        b"TGCATGCATGCA",
+    ]
+    .concat();
     let reads = Sim::new(0.05, 0.02, 0.02, 8).simulate(&template, 20);
     let result = consensus(&refs(&reads), 0, &PoaConfig::default()).unwrap();
     let id = identity(&template, &result.sequence);
@@ -240,7 +268,10 @@ fn adaptive_band_graph_size_aware_closes_accuracy_gap() {
     let reads = Sim::new(0.05, 0.03, 0.03, 11).simulate(&template, 30);
     let refs = refs(&reads);
 
-    let narrow = PoaConfig { band_width: 20, ..PoaConfig::default() };
+    let narrow = PoaConfig {
+        band_width: 20,
+        ..PoaConfig::default()
+    };
     let adaptive = PoaConfig {
         adaptive_band: true,
         adaptive_band_b: 10,
@@ -249,24 +280,32 @@ fn adaptive_band_graph_size_aware_closes_accuracy_gap() {
     };
     let unbanded = PoaConfig::default();
 
-    let id_narrow   = consensus(&refs, 0, &narrow).map(|r| identity(&template, &r.sequence)).unwrap_or(0.0);
-    let id_adaptive = consensus(&refs, 0, &adaptive).map(|r| identity(&template, &r.sequence)).unwrap_or(0.0);
-    let id_unbanded = consensus(&refs, 0, &unbanded).map(|r| identity(&template, &r.sequence)).unwrap_or(0.0);
+    let id_narrow = consensus(&refs, 0, &narrow)
+        .map(|r| identity(&template, &r.sequence))
+        .unwrap_or(0.0);
+    let id_adaptive = consensus(&refs, 0, &adaptive)
+        .map(|r| identity(&template, &r.sequence))
+        .unwrap_or(0.0);
+    let id_unbanded = consensus(&refs, 0, &unbanded)
+        .map(|r| identity(&template, &r.sequence))
+        .unwrap_or(0.0);
 
     println!("\nGraph-size-aware adaptive band (30 reads, 5% sub, 3% ins/del, 70bp)");
-    println!("  narrow (w=20):   {:.1}%", id_narrow   * 100.0);
+    println!("  narrow (w=20):   {:.1}%", id_narrow * 100.0);
     println!("  adaptive:        {:.1}%", id_adaptive * 100.0);
     println!("  unbanded:        {:.1}%", id_unbanded * 100.0);
 
     assert!(
         id_adaptive >= id_narrow,
         "adaptive band should match or beat narrow band: adaptive={:.1}% narrow={:.1}%",
-        id_adaptive * 100.0, id_narrow * 100.0
+        id_adaptive * 100.0,
+        id_narrow * 100.0
     );
     assert!(
         (id_adaptive - id_unbanded).abs() <= 0.05,
         "adaptive band should be within 5% of unbanded: adaptive={:.1}% unbanded={:.1}%",
-        id_adaptive * 100.0, id_unbanded * 100.0
+        id_adaptive * 100.0,
+        id_unbanded * 100.0
     );
 }
 
@@ -284,7 +323,12 @@ fn depth_accuracy_curve() {
         match consensus(&refs(&reads), 0, &PoaConfig::default()) {
             Ok(r) => {
                 let id = identity(&template, &r.sequence);
-                println!("{:>6}  {:>9.1}%  {:>8}", depth, id * 100.0, r.sequence.len());
+                println!(
+                    "{:>6}  {:>9.1}%  {:>8}",
+                    depth,
+                    id * 100.0,
+                    r.sequence.len()
+                );
                 if depth >= 10 {
                     assert!(
                         id >= 0.90,
@@ -318,11 +362,24 @@ fn band_width_accuracy_tradeoff() {
         match consensus(&refs(&reads), 0, &config) {
             Ok(r) => {
                 let id = identity(&template, &r.sequence);
-                let label = if bw == 0 { "unbanded".to_string() } else { bw.to_string() };
-                println!("{:>12}  {:>9.1}%  {:>8}", label, id * 100.0, r.sequence.len());
+                let label = if bw == 0 {
+                    "unbanded".to_string()
+                } else {
+                    bw.to_string()
+                };
+                println!(
+                    "{:>12}  {:>9.1}%  {:>8}",
+                    label,
+                    id * 100.0,
+                    r.sequence.len()
+                );
             }
             Err(e) => {
-                let label = if bw == 0 { "unbanded".to_string() } else { bw.to_string() };
+                let label = if bw == 0 {
+                    "unbanded".to_string()
+                } else {
+                    bw.to_string()
+                };
                 println!("{:>12}  {:>10}  {:>8}", label, format!("Err({e})"), "-");
             }
         }
@@ -361,7 +418,8 @@ mod accuracy_plots {
         let mean_identity = |sub: f64, ins: f64, del: f64, depth: usize| -> f64 {
             let sum: f64 = (0..N_SEEDS)
                 .filter_map(|seed| {
-                    let reads = Sim::new(sub, ins, del, (seed + 1) * 100).simulate(&template, depth);
+                    let reads =
+                        Sim::new(sub, ins, del, (seed + 1) * 100).simulate(&template, depth);
                     consensus(&refs(&reads), 0, &PoaConfig::default())
                         .ok()
                         .map(|r| identity(&template, &r.sequence) * 100.0)
@@ -417,13 +475,18 @@ mod accuracy_plots {
             };
             let vals: Vec<f64> = (0..N_SEEDS)
                 .filter_map(|seed| {
-                    let reads = Sim::new(0.05, 0.03, 0.03, (seed + 1) * 100).simulate(&template, depth);
+                    let reads =
+                        Sim::new(0.05, 0.03, 0.03, (seed + 1) * 100).simulate(&template, depth);
                     consensus(&refs(&reads), 0, &config)
                         .ok()
                         .map(|r| identity(&template, &r.sequence) * 100.0)
                 })
                 .collect();
-            if vals.is_empty() { None } else { Some(vals.iter().sum::<f64>() / vals.len() as f64) }
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.iter().sum::<f64>() / vals.len() as f64)
+            }
         };
 
         let mut plots: Vec<Plot> = Vec::new();
@@ -438,7 +501,11 @@ mod accuracy_plots {
 
             let label = format!("{depth}x reads (mean of {N_SEEDS})");
             plots.push(
-                LinePlot::new().with_data(banded_pts).with_color(color).with_legend(&label).into(),
+                LinePlot::new()
+                    .with_data(banded_pts)
+                    .with_color(color)
+                    .with_legend(&label)
+                    .into(),
             );
             let unbanded_line: Plot = LinePlot::new()
                 .with_data(vec![(5.0, unbanded_id), (100.0, unbanded_id)])
@@ -454,7 +521,10 @@ mod accuracy_plots {
             .with_x_label("Band width (cells)")
             .with_y_label("Identity (%)");
 
-        save("accuracy_band_width_curve.svg", render_to_svg(plots, layout));
+        save(
+            "accuracy_band_width_curve.svg",
+            render_to_svg(plots, layout),
+        );
     }
 
     /// Identity% vs substitution rate at fixed depth (20 reads, unbanded), averaged over N seeds.
@@ -503,6 +573,9 @@ mod accuracy_plots {
             .with_x_label("Substitution rate (%)")
             .with_y_label("Identity (%)");
 
-        save("accuracy_error_rate_sweep.svg", render_to_svg(plots, layout));
+        save(
+            "accuracy_error_rate_sweep.svg",
+            render_to_svg(plots, layout),
+        );
     }
 }

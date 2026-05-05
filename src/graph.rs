@@ -10,7 +10,11 @@ const UNSET: i32 = i32::MIN / 2;
 
 #[inline]
 fn safe_add(a: i32, b: i32) -> i32 {
-    if a == UNSET { UNSET } else { a.saturating_add(b) }
+    if a == UNSET {
+        UNSET
+    } else {
+        a.saturating_add(b)
+    }
 }
 
 /// Sentinel topo index meaning "came from the virtual start node".
@@ -44,7 +48,11 @@ fn compute_effective_band(cfg: &PoaConfig, read_len: usize, graph_nodes: usize) 
     if cfg.adaptive_band {
         let span = read_len.max(graph_nodes);
         let w = cfg.adaptive_band_b + (cfg.adaptive_band_f * span as f32).ceil() as usize;
-        let w = if cfg.band_width > 0 { w.max(cfg.band_width) } else { w };
+        let w = if cfg.band_width > 0 {
+            w.max(cfg.band_width)
+        } else {
+            w
+        };
         w.max(1)
     } else if cfg.band_width > 0 {
         cfg.band_width
@@ -56,20 +64,30 @@ fn compute_effective_band(cfg: &PoaConfig, read_len: usize, graph_nodes: usize) 
 /// Lowest j >= 1 reachable from a band centred at `centre` with width `w`.
 #[inline]
 fn j_lo_centred(centre: usize, w: usize) -> usize {
-    if w == UNBANDED { 1 } else { centre.saturating_sub(w).max(1) }
+    if w == UNBANDED {
+        1
+    } else {
+        centre.saturating_sub(w).max(1)
+    }
 }
 
 /// Highest j reachable from a band centred at `centre` with width `w`.
 #[inline]
 fn j_hi_centred(centre: usize, w: usize, l: usize) -> usize {
-    if w == UNBANDED { l } else { (centre + w).min(l) }
+    if w == UNBANDED {
+        l
+    } else {
+        (centre + w).min(l)
+    }
 }
 
 /// True if cell (centre_row, j) is within the band for a row whose band is
 /// centred at `centre`.  j=0 is in-band only when `centre <= w`.
 #[inline]
 fn in_band_centred(centre: usize, j: usize, w: usize, l: usize) -> bool {
-    if w == UNBANDED { return true; }
+    if w == UNBANDED {
+        return true;
+    }
     j >= centre.saturating_sub(w) && j <= (centre + w).min(l)
 }
 
@@ -188,7 +206,10 @@ struct Cell {
 
 impl Cell {
     fn unset() -> Self {
-        Cell { score: UNSET, pred_t: 0 }
+        Cell {
+            score: UNSET,
+            pred_t: 0,
+        }
     }
 }
 
@@ -238,8 +259,7 @@ fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize) {
 fn topological_order(nodes: &[Node]) -> (Vec<usize>, Vec<usize>) {
     let n = nodes.len();
     let mut in_deg: Vec<usize> = nodes.iter().map(|nd| nd.in_edges.len()).collect();
-    let mut queue: std::collections::VecDeque<usize> =
-        (0..n).filter(|&i| in_deg[i] == 0).collect();
+    let mut queue: std::collections::VecDeque<usize> = (0..n).filter(|&i| in_deg[i] == 0).collect();
     let mut topo: Vec<usize> = Vec::with_capacity(n);
 
     while let Some(u) = queue.pop_front() {
@@ -344,27 +364,46 @@ fn align(
             let (mut best, mut best_pred) = (UNSET, 0usize);
             if is_source {
                 let val = go + ge;
-                if val > best { best = val; best_pred = VIRTUAL; }
+                if val > best {
+                    best = val;
+                    best_pred = VIRTUAL;
+                }
             }
             for &p in &nodes[node_idx].in_edges {
                 let p_t = rank_of[p];
                 if in_band_centred(m.centres[p_t], 0, w, l) {
                     let vm = safe_add(m.get(p_t, 0).score, go + ge);
-                    if vm > best { best = vm; best_pred = p_t; }
+                    if vm > best {
+                        best = vm;
+                        best_pred = p_t;
+                    }
                     let vd = safe_add(del.get(p_t, 0).score, ge);
-                    if vd > best { best = vd; best_pred = p_t; }
+                    if vd > best {
+                        best = vd;
+                        best_pred = p_t;
+                    }
                 }
             }
             if best != UNSET {
-                del.set(t, 0, Cell { score: best, pred_t: best_pred });
+                del.set(
+                    t,
+                    0,
+                    Cell {
+                        score: best,
+                        pred_t: best_pred,
+                    },
+                );
             }
         }
 
         // ── j = j_lo..=j_hi ───────────────────────────────────────────────────
         for j in j_lo..=j_hi {
             let q_base = query[j - 1];
-            let score_fn =
-                if node_base == q_base { cfg.match_score } else { cfg.mismatch_score };
+            let score_fn = if node_base == q_base {
+                cfg.match_score
+            } else {
+                cfg.mismatch_score
+            };
 
             // M[t][j]
             {
@@ -372,25 +411,47 @@ fn align(
                 if j == 1 && (is_source || cfg.alignment_mode == AlignmentMode::SemiGlobal) {
                     // Source nodes start clean at j=1.
                     // Semi-global: any node can begin alignment here (free graph prefix).
-                    if score_fn > best { best = score_fn; best_pred = VIRTUAL; }
+                    if score_fn > best {
+                        best = score_fn;
+                        best_pred = VIRTUAL;
+                    }
                 }
                 if is_source && j > 1 {
                     let val = safe_add(go + (j as i32 - 1) * ge, score_fn);
-                    if val > best { best = val; best_pred = VIRTUAL; }
+                    if val > best {
+                        best = val;
+                        best_pred = VIRTUAL;
+                    }
                 }
                 for &p in &nodes[node_idx].in_edges {
                     let p_t = rank_of[p];
                     if in_band_centred(m.centres[p_t], j - 1, w, l) {
                         let vm = safe_add(m.get(p_t, j - 1).score, score_fn);
-                        if vm > best { best = vm; best_pred = p_t; }
+                        if vm > best {
+                            best = vm;
+                            best_pred = p_t;
+                        }
                         let vi = safe_add(ins.get(p_t, j - 1).score, score_fn);
-                        if vi > best { best = vi; best_pred = p_t; }
+                        if vi > best {
+                            best = vi;
+                            best_pred = p_t;
+                        }
                         let vd = safe_add(del.get(p_t, j - 1).score, score_fn);
-                        if vd > best { best = vd; best_pred = p_t; }
+                        if vd > best {
+                            best = vd;
+                            best_pred = p_t;
+                        }
                     }
                 }
                 if best != UNSET {
-                    m.set(t, j, Cell { score: best, pred_t: best_pred });
+                    m.set(
+                        t,
+                        j,
+                        Cell {
+                            score: best,
+                            pred_t: best_pred,
+                        },
+                    );
                 }
             }
 
@@ -399,16 +460,32 @@ fn align(
                 let (mut best, mut best_pred) = (UNSET, VIRTUAL);
                 if is_source && j == 1 {
                     let val = go + ge;
-                    if val > best { best = val; best_pred = VIRTUAL; }
+                    if val > best {
+                        best = val;
+                        best_pred = VIRTUAL;
+                    }
                 }
                 if in_band_centred(centre, j - 1, w, l) {
                     let vm = safe_add(m.get(t, j - 1).score, go + ge);
-                    if vm > best { best = vm; best_pred = t; }
+                    if vm > best {
+                        best = vm;
+                        best_pred = t;
+                    }
                     let vi = safe_add(ins.get(t, j - 1).score, ge);
-                    if vi > best { best = vi; best_pred = t; }
+                    if vi > best {
+                        best = vi;
+                        best_pred = t;
+                    }
                 }
                 if best != UNSET {
-                    ins.set(t, j, Cell { score: best, pred_t: best_pred });
+                    ins.set(
+                        t,
+                        j,
+                        Cell {
+                            score: best,
+                            pred_t: best_pred,
+                        },
+                    );
                 }
             }
 
@@ -420,15 +497,31 @@ fn align(
                     let p_t = rank_of[p];
                     if in_band_centred(m.centres[p_t], j, w, l) {
                         let vm = safe_add(m.get(p_t, j).score, go + ge);
-                        if vm > best { best = vm; best_pred = p_t; }
+                        if vm > best {
+                            best = vm;
+                            best_pred = p_t;
+                        }
                         let vi = safe_add(ins.get(p_t, j).score, go + ge);
-                        if vi > best { best = vi; best_pred = p_t; }
+                        if vi > best {
+                            best = vi;
+                            best_pred = p_t;
+                        }
                         let vd = safe_add(del.get(p_t, j).score, ge);
-                        if vd > best { best = vd; best_pred = p_t; }
+                        if vd > best {
+                            best = vd;
+                            best_pred = p_t;
+                        }
                     }
                 }
                 if best != UNSET {
-                    del.set(t, j, Cell { score: best, pred_t: best_pred });
+                    del.set(
+                        t,
+                        j,
+                        Cell {
+                            score: best,
+                            pred_t: best_pred,
+                        },
+                    );
                 }
             }
         }
@@ -452,10 +545,16 @@ fn align(
             // there are valid positions to the left that weren't computed; j_hi < l
             // means there are valid positions to the right. At the absolute boundaries
             // (j=1 or j=l) there are no missing cells, so treat those sides as safe.
-            let left_margin =
-                if j_lo > 1 { best_j.saturating_sub(j_lo) } else { GAP_MARGIN };
-            let right_margin =
-                if j_hi < l { j_hi.saturating_sub(best_j) } else { GAP_MARGIN };
+            let left_margin = if j_lo > 1 {
+                best_j.saturating_sub(j_lo)
+            } else {
+                GAP_MARGIN
+            };
+            let right_margin = if j_hi < l {
+                j_hi.saturating_sub(best_j)
+            } else {
+                GAP_MARGIN
+            };
             let margin = left_margin.min(right_margin);
             if margin < GAP_MARGIN {
                 let extra = (GAP_MARGIN - margin) * 2 + GAP_MARGIN;
@@ -467,7 +566,10 @@ fn align(
     // Approaching-edge flag: the DP may have run with cells near or outside the
     // band. Return before traceback to force a clean retry with the wider band.
     if max_required > w && w != UNBANDED {
-        return Err(PoaError::BandTooNarrow { configured: w, required: max_required });
+        return Err(PoaError::BandTooNarrow {
+            configured: w,
+            required: max_required,
+        });
     }
 
     // ── Find best terminal cell at column l ───────────────────────────────────
@@ -487,7 +589,10 @@ fn align(
     let (best_t, best_state) = match terminal_best {
         Some(result) => result,
         None if w != UNBANDED && l > 0 => {
-            return Err(PoaError::BandTooNarrow { configured: w, required: w * 2 });
+            return Err(PoaError::BandTooNarrow {
+                configured: w,
+                required: w * 2,
+            });
         }
         None => (0, State::M),
     };
@@ -868,7 +973,11 @@ fn find_bubbles(
                 .filter(|&&(_, w)| w >= threshold)
                 .map(|&(to, _)| to)
                 .collect();
-            if arms.len() >= 2 { Some((node_idx, arms)) } else { None }
+            if arms.len() >= 2 {
+                Some((node_idx, arms))
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -919,7 +1028,9 @@ fn partition_reads_by_bubble(
         .map(|(i, _)| i)
         .unwrap_or(0);
     for (r, &done) in assigned.iter().enumerate() {
-        if !done { groups[largest].push(r); }
+        if !done {
+            groups[largest].push(r);
+        }
     }
 
     groups.retain(|g| !g.is_empty());
@@ -928,7 +1039,9 @@ fn partition_reads_by_bubble(
 
 /// Index within `group` of the read whose length is closest to the median.
 fn choose_seed(group: &[usize], reads: &[Vec<u8>]) -> usize {
-    if group.len() == 1 { return 0; }
+    if group.len() == 1 {
+        return 0;
+    }
     let mut lens: Vec<usize> = group.iter().map(|&i| reads[i].len()).collect();
     lens.sort_unstable();
     let median = lens[lens.len() / 2];
@@ -1009,9 +1122,14 @@ impl PoaGraph {
             let sequence: Vec<u8> = topo.iter().map(|&idx| self.nodes[idx].base).collect();
             let coverage: Vec<u32> = topo.iter().map(|_| 1).collect();
             let path_weights: Vec<i32> = topo.iter().map(|_| 1).collect();
-            let graph_stats =
-                compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
-            return Ok(Consensus { sequence, coverage, path_weights, n_reads: 1, graph_stats });
+            let graph_stats = compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
+            return Ok(Consensus {
+                sequence,
+                coverage,
+                path_weights,
+                n_reads: 1,
+                graph_stats,
+            });
         }
 
         let (topo, rank_of) = topological_order(&self.nodes);
@@ -1032,7 +1150,11 @@ impl PoaGraph {
                     .map(|i| i + 1)
                     .unwrap_or(path.len());
 
-                let effective = if start < end { &path[start..end] } else { &path[..] };
+                let effective = if start < end {
+                    &path[start..end]
+                } else {
+                    &path[..]
+                };
 
                 effective
                     .iter()
@@ -1052,7 +1174,13 @@ impl PoaGraph {
 
         let graph_stats = compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
 
-        Ok(Consensus { sequence, coverage, path_weights, n_reads: self.n_reads, graph_stats })
+        Ok(Consensus {
+            sequence,
+            coverage,
+            path_weights,
+            n_reads: self.n_reads,
+            graph_stats,
+        })
     }
 
     pub fn stats(&self) -> GraphStats {
@@ -1141,8 +1269,7 @@ impl PoaGraph {
             })
             .unwrap();
 
-        let groups =
-            partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads);
+        let groups = partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads);
 
         if groups.len() < 2 {
             return Ok(vec![self.consensus()?]);
@@ -1160,7 +1287,9 @@ impl PoaGraph {
             let seed = &self.reads[group[seed_slot]];
             let mut sub = PoaGraph::new(seed, self.config.clone())?;
             for (slot, &read_idx) in group.iter().enumerate() {
-                if slot == seed_slot { continue; }
+                if slot == seed_slot {
+                    continue;
+                }
                 sub.add_read(&self.reads[read_idx])?;
             }
             results.push(sub.consensus()?);
