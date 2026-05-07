@@ -25,6 +25,7 @@ required-features = ["cli"]
 [features]
 cli = ["dep:clap", "dep:noodles"]
 plot = ["dep:kuva"]
+ref_compare = []  # requires ref/poa.rs present locally; never enabled in CI
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
