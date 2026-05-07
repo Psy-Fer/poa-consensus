@@ -1,0 +1,1 @@
+ignore = ["tests/comparison.rs"]
