@@ -1,3 +1,4 @@
+#![cfg(feature = "ref_compare")]
 //! Comparison of poa-consensus (affine-gap) output against the original
 //! linear-gap reference implementation in `ref/poa.rs`.
 //!
