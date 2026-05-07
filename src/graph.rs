@@ -1,6 +1,6 @@
 use crate::config::{AlignmentMode, ConsensusMode, PoaConfig};
 use crate::error::PoaError;
-use crate::types::{Consensus, GraphStats};
+use crate::types::{Consensus, CoverageGap, GapKind, GraphStats};
 use std::collections::HashMap;
 
 // ─── Sentinel ────────────────────────────────────────────────────────────────
@@ -952,6 +952,38 @@ fn binary_entropy(p: f64) -> f64 {
     }
 }
 
+// ─── Coverage gap detection ───────────────────────────────────────────────────
+
+/// Scan a consensus `coverage` slice and return interior runs where
+/// `coverage[i] < 2` (seed-only: no independent read corroborated the base)
+/// that are flanked on both sides by positions with `coverage >= 2`.
+///
+/// These represent regions where partial reads from opposite ends of the
+/// template did not overlap; the bases are present (from the seed) but
+/// unverified, and `gap.size()` is the minimum base-count estimate for that
+/// region.
+fn detect_coverage_gaps(coverage: &[u32]) -> Vec<CoverageGap> {
+    let first = coverage.iter().position(|&c| c >= 2);
+    let last = coverage.iter().rposition(|&c| c >= 2);
+    let (first, last) = match (first, last) {
+        (Some(f), Some(l)) if f < l => (f, l),
+        _ => return vec![],
+    };
+    let mut gaps = Vec::new();
+    let mut gap_start: Option<usize> = None;
+    for i in (first + 1)..last {
+        if coverage[i] < 2 {
+            gap_start.get_or_insert(i);
+        } else if let Some(s) = gap_start.take() {
+            gaps.push(CoverageGap { start: s, end: i, kind: GapKind::Spanning });
+        }
+    }
+    if let Some(s) = gap_start {
+        gaps.push(CoverageGap { start: s, end: last, kind: GapKind::Spanning });
+    }
+    gaps
+}
+
 // ─── Multi-allele helpers ─────────────────────────────────────────────────────
 
 /// Returns `(entry_node_idx, arm_start_node_idxs)` for every bubble in the
@@ -1129,6 +1161,7 @@ impl PoaGraph {
                 path_weights,
                 n_reads: 1,
                 graph_stats,
+                gaps: vec![],
             });
         }
 
@@ -1173,6 +1206,7 @@ impl PoaGraph {
         let path_weights: Vec<i32> = filtered.iter().map(|&(_, _, w)| w).collect();
 
         let graph_stats = compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
+        let gaps = detect_coverage_gaps(&coverage);
 
         Ok(Consensus {
             sequence,
@@ -1180,6 +1214,7 @@ impl PoaGraph {
             path_weights,
             n_reads: self.n_reads,
             graph_stats,
+            gaps,
         })
     }
 

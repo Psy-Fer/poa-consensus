@@ -4,6 +4,60 @@ pub enum Strand {
     Reverse,
 }
 
+/// Whether the size of a [`CoverageGap`] can be estimated from the data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapKind {
+    /// A spanning read crossed this region.  `sequence[start..end]` are
+    /// seed-only bases; `end - start` is a minimum size estimate.
+    Spanning,
+    /// No read crossed this region.  `start == end` (no bases in the output
+    /// represent the gap); true size is completely unknown.
+    Unknown,
+}
+
+/// A region in the consensus where coverage dropped to seed-only level, or a
+/// structural break between two non-overlapping read groups.
+///
+/// ```text
+/// kind = Spanning  →  |===[ seed-only bases ]===|   (≥N bp, N = size())
+/// kind = Unknown   →  |===|?????|===|              (at least left + right bp)
+/// ```
+///
+/// Typical rendering:
+/// ```text
+/// format!("{}(gap:{}{}bp){}", &seq[..gap.start],
+///     if gap.kind == GapKind::Unknown { "unknown, ≥" } else { "≥" },
+///     gap.size(), &seq[gap.end..])
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageGap {
+    /// First position in the consensus sequence (0-indexed, inclusive) that
+    /// belongs to the gap.  For `Unknown` gaps `start == end`.
+    pub start: usize,
+    /// First position after the gap (0-indexed, exclusive).
+    /// For `Unknown` gaps `start == end`.
+    pub end: usize,
+    /// Whether a spanning read provided a minimum size estimate.
+    pub kind: GapKind,
+}
+
+impl CoverageGap {
+    /// Number of seed-only bases in the gap (minimum size estimate).
+    /// Returns 0 for `Unknown` gaps where `start == end`.
+    pub fn size(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Minimum number of bases in this gap, if known.
+    /// Returns `None` for `GapKind::Unknown`.
+    pub fn min_size(&self) -> Option<usize> {
+        match self.kind {
+            GapKind::Spanning => Some(self.end - self.start),
+            GapKind::Unknown => None,
+        }
+    }
+}
+
 /// Per-graph statistics computed in a single O(V+E) pass.
 #[derive(Debug, Clone, Default)]
 pub struct GraphStats {
@@ -37,6 +91,11 @@ pub struct Consensus {
     /// Total reads used to build this consensus (seed + all `add_read` calls).
     pub n_reads: usize,
     pub graph_stats: GraphStats,
+    /// Coverage gaps detected in this consensus.  Empty when reads overlap
+    /// throughout.  Each gap is either `Spanning` (seed-only bases, minimum
+    /// size known) or `Unknown` (no spanning read; size completely unknown,
+    /// as produced by [`bridged_consensus`]).
+    pub gaps: Vec<CoverageGap>,
 }
 
 impl Consensus {

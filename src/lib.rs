@@ -353,7 +353,7 @@ pub use error::PoaError;
 pub use flank::extract_flanked_region;
 pub use graph::PoaGraph;
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
-pub use types::{Consensus, GraphStats, Strand};
+pub use types::{Consensus, CoverageGap, GapKind, GraphStats, Strand};
 
 // ── Internal helper ───────────────────────────────────────────────────────────
 
@@ -469,4 +469,77 @@ pub fn consensus_adaptive(
 
     // No second pass needed.
     Ok(vec![graph.consensus()?])
+}
+
+/// Build a consensus from two non-overlapping read groups with a gap of
+/// unknown length between them.
+///
+/// Use this when reads cover only the left end and right end of a template
+/// with no read bridging the middle — for example, when a repeat expansion
+/// is longer than any individual read.
+///
+/// Each group is assembled independently using [`consensus`].  The results
+/// are concatenated and a single [`CoverageGap`] with
+/// [`GapKind::Unknown`] is inserted at the join point.
+///
+/// The returned `Consensus.n_reads` is the sum of both groups.
+/// `Consensus.graph_stats` reflects the left group's graph.
+///
+/// # Size interpretation
+///
+/// ```text
+/// |=left_consensus=|???unknown???|=right_consensus=|
+/// total ≥ left_consensus.len() + right_consensus.len()
+/// ```
+///
+/// `gap.min_size()` returns `None` (size unknown).  The caller can report:
+/// ```text
+/// format!("≥{} bp with a gap of unknown length",
+///     cons.sequence.len())
+/// ```
+pub fn bridged_consensus(
+    left_reads: &[&[u8]],
+    left_seed_idx: usize,
+    right_reads: &[&[u8]],
+    right_seed_idx: usize,
+    config: &PoaConfig,
+) -> Result<Consensus, PoaError> {
+    validate(left_reads, left_seed_idx)?;
+    validate(right_reads, right_seed_idx)?;
+
+    let left = build_graph(left_reads, left_seed_idx, config.clone())?.consensus()?;
+    let right = build_graph(right_reads, right_seed_idx, config.clone())?.consensus()?;
+
+    let join = left.sequence.len();
+
+    let mut sequence = left.sequence.clone();
+    sequence.extend_from_slice(&right.sequence);
+
+    let mut coverage = left.coverage.clone();
+    coverage.extend_from_slice(&right.coverage);
+
+    let mut path_weights = left.path_weights.clone();
+    path_weights.extend_from_slice(&right.path_weights);
+
+    // Carry forward any spanning gaps from each segment (offset right gaps by join).
+    let mut gaps = left.gaps.clone();
+    for gap in &right.gaps {
+        gaps.push(CoverageGap {
+            start: gap.start + join,
+            end: gap.end + join,
+            kind: gap.kind,
+        });
+    }
+    // Insert the unknown gap at the join point, then sort by position.
+    gaps.push(CoverageGap { start: join, end: join, kind: GapKind::Unknown });
+    gaps.sort_by_key(|g| g.start);
+
+    Ok(Consensus {
+        sequence,
+        coverage,
+        path_weights,
+        n_reads: left.n_reads + right.n_reads,
+        graph_stats: left.graph_stats,
+        gaps,
+    })
 }
