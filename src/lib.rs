@@ -531,7 +531,11 @@ pub fn bridged_consensus(
         });
     }
     // Insert the unknown gap at the join point, then sort by position.
-    gaps.push(CoverageGap { start: join, end: join, kind: GapKind::Unknown });
+    gaps.push(CoverageGap {
+        start: join,
+        end: join,
+        kind: GapKind::Unknown,
+    });
     gaps.sort_by_key(|g| g.start);
 
     Ok(Consensus {

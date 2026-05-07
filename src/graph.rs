@@ -971,15 +971,20 @@ fn detect_coverage_gaps(coverage: &[u32]) -> Vec<CoverageGap> {
     };
     let mut gaps = Vec::new();
     let mut gap_start: Option<usize> = None;
-    for i in (first + 1)..last {
-        if coverage[i] < 2 {
+    for (offset, &cov) in coverage[(first + 1)..last].iter().enumerate() {
+        let i = first + 1 + offset;
+        if cov < 2 {
             gap_start.get_or_insert(i);
         } else if let Some(s) = gap_start.take() {
             gaps.push(CoverageGap { start: s, end: i, kind: GapKind::Spanning });
         }
     }
     if let Some(s) = gap_start {
-        gaps.push(CoverageGap { start: s, end: last, kind: GapKind::Spanning });
+        gaps.push(CoverageGap {
+            start: s,
+            end: last,
+            kind: GapKind::Spanning,
+        });
     }
     gaps
 }

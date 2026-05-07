@@ -692,16 +692,20 @@ fn coverage_vec_reflects_partial_read_depth() {
 fn no_gap_when_reads_overlap() {
     // Spanning seed + partials that all overlap in the middle → no coverage gap.
     let seed = b("ACGTTGCAATGC"); // 12 bp
-    let left = b("ACGTTGCA");      //  8 bp: covers positions 0-7
-    let right = b("GCAATGC");      //  7 bp: covers positions 5-11 (3 bp overlap)
+    let left = b("ACGTTGCA"); //  8 bp: covers positions 0-7
+    let right = b("GCAATGC"); //  7 bp: covers positions 5-11 (3 bp overlap)
     let cfg = PoaConfig {
         alignment_mode: AlignmentMode::SemiGlobal,
         min_coverage_fraction: 0.1,
         ..Default::default()
     };
     let mut graph = PoaGraph::new(&seed, cfg).unwrap();
-    for _ in 0..3 { graph.add_read(&left).unwrap(); }
-    for _ in 0..3 { graph.add_read(&right).unwrap(); }
+    for _ in 0..3 {
+        graph.add_read(&left).unwrap();
+    }
+    for _ in 0..3 {
+        graph.add_read(&right).unwrap();
+    }
     let cons = graph.consensus().unwrap();
     assert!(
         cons.gaps.is_empty(),
@@ -717,17 +721,21 @@ fn gap_detected_when_partials_dont_overlap() {
     // Left:  ACGTT              (5 bp, covers positions 0-4)
     // Right:           CCCGG   (5 bp, covers positions 11-15)
     // Gap:         positions 5-10 (6 bp, seed-only coverage=1)
-    let seed  = b("ACGTTGCAATGCCCGG"); // 16 bp
-    let left  = b("ACGTT");             // 5 bp: unique prefix of seed
-    let right = b("CCCGG");             // 5 bp: unique suffix of seed
+    let seed = b("ACGTTGCAATGCCCGG"); // 16 bp
+    let left = b("ACGTT"); // 5 bp: unique prefix of seed
+    let right = b("CCCGG"); // 5 bp: unique suffix of seed
     let cfg = PoaConfig {
         alignment_mode: AlignmentMode::SemiGlobal,
         min_coverage_fraction: 0.1,
         ..Default::default()
     };
     let mut graph = PoaGraph::new(&seed, cfg).unwrap();
-    for _ in 0..3 { graph.add_read(&left).unwrap(); }
-    for _ in 0..3 { graph.add_read(&right).unwrap(); }
+    for _ in 0..3 {
+        graph.add_read(&left).unwrap();
+    }
+    for _ in 0..3 {
+        graph.add_read(&right).unwrap();
+    }
     let cons = graph.consensus().unwrap();
     assert!(
         !cons.gaps.is_empty(),
@@ -735,7 +743,11 @@ fn gap_detected_when_partials_dont_overlap() {
         cons.coverage
     );
     let gap = &cons.gaps[0];
-    assert!(gap.size() >= 6, "gap should span the 6 seed-only positions: {:?}", gap);
+    assert!(
+        gap.size() >= 6,
+        "gap should span the 6 seed-only positions: {:?}",
+        gap
+    );
     assert_eq!(gap.start + gap.size(), gap.end);
 }
 
@@ -745,16 +757,20 @@ fn gap_size_is_minimum_size_estimate() {
     // Seed: 20 bp.  Left reads cover 0-4, right reads cover 15-19.
     // The middle 10 positions (5-14) have coverage=1 (seed only).
     let seed = b("ACGTTGCAATGCCCGGTTAA"); // 20 bp
-    let left  = b("ACGTT");  // 5 bp: covers 0-4
-    let right = b("GTTAA");  // 5 bp: covers 15-19
+    let left = b("ACGTT"); // 5 bp: covers 0-4
+    let right = b("GTTAA"); // 5 bp: covers 15-19
     let cfg = PoaConfig {
         alignment_mode: AlignmentMode::SemiGlobal,
         min_coverage_fraction: 0.1,
         ..Default::default()
     };
     let mut graph = PoaGraph::new(&seed, cfg).unwrap();
-    for _ in 0..4 { graph.add_read(&left).unwrap(); }
-    for _ in 0..4 { graph.add_read(&right).unwrap(); }
+    for _ in 0..4 {
+        graph.add_read(&left).unwrap();
+    }
+    for _ in 0..4 {
+        graph.add_read(&right).unwrap();
+    }
     let cons = graph.consensus().unwrap();
     assert!(
         !cons.gaps.is_empty(),
@@ -774,18 +790,24 @@ fn gap_size_is_minimum_size_estimate() {
 fn single_read_has_no_gap() {
     // With only the seed read, coverage is all 1s but there are no
     // well-supported flanks, so detect_coverage_gaps returns empty.
-    let cfg = PoaConfig { min_reads: 1, ..Default::default() };
+    let cfg = PoaConfig {
+        min_reads: 1,
+        ..Default::default()
+    };
     let graph = PoaGraph::new(b"ACGTTGCAATGC", cfg).unwrap();
     let cons = graph.consensus().unwrap();
-    assert!(cons.gaps.is_empty(), "single-read consensus should have no gaps");
+    assert!(
+        cons.gaps.is_empty(),
+        "single-read consensus should have no gaps"
+    );
 }
 
 #[test]
 fn gap_kind_spanning_for_seed_based_gap() {
     // A seed-based gap must have kind=Spanning so callers know a minimum
     // size estimate is available via size().
-    let seed  = b("ACGTTGCAATGCCCGG");
-    let left  = b("ACGTT");
+    let seed = b("ACGTTGCAATGCCCGG");
+    let left = b("ACGTT");
     let right = b("CCCGG");
     let cfg = PoaConfig {
         alignment_mode: AlignmentMode::SemiGlobal,
@@ -793,8 +815,12 @@ fn gap_kind_spanning_for_seed_based_gap() {
         ..Default::default()
     };
     let mut graph = PoaGraph::new(&seed, cfg).unwrap();
-    for _ in 0..3 { graph.add_read(&left).unwrap(); }
-    for _ in 0..3 { graph.add_read(&right).unwrap(); }
+    for _ in 0..3 {
+        graph.add_read(&left).unwrap();
+    }
+    for _ in 0..3 {
+        graph.add_read(&right).unwrap();
+    }
     let cons = graph.consensus().unwrap();
     assert!(!cons.gaps.is_empty());
     assert_eq!(
@@ -818,21 +844,24 @@ fn bridged_consensus_unknown_gap() {
         alignment_mode: AlignmentMode::SemiGlobal,
         ..Default::default()
     };
-    let cons = poa_consensus::bridged_consensus(
-        &left_refs, 0, &right_refs, 0, &cfg,
-    ).unwrap();
+    let cons = poa_consensus::bridged_consensus(&left_refs, 0, &right_refs, 0, &cfg).unwrap();
 
     // Sequence is the concatenation of both consensuses.
     assert!(!cons.sequence.is_empty());
 
     // Exactly one Unknown gap at the join point.
-    let unknown: Vec<_> = cons.gaps.iter()
+    let unknown: Vec<_> = cons
+        .gaps
+        .iter()
         .filter(|g| g.kind == poa_consensus::GapKind::Unknown)
         .collect();
     assert_eq!(unknown.len(), 1, "expected exactly one Unknown gap");
 
     let gap = unknown[0];
-    assert_eq!(gap.start, gap.end, "Unknown gap should be an insertion point (start==end)");
+    assert_eq!(
+        gap.start, gap.end,
+        "Unknown gap should be an insertion point (start==end)"
+    );
     assert_eq!(gap.min_size(), None, "Unknown gap has no minimum size");
 
     // Total minimum size: at least as long as the two consensus segments.
