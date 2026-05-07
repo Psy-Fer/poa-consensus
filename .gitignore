@@ -24,3 +24,10 @@ target
 # Added by cargo
 
 /target
+
+
+ref/
+tests/comparison.rs
+test_plots/
+bench/work/
+*.pyc
