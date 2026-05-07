@@ -976,7 +976,11 @@ fn detect_coverage_gaps(coverage: &[u32]) -> Vec<CoverageGap> {
         if cov < 2 {
             gap_start.get_or_insert(i);
         } else if let Some(s) = gap_start.take() {
-            gaps.push(CoverageGap { start: s, end: i, kind: GapKind::Spanning });
+            gaps.push(CoverageGap {
+                start: s,
+                end: i,
+                kind: GapKind::Spanning,
+            });
         }
     }
     if let Some(s) = gap_start {
