@@ -25,7 +25,10 @@ target
 
 /target
 
-
+CLAUDE.md
+TODO.md
+poa_crate_handoff.md
+design/
 ref/
 test_plots/
 bench/work/
