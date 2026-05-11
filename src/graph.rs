@@ -532,7 +532,12 @@ fn align(
             let mut new_best_score = UNSET;
             for j in j_lo..=j_hi {
                 let s = m.get(t, j).score;
-                if s != UNSET && s > new_best_score {
+                if s != UNSET
+                    && (new_best_score == UNSET
+                        || s > new_best_score
+                        || (s == new_best_score
+                            && j.abs_diff(centre) < new_best_j.abs_diff(centre)))
+                {
                     new_best_score = s;
                     new_best_j = j;
                 }
