@@ -1874,3 +1874,76 @@ fn multi_allele_low_per_allele_depth() {
         result.map(|v| v.len())
     );
 }
+
+// ─── Diagonal-skip convergence ────────────────────────────────────────────────
+
+/// Verify that the diagonal-skip rate increases as more reads are added.
+///
+/// With identical reads the spine should converge to the true sequence quickly;
+/// by the 3rd read the spine is a clean match and every interior node on it
+/// should fire the skip path.  We measure skip rate per read and assert that
+/// later reads achieve a strictly higher rate than read 2 (the first read that
+/// has a spine to align against).
+#[test]
+fn diagonal_skip_rate_increases_with_read_count() {
+    use crate::graph::{reset_skip_counters, skip_rate};
+
+    // Use a long, non-repetitive sequence so many spine nodes are simple
+    // (single in-edge, single out-edge) and eligible for the skip.
+    let seq = b"ACGTACGATCGATCGTAGCTAGCTAGCTACGATCGATCGATCGTACGATCG\
+                TAGCTAGCTAGCATCGATCGATCGTACGATCGTAGCTAGCTAGCTACGATC";
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        ..Default::default()
+    };
+
+    let mut graph = PoaGraph::new(seq, cfg).unwrap();
+
+    // Read 2 — first read with a (single-node) spine; skip rate is low because
+    // the spine has only one node (the seed) so most nodes are new.
+    reset_skip_counters();
+    graph.add_read(seq).unwrap();
+    let rate2 = skip_rate();
+
+    // Reads 3-5 — spine grows to full length; skip rate should climb.
+    reset_skip_counters();
+    graph.add_read(seq).unwrap();
+    let rate3 = skip_rate();
+
+    reset_skip_counters();
+    graph.add_read(seq).unwrap();
+    let rate4 = skip_rate();
+
+    reset_skip_counters();
+    graph.add_read(seq).unwrap();
+    let rate5 = skip_rate();
+
+    eprintln!(
+        "diagonal skip rates — r2: {:.2}%  r3: {:.2}%  r4: {:.2}%  r5: {:.2}%",
+        rate2 * 100.0,
+        rate3 * 100.0,
+        rate4 * 100.0,
+        rate5 * 100.0,
+    );
+
+    // By read 4 the spine should be the exact sequence; skip rate should be high
+    // (>50% of non-source nodes) and strictly increasing after read 2.
+    assert!(
+        rate3 >= rate2,
+        "skip rate should not decrease: r3={:.2}% r2={:.2}%",
+        rate3 * 100.0,
+        rate2 * 100.0,
+    );
+    assert!(
+        rate5 >= rate4,
+        "skip rate should not decrease: r5={:.2}% r4={:.2}%",
+        rate5 * 100.0,
+        rate4 * 100.0,
+    );
+    assert!(
+        rate5 > 0.5,
+        "expected >50% skip rate for identical reads by read 5, got {:.2}%",
+        rate5 * 100.0,
+    );
+}

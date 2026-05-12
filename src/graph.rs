@@ -3,6 +3,30 @@ use crate::error::PoaError;
 use crate::types::{Consensus, CoverageGap, GapKind, GraphStats};
 use std::collections::HashMap;
 
+#[cfg(test)]
+use std::cell::Cell as StdCell;
+
+// Per-thread diagonal-skip counters, only compiled in test builds.
+// SKIP_COUNTER: total diagonal skips fired; NODE_COUNTER: total non-source nodes.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SKIP_COUNTER: StdCell<u64> = StdCell::new(0);
+    pub(crate) static NODE_COUNTER: StdCell<u64> = StdCell::new(0);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_skip_counters() {
+    SKIP_COUNTER.with(|c| c.set(0));
+    NODE_COUNTER.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn skip_rate() -> f64 {
+    let skips = SKIP_COUNTER.with(|c| c.get());
+    let nodes = NODE_COUNTER.with(|c| c.get());
+    if nodes == 0 { 0.0 } else { skips as f64 / nodes as f64 }
+}
+
 // ─── Sentinel ────────────────────────────────────────────────────────────────
 
 /// "Not yet filled" sentinel.
@@ -241,21 +265,24 @@ fn compute_bubble_ranges(nodes: &[Node], topo: &[usize]) -> Vec<Option<(usize, u
 /// 50 accommodates up to ~10 % indel rate over a 500-node spine segment.
 const SPINE_MARGIN: usize = 50;
 
-/// Align `query` against the graph using affine-gap DAG DP.
+/// Align `query` against the graph using spine-guided affine-gap DAG DP.
 ///
-/// Spine nodes (outside bubbles) restrict their DP to a narrow query window
-/// centred on the expected diagonal, bounded by [`SPINE_MARGIN`].  Bubble nodes
-/// use the full query range so that any arm length is reachable.
+/// **Diagonal skip** — O(1) fast path for consecutive exact matches along the
+/// heaviest-path spine.  Fires whenever the spine node's base matches the query
+/// base AND the M score at the predecessor dominates any open I/D state.  After
+/// each read is added the spine converges toward the true consensus, so later
+/// reads align almost entirely via diagonal skip with only small local-DP
+/// bursts at divergence points.
 ///
-/// This yields O(spine × MARGIN + bubble_nodes × l) total cells rather than the
-/// O(n × l) full-matrix cost, with a meaningful speedup when spine dominates.
-///
-/// The diagonal skip is preserved as an O(1) fast path for clean exact matches
-/// on single-predecessor, single-successor spine nodes with no pending gap state.
+/// **j-range restriction** — spine nodes get a narrow ±[`SPINE_MARGIN`] window;
+/// bubble nodes get a window anchored on the bubble entry's j position extended
+/// by the bubble span.  Cells outside the window remain UNSET and are invisible
+/// to traceback.
 fn align(
     nodes: &[Node],
     topo: &[usize],
     rank_of: &[usize],
+    spine: &[(usize, u8, i32)],
     query: &[u8],
     cfg: &PoaConfig,
 ) -> Result<Vec<AlignOp>, PoaError> {
@@ -270,6 +297,18 @@ fn align(
     let mut m = vec![Cell::unset(); size];
     let mut ins = vec![Cell::unset(); size];
     let mut del = vec![Cell::unset(); size];
+
+    // Spine membership: for each node index, the previous spine node (if on spine).
+    // Used to gate the relaxed diagonal skip.
+    let nn = nodes.len();
+    let mut on_spine = vec![false; nn];
+    let mut spine_prev: Vec<Option<usize>> = vec![None; nn];
+    for (sp, &(node_idx, _, _)) in spine.iter().enumerate() {
+        on_spine[node_idx] = true;
+        if sp > 0 {
+            spine_prev[node_idx] = Some(spine[sp - 1].0);
+        }
+    }
 
     // Bubble membership: Some((entry_t, exit_t)) or None for spine.
     let bubble_ranges = compute_bubble_ranges(nodes, topo);
@@ -288,24 +327,57 @@ fn align(
         let node_base = nodes[node_idx].base;
         let is_source = nodes[node_idx].in_edges.is_empty();
 
-        // ── Diagonal skip ───────────────────────────────────────────────────────
-        // O(1): carry match score from predecessor's best_j.
+        // ── Diagonal skip ──────────────────────────────────────────────────────
+        // O(1) fast path for consecutive exact matches along the spine.
+        //
+        // Correct formulation: predecessor has consumed `bj` query bases
+        // (M[pt][bj] is its best cell).  We advance by one — consuming query[bj]
+        // (0-indexed) — and record M[t][bj+1] = M[pt][bj] + match_score.
+        // best_j[t] = bj+1, so the NEXT spine node will find M[t][bj+1] set and
+        // fire its own skip.  This allows runs of consecutive diagonal skips.
+        //
+        // Guards:
+        //   - node must be on the spine (so we know which predecessor to trust)
+        //   - exactly one in-edge, from the previous spine node (no competing arm)
+        //   - exactly one out-edge (not a bubble entry — those need full DP so the
+        //     non-spine arms can read correct predecessor scores)
+        //   - no open insert/delete state at predecessor's best column
+        #[cfg(test)]
         if !is_source {
-            if let [pred_node] = nodes[node_idx].in_edges.as_slice() {
-                if nodes[node_idx].out_edges.len() == 1 {
-                    let pt = rank_of[*pred_node];
+            NODE_COUNTER.with(|c| c.set(c.get() + 1));
+        }
+
+        if !is_source && on_spine[node_idx] {
+            if let Some(prev_sp) = spine_prev[node_idx] {
+                if nodes[node_idx].in_edges == [prev_sp]
+                    && nodes[node_idx].out_edges.len() == 1
+                {
+                    let pt = rank_of[prev_sp];
                     let bj = best_j_per_t[pt];
-                    if bj >= 1
-                        && bj <= l
-                        && node_base == query[bj - 1]
-                        && m[idx(pt, bj - 1, l)].score != UNSET
-                        && ins[idx(pt, bj - 1, l)].score == UNSET
-                        && del[idx(pt, bj - 1, l)].score == UNSET
-                    {
-                        let score = m[idx(pt, bj - 1, l)].score + cfg.match_score;
-                        m[idx(t, bj, l)] = Cell { score, pred_t: pt };
-                        best_j_per_t[t] = bj;
-                        continue;
+                    if bj < l && node_base == query[bj] {
+                        let m_prev = m[idx(pt, bj, l)].score;
+                        let i_prev = ins[idx(pt, bj, l)].score;
+                        let d_prev = del[idx(pt, bj, l)].score;
+                        // The source node always has I[source][j] set from global
+                        // alignment initialization (leading-insert penalties).
+                        // It's safe to skip through source if M clearly dominates —
+                        // I[source][bj] is just the penalty for a leading insertion,
+                        // not an ongoing gap run.  For all non-source predecessors
+                        // we require I/D to be strictly UNSET: an ongoing gap run
+                        // must not be cut off by the skip.
+                        let pred_is_source = nodes[topo[pt]].in_edges.is_empty();
+                        let i_ok = i_prev == UNSET
+                            || (pred_is_source && m_prev > i_prev);
+                        let d_ok = d_prev == UNSET
+                            || (pred_is_source && m_prev > d_prev);
+                        if m_prev != UNSET && i_ok && d_ok {
+                            let score = m_prev + cfg.match_score;
+                            m[idx(t, bj + 1, l)] = Cell { score, pred_t: pt };
+                            best_j_per_t[t] = bj + 1;
+                            #[cfg(test)]
+                            SKIP_COUNTER.with(|c| c.set(c.get() + 1));
+                            continue;
+                        }
                     }
                 }
             }
@@ -1003,7 +1075,8 @@ impl PoaGraph {
         }
 
         let (topo, rank_of) = topological_order(&self.nodes);
-        let ops = align(&self.nodes, &topo, &rank_of, read, &self.config)?;
+        let spine = heaviest_path(&self.nodes, &topo, &rank_of);
+        let ops = align(&self.nodes, &topo, &rank_of, &spine, read, &self.config)?;
         let read_idx = self.n_reads as u32;
         add_to_graph(&mut self.nodes, &mut self.edge_reads, read, &ops, read_idx);
         self.reads.push(read.to_vec());
@@ -1119,7 +1192,8 @@ impl PoaGraph {
         read: &[u8],
     ) -> Result<(Vec<AlignOp>, usize, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
-        let ops = align(&self.nodes, &topo, &rank_of, read, &self.config)?;
+        let spine = heaviest_path(&self.nodes, &topo, &rank_of);
+        let ops = align(&self.nodes, &topo, &rank_of, &spine, read, &self.config)?;
         Ok((ops, 0, rank_of))
     }
 
@@ -1129,7 +1203,8 @@ impl PoaGraph {
         read: &[u8],
     ) -> Result<(Vec<AlignOp>, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
-        let ops = align(&self.nodes, &topo, &rank_of, read, &self.config)?;
+        let spine = heaviest_path(&self.nodes, &topo, &rank_of);
+        let ops = align(&self.nodes, &topo, &rank_of, &spine, read, &self.config)?;
         Ok((ops, rank_of))
     }
 
