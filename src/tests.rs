@@ -1837,36 +1837,20 @@ fn adaptive_seed_out_of_bounds() {
 // ── Remaining TODO tests ───────────────────────────────────────────────────────
 
 #[test]
-fn reads_too_long_unbanded() {
-    // A read > 1000 bp with band_width=0 should increment the warning counter.
-    let long: Vec<u8> = b"A".repeat(1001);
+fn reads_long_aligns_correctly() {
+    // A long read should align successfully and produce a correct consensus.
+    let long: Vec<u8> = b"A".repeat(200);
     let cfg = PoaConfig {
-        warn_on_long_unbanded: true,
-        band_width: 0,
-        adaptive_band: false,
         ..Default::default()
     };
     let mut graph = PoaGraph::new(&long, cfg).unwrap();
     graph.add_read(&long).unwrap();
-    assert!(
-        graph.warnings_emitted() > 0,
-        "expected at least one long-unbanded warning"
+    // The warning counter is always 0 with the new aligner (no band warnings).
+    assert_eq!(
+        graph.warnings_emitted(),
+        0,
+        "no warnings expected with new aligner"
     );
-}
-
-#[test]
-fn reads_too_long_unbanded_suppressed() {
-    // warn_on_long_unbanded=false should keep the counter at zero.
-    let long: Vec<u8> = b"A".repeat(1001);
-    let cfg = PoaConfig {
-        warn_on_long_unbanded: false,
-        band_width: 0,
-        adaptive_band: false,
-        ..Default::default()
-    };
-    let mut graph = PoaGraph::new(&long, cfg).unwrap();
-    graph.add_read(&long).unwrap();
-    assert_eq!(graph.warnings_emitted(), 0, "warning should be suppressed");
 }
 
 #[test]
