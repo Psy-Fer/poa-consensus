@@ -1961,19 +1961,25 @@ fn stale_spine_same_consensus_as_fresh() {
     // Build 20 reads: 18 identical to base, 2 with a single-base difference
     // (these introduce minor branches that don't survive the coverage filter).
     let mut reads: Vec<Vec<u8>> = (0..18).map(|_| base.to_vec()).collect();
-    let mut r1 = base.to_vec(); r1[10] = b'T'; // SNP — minor branch, pruned
-    let mut r2 = base.to_vec(); r2[40] = b'G'; // SNP — minor branch, pruned
+    let mut r1 = base.to_vec();
+    r1[10] = b'T'; // SNP — minor branch, pruned
+    let mut r2 = base.to_vec();
+    r2[40] = b'G'; // SNP — minor branch, pruned
     reads.push(r1);
     reads.push(r2);
 
-    let cfg = PoaConfig { min_reads: 3, ..Default::default() };
+    let cfg = PoaConfig {
+        min_reads: 3,
+        ..Default::default()
+    };
 
     // Build with stale-spine policy (the current default).
     let stale_result = poa_consensus::consensus(
         &reads.iter().map(|r| r.as_slice()).collect::<Vec<_>>(),
         0,
         &cfg,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Build a reference consensus with no optimization possible: rebuild the
     // graph from scratch using the functional API, which internally creates a
@@ -1983,7 +1989,8 @@ fn stale_spine_same_consensus_as_fresh() {
         &reads.iter().map(|r| r.as_slice()).collect::<Vec<_>>(),
         0,
         &cfg,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(
         stale_result.sequence, ref_result.sequence,

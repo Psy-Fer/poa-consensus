@@ -24,7 +24,11 @@ pub(crate) fn reset_skip_counters() {
 pub(crate) fn skip_rate() -> f64 {
     let skips = SKIP_COUNTER.with(|c| c.get());
     let nodes = NODE_COUNTER.with(|c| c.get());
-    if nodes == 0 { 0.0 } else { skips as f64 / nodes as f64 }
+    if nodes == 0 {
+        0.0
+    } else {
+        skips as f64 / nodes as f64
+    }
 }
 
 // ─── Sentinel ────────────────────────────────────────────────────────────────
@@ -288,6 +292,74 @@ const SPINE_STABLE_THRESHOLD: usize = 3;
 /// Maximum recompute interval (reads between spine refreshes).
 const SPINE_MAX_INTERVAL: usize = 32;
 
+// ─── Lookahead resolve ───────────────────────────────────────────────────────
+
+/// Query bases scored per arm when resolving a bubble entry.
+/// Set to one repeat unit (5 bases covers AAGGG, GGGGCC, CAG etc.).
+/// Larger windows increase false-positive risk at typical ONT error rates
+/// because a single read error in the window can flip the decision.
+const LOOKAHEAD_K: usize = 5;
+/// Winning arm must beat the runner-up by at least this many score points.
+/// One match+mismatch swing = 2 points, so MARGIN=2 requires one net
+/// advantage position after accounting for any tie positions.
+const LOOKAHEAD_MARGIN: i32 = 2;
+/// Maximum nodes walked when materialising a single bubble arm.
+const LOOKAHEAD_MAX_ARM_DEPTH: usize = 512;
+
+/// Walks one bubble arm from `start_idx` forward, collecting node indices
+/// until the bubble exit (topo rank `exit_t`) is reached.  The exit node
+/// itself is NOT included — it runs its own windowed DP normally.
+///
+/// Returns `None` if the arm has internal branching (a nested bubble) or
+/// exceeds the depth cap; both are signals to fall back to windowed DP.
+fn collect_arm_nodes(
+    nodes: &[Node],
+    rank_of: &[usize],
+    start_idx: usize,
+    exit_t: usize,
+) -> Option<Vec<usize>> {
+    let mut path = Vec::new();
+    let mut cur = start_idx;
+    for _ in 0..LOOKAHEAD_MAX_ARM_DEPTH {
+        if rank_of[cur] == exit_t {
+            return Some(path);
+        }
+        path.push(cur);
+        match nodes[cur].out_edges.as_slice() {
+            [(next, _)] => cur = *next,
+            _ => return None, // internal branch or dead end before exit
+        }
+    }
+    None // depth cap exceeded
+}
+
+/// Scores the first `min(LOOKAHEAD_K, arm.len(), query[j..].len())` bases of
+/// `arm` against `query` starting at position `j`.
+fn score_arm_prefix(
+    arm: &[usize],
+    nodes: &[Node],
+    query: &[u8],
+    j: usize,
+    match_score: i32,
+    mismatch_score: i32,
+) -> i32 {
+    let len = arm
+        .len()
+        .min(LOOKAHEAD_K)
+        .min(query.len().saturating_sub(j));
+    arm[..len]
+        .iter()
+        .enumerate()
+        .map(|(i, &nidx)| {
+            if nodes[nidx].base == query[j + i] {
+                match_score
+            } else {
+                mismatch_score
+            }
+        })
+        .sum()
+}
+
 // ─── Bubble-aware DP alignment ────────────────────────────────────────────────
 
 /// Half-width of the DP band applied to spine (non-bubble) nodes.
@@ -348,12 +420,22 @@ fn align(
     // Track best_j per row for diagonal skip.
     let mut best_j_per_t = vec![0usize; n];
 
+    // Nodes marked here are on a losing bubble arm identified by lookahead
+    // resolve.  Their entire windowed DP is skipped; their cells stay UNSET so
+    // the exit node naturally reads only from the winning arm's predecessors.
+    let mut lookahead_skip = vec![false; nn];
+
     #[inline]
     fn idx(t: usize, j: usize, l: usize) -> usize {
         t * (l + 1) + j
     }
 
     for (t, &node_idx) in topo.iter().enumerate() {
+        // Lookahead: skip nodes on losing bubble arms entirely.
+        if lookahead_skip[node_idx] {
+            continue;
+        }
+
         let node_base = nodes[node_idx].base;
         let is_source = nodes[node_idx].in_edges.is_empty();
 
@@ -379,9 +461,7 @@ fn align(
 
         if !is_source && on_spine[node_idx] {
             if let Some(prev_sp) = spine_prev[node_idx] {
-                if nodes[node_idx].in_edges == [prev_sp]
-                    && nodes[node_idx].out_edges.len() == 1
-                {
+                if nodes[node_idx].in_edges == [prev_sp] && nodes[node_idx].out_edges.len() == 1 {
                     let pt = rank_of[prev_sp];
                     let bj = best_j_per_t[pt];
                     if bj < l && node_base == query[bj] {
@@ -396,10 +476,8 @@ fn align(
                         // we require I/D to be strictly UNSET: an ongoing gap run
                         // must not be cut off by the skip.
                         let pred_is_source = nodes[topo[pt]].in_edges.is_empty();
-                        let i_ok = i_prev == UNSET
-                            || (pred_is_source && m_prev > i_prev);
-                        let d_ok = d_prev == UNSET
-                            || (pred_is_source && m_prev > d_prev);
+                        let i_ok = i_prev == UNSET || (pred_is_source && m_prev > i_prev);
+                        let d_ok = d_prev == UNSET || (pred_is_source && m_prev > d_prev);
                         if m_prev != UNSET && i_ok && d_ok {
                             let score = m_prev + cfg.match_score;
                             m[idx(t, bj + 1, l)] = Cell { score, pred_t: pt };
@@ -616,6 +694,90 @@ fn align(
             } else {
                 j_pred_max.saturating_add(1).min(l)
             };
+        }
+
+        // ── Lookahead resolve ─────────────────────────────────────────────────
+        // At a bubble entry node: score each arm's first LOOKAHEAD_K bases
+        // against the query.  If one arm beats the runner-up by LOOKAHEAD_MARGIN
+        // points, mark every losing arm's nodes in `lookahead_skip` so their
+        // windowed DP is skipped.  The winning arm runs its normal windowed DP
+        // (the existing j-window is already correctly anchored to bubble_entry_j).
+        // The exit node then reads from the winning arm's cells — losing arms
+        // are all UNSET and invisible to traceback.
+        if let Some((entry_t, exit_t)) = bubble_ranges[t] {
+            if t == entry_t && nodes[node_idx].out_edges.len() >= 2 {
+                let j_entry = best_j_per_t[t];
+                if j_entry < l {
+                    // Materialise each arm; bail if any is internally branched.
+                    let mut all_arms: Vec<Vec<usize>> = Vec::new();
+                    let mut complex = false;
+                    for &(arm_start, _) in &nodes[node_idx].out_edges {
+                        match collect_arm_nodes(nodes, rank_of, arm_start, exit_t) {
+                            Some(arm) => all_arms.push(arm),
+                            None => {
+                                complex = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Only fire lookahead when the longest arm provides the
+                    // full LOOKAHEAD_K bases to score.  Short arms (< K nodes)
+                    // are unreliable: a single read error in the window can flip
+                    // the decision, causing incorrect arm elimination.  Requiring
+                    // the full K bases means only genuine structural bubbles
+                    // (≥ one repeat unit long) trigger lookahead; error-induced
+                    // single-node arms always fall back to windowed DP.
+                    let max_scored = all_arms
+                        .iter()
+                        .map(|arm| {
+                            arm.len()
+                                .min(LOOKAHEAD_K)
+                                .min(query.len().saturating_sub(j_entry))
+                        })
+                        .max()
+                        .unwrap_or(0);
+
+                    if !complex && all_arms.len() >= 2 && max_scored >= LOOKAHEAD_K {
+                        let scores: Vec<i32> = all_arms
+                            .iter()
+                            .map(|arm| {
+                                score_arm_prefix(
+                                    arm,
+                                    nodes,
+                                    query,
+                                    j_entry,
+                                    cfg.match_score,
+                                    cfg.mismatch_score,
+                                )
+                            })
+                            .collect();
+
+                        let best = *scores.iter().max().unwrap();
+                        let winner_count = scores.iter().filter(|&&s| s == best).count();
+
+                        if winner_count == 1 {
+                            let second_best = scores
+                                .iter()
+                                .copied()
+                                .filter(|&s| s != best)
+                                .max()
+                                .unwrap_or(i32::MIN);
+
+                            if best - second_best >= LOOKAHEAD_MARGIN {
+                                let winner = scores.iter().position(|&s| s == best).unwrap();
+                                for (arm_idx, arm) in all_arms.iter().enumerate() {
+                                    if arm_idx != winner {
+                                        for &losing_node in arm {
+                                            lookahead_skip[losing_node] = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1127,7 +1289,14 @@ impl PoaGraph {
             }
         }
 
-        let ops = align(&self.nodes, &topo, &rank_of, &self.cached_spine, read, &self.config)?;
+        let ops = align(
+            &self.nodes,
+            &topo,
+            &rank_of,
+            &self.cached_spine,
+            read,
+            &self.config,
+        )?;
         let read_idx = self.n_reads as u32;
         add_to_graph(&mut self.nodes, &mut self.edge_reads, read, &ops, read_idx);
         self.reads.push(read.to_vec());
