@@ -213,8 +213,7 @@ fn find_bubble_exit(nodes: &[Node], topo: &[usize], entry_t: usize) -> Option<us
 
     let mut outstanding = nodes[entry_node].out_edges.len();
 
-    for t in (entry_t + 1)..topo.len() {
-        let node_idx = topo[t];
+    for (t, &node_idx) in topo.iter().enumerate().skip(entry_t + 1) {
         let bubble_in = nodes[node_idx]
             .in_edges
             .iter()
@@ -251,15 +250,11 @@ fn compute_bubble_ranges(nodes: &[Node], topo: &[usize]) -> Vec<Option<(usize, u
     while t < n {
         if nodes[topo[t]].out_edges.len() >= 2 {
             if let Some(exit_t) = find_bubble_exit(nodes, topo, t) {
-                for bt in t..=exit_t {
-                    ranges[bt] = Some((t, exit_t));
-                }
+                ranges[t..=exit_t].fill(Some((t, exit_t)));
                 t = exit_t + 1;
             } else {
                 // Open-ended bubble: mark everything remaining conservatively.
-                for bt in t..n {
-                    ranges[bt] = Some((t, n - 1));
-                }
+                ranges[t..n].fill(Some((t, n - 1)));
                 break;
             }
         } else {
@@ -388,7 +383,12 @@ const SLIDE_MIN_CONSEC: usize = 2;
 /// decided at the bubble *entry* node (before arm nodes are processed in topo
 /// order), the winning arm's nodes proceed through the normal windowed DP and
 /// accumulate correct M/I/D cells for traceback.
-fn slide_lock(all_arms: &[Vec<usize>], nodes: &[Node], query: &[u8], j_entry: usize) -> Option<usize> {
+fn slide_lock(
+    all_arms: &[Vec<usize>],
+    nodes: &[Node],
+    query: &[u8],
+    j_entry: usize,
+) -> Option<usize> {
     let n_arms = all_arms.len();
     let remaining = query.len().saturating_sub(j_entry);
     if remaining == 0 || n_arms < 2 {
@@ -443,14 +443,12 @@ fn slide_lock(all_arms: &[Vec<usize>], nodes: &[Node], query: &[u8], j_entry: us
         // Bounds check on arm index: alive arms always have len > i here (ensured
         // by the exhaustion block above which eliminates len <= i arms first).
         let matched: Vec<bool> = (0..n_arms)
-            .map(|idx| {
-                alive[idx]
-                    && all_arms[idx].len() > i
-                    && nodes[all_arms[idx][i]].base == q
-            })
+            .map(|idx| alive[idx] && all_arms[idx].len() > i && nodes[all_arms[idx][i]].base == q)
             .collect();
         let match_count = matched.iter().filter(|&&m| m).count();
-        let mismatch_count = (0..n_arms).filter(|&idx| alive[idx] && !matched[idx]).count();
+        let mismatch_count = (0..n_arms)
+            .filter(|&idx| alive[idx] && !matched[idx])
+            .count();
 
         if match_count == 1 && mismatch_count > 0 {
             let candidate = matched.iter().position(|&m| m).unwrap();
@@ -705,11 +703,9 @@ fn align(
             {
                 let (mut best, mut best_pred) = (UNSET, VIRTUAL);
                 // Free-start at j=1: applies when j_lo==1 (source or bubble nodes).
-                if j == 1 && (is_source || semi) {
-                    if sc > best {
-                        best = sc;
-                        best_pred = VIRTUAL;
-                    }
+                if j == 1 && (is_source || semi) && sc > best {
+                    best = sc;
+                    best_pred = VIRTUAL;
                 }
                 if is_source && j > 1 {
                     let val = safe_add(go + (j as i32 - 1) * ge, sc);
@@ -884,8 +880,7 @@ fn align(
                                 })
                                 .collect();
                             let best = *scores.iter().max().unwrap();
-                            let winner_count =
-                                scores.iter().filter(|&&s| s == best).count();
+                            let winner_count = scores.iter().filter(|&&s| s == best).count();
                             if winner_count == 1 {
                                 let second_best = scores
                                     .iter()
@@ -1392,8 +1387,8 @@ fn phasing_groups(
     // Split reads into those with at least one recorded arm choice and those with none.
     let mut assigned: Vec<usize> = Vec::new();
     let mut unassigned: Vec<usize> = Vec::new();
-    for r in 0..n_reads {
-        if sig[r].iter().any(|s| s.is_some()) {
+    for (r, row) in sig.iter().enumerate() {
+        if row.iter().any(|s| s.is_some()) {
             assigned.push(r);
         } else {
             unassigned.push(r);
@@ -1444,7 +1439,7 @@ fn phasing_groups(
     }
 
     let mut groups: Vec<Vec<usize>> = group_map.into_values().collect();
-    groups.sort_unstable_by(|a, b| b.len().cmp(&a.len()));
+    groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.len()));
 
     if groups.is_empty() {
         groups.push(Vec::new());
@@ -1797,11 +1792,20 @@ impl PoaGraph {
         let structural = find_structural_bubbles(&self.nodes, &topo, self.n_reads, &self.config);
 
         let groups = if !structural.is_empty() {
-            phasing_groups(&self.edge_reads, &structural, self.n_reads, self.config.min_reads)
+            phasing_groups(
+                &self.edge_reads,
+                &structural,
+                self.n_reads,
+                self.config.min_reads,
+            )
         } else {
             // Fall back to single-best SNP bubble partitioning.
-            let snp_bubbles =
-                find_bubbles(&self.nodes, &topo, self.n_reads, self.config.min_allele_freq);
+            let snp_bubbles = find_bubbles(
+                &self.nodes,
+                &topo,
+                self.n_reads,
+                self.config.min_allele_freq,
+            );
             if snp_bubbles.is_empty() {
                 return Ok(vec![self.consensus()?]);
             }

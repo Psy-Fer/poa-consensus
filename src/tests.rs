@@ -1883,7 +1883,7 @@ fn multi_allele_low_per_allele_depth() {
 fn structural_bubble_phasing_splits_flanked_length_variants() {
     let left = b"ACGTACGT";
     let right = b"TTTTGGGG";
-    let short_mid: Vec<u8> = b"CAT".repeat(5);  // 15 bp
+    let short_mid: Vec<u8> = b"CAT".repeat(5); // 15 bp
     let long_mid: Vec<u8> = b"CAT".repeat(10); // 30 bp
 
     let mut short_read = left.to_vec();
@@ -1911,7 +1911,7 @@ fn structural_bubble_phasing_splits_flanked_length_variants() {
     let mut lens: Vec<usize> = consensuses.iter().map(|c| c.sequence.len()).collect();
     lens.sort_unstable();
     let expected_short = left.len() + short_mid.len() + right.len(); // 31
-    let expected_long = left.len() + long_mid.len() + right.len();   // 46
+    let expected_long = left.len() + long_mid.len() + right.len(); // 46
     assert_eq!(lens[0], expected_short, "short allele length mismatch");
     assert_eq!(lens[1], expected_long, "long allele length mismatch");
 }
@@ -1923,7 +1923,7 @@ fn structural_bubble_phasing_splits_flanked_length_variants() {
 fn structural_bubble_phasing_preserves_minority_expansion() {
     let left = b"GATTACAGATTACA";
     let right = b"CATCATCATCATCA";
-    let normal_mid: Vec<u8> = b"AAA".repeat(5);    // 15 bp
+    let normal_mid: Vec<u8> = b"AAA".repeat(5); // 15 bp
     let expanded_mid: Vec<u8> = b"AAA".repeat(15); // 45 bp (30 extra nodes)
 
     let mut normal = left.to_vec();
@@ -1947,13 +1947,20 @@ fn structural_bubble_phasing_preserves_minority_expansion() {
     let refs: Vec<&[u8]> = all_reads.iter().map(Vec::as_slice).collect();
     let consensuses = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
 
-    assert_eq!(consensuses.len(), 2, "somatic expansion must appear as a second consensus");
+    assert_eq!(
+        consensuses.len(),
+        2,
+        "somatic expansion must appear as a second consensus"
+    );
     let mut lens: Vec<usize> = consensuses.iter().map(|c| c.sequence.len()).collect();
     lens.sort_unstable();
     let expected_normal = left.len() + normal_mid.len() + right.len();
     let expected_expanded = left.len() + expanded_mid.len() + right.len();
     assert_eq!(lens[0], expected_normal, "normal allele length mismatch");
-    assert_eq!(lens[1], expected_expanded, "expanded allele length mismatch");
+    assert_eq!(
+        lens[1], expected_expanded,
+        "expanded allele length mismatch"
+    );
 }
 
 /// Structural bubble phasing is sequence-agnostic. Two reads with a large
@@ -1986,7 +1993,11 @@ fn structural_bubble_phasing_sequence_agnostic() {
     let refs: Vec<&[u8]> = all_reads.iter().map(Vec::as_slice).collect();
     let consensuses = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
 
-    assert_eq!(consensuses.len(), 2, "non-repetitive SV should split into two consensuses");
+    assert_eq!(
+        consensuses.len(),
+        2,
+        "non-repetitive SV should split into two consensuses"
+    );
     let mut lens: Vec<usize> = consensuses.iter().map(|c| c.sequence.len()).collect();
     lens.sort_unstable();
     assert_eq!(lens[0], left.len() + normal_mid.len() + right.len());
@@ -2012,7 +2023,11 @@ fn structural_bubble_phasing_ignores_snp_bubbles() {
     ];
     let consensuses = poa_consensus::consensus_multi(&reads, 0, &cfg).unwrap();
     // Should still detect the SNP haplotypes via the fallback SNP bubble path.
-    assert_eq!(consensuses.len(), 2, "SNP haplotypes should still be detected via fallback");
+    assert_eq!(
+        consensuses.len(),
+        2,
+        "SNP haplotypes should still be detected via fallback"
+    );
 }
 
 /// Three flanked alleles of different lengths produce a nested structural bubble:
@@ -2020,11 +2035,11 @@ fn structural_bubble_phasing_ignores_snp_bubbles() {
 /// sub-arm 1. The compatibility grouping must yield exactly three allele groups.
 #[test]
 fn structural_bubble_phasing_three_alleles() {
-    let left  = b"ACGTACGTACGT";
+    let left = b"ACGTACGTACGT";
     let right = b"TTTTGGGGTTTT";
-    let short_mid:  Vec<u8> = b"CAT".repeat(3);   //  9 bp
-    let medium_mid: Vec<u8> = b"CAT".repeat(8);  // 24 bp
-    let long_mid:   Vec<u8> = b"CAT".repeat(15); // 45 bp
+    let short_mid: Vec<u8> = b"CAT".repeat(3); //  9 bp
+    let medium_mid: Vec<u8> = b"CAT".repeat(8); // 24 bp
+    let long_mid: Vec<u8> = b"CAT".repeat(15); // 45 bp
 
     let make = |mid: &[u8]| -> Vec<u8> {
         let mut r = left.to_vec();
@@ -2033,9 +2048,9 @@ fn structural_bubble_phasing_three_alleles() {
         r
     };
 
-    let short_read  = make(&short_mid);
+    let short_read = make(&short_mid);
     let medium_read = make(&medium_mid);
-    let long_read   = make(&long_mid);
+    let long_read = make(&long_mid);
 
     let cfg = PoaConfig {
         min_reads: 3,
@@ -2054,9 +2069,9 @@ fn structural_bubble_phasing_three_alleles() {
     assert_eq!(consensuses.len(), 3, "expected three allele consensuses");
     let mut lens: Vec<usize> = consensuses.iter().map(|c| c.sequence.len()).collect();
     lens.sort_unstable();
-    assert_eq!(lens[0], left.len() + short_mid.len()  + right.len());
+    assert_eq!(lens[0], left.len() + short_mid.len() + right.len());
     assert_eq!(lens[1], left.len() + medium_mid.len() + right.len());
-    assert_eq!(lens[2], left.len() + long_mid.len()   + right.len());
+    assert_eq!(lens[2], left.len() + long_mid.len() + right.len());
 }
 
 /// A structural variant supported by only one read (below min_allele_freq=0.2
@@ -2064,10 +2079,10 @@ fn structural_bubble_phasing_three_alleles() {
 /// library should return a single consensus absorbing the rare read.
 #[test]
 fn structural_bubble_phasing_no_spurious_split_below_threshold() {
-    let left  = b"GATTACAGATTACA";
+    let left = b"GATTACAGATTACA";
     let right = b"CATCATCATCATCA";
     let normal_mid: Vec<u8> = b"AAACCC".repeat(3); // 18 bp
-    let rare_mid:   Vec<u8> = b"AAACCC".repeat(8); // 48 bp  (1 read ≈ 9%)
+    let rare_mid: Vec<u8> = b"AAACCC".repeat(8); // 48 bp  (1 read ≈ 9%)
 
     let make = |mid: &[u8]| -> Vec<u8> {
         let mut r = left.to_vec();
@@ -2076,7 +2091,7 @@ fn structural_bubble_phasing_no_spurious_split_below_threshold() {
         r
     };
     let normal = make(&normal_mid);
-    let rare   = make(&rare_mid);
+    let rare = make(&rare_mid);
 
     let cfg = PoaConfig {
         min_reads: 3,
@@ -2091,7 +2106,11 @@ fn structural_bubble_phasing_no_spurious_split_below_threshold() {
     let refs: Vec<&[u8]> = all_reads.iter().map(Vec::as_slice).collect();
     let consensuses = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
 
-    assert_eq!(consensuses.len(), 1, "single rare read must not trigger a spurious split");
+    assert_eq!(
+        consensuses.len(),
+        1,
+        "single rare read must not trigger a spurious split"
+    );
 }
 
 // ─── Diagonal-skip convergence ────────────────────────────────────────────────
