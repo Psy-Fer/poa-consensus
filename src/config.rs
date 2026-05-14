@@ -36,6 +36,10 @@ pub struct PoaConfig {
     pub consensus_mode: ConsensusMode,
     /// Emit a warning to stderr when reads exceed ~1 kb with band_width = 0.
     pub warn_on_long_unbanded: bool,
+    /// Minimum arm span (nodes) for a bubble to be considered a structural variant
+    /// for cross-bubble phasing. Bubbles below this threshold (SNPs, short indels)
+    /// use the existing single-bubble partitioning. Default 10.
+    pub phasing_bubble_min_span: usize,
 }
 
 impl Default for PoaConfig {
@@ -55,6 +59,7 @@ impl Default for PoaConfig {
             alignment_mode: AlignmentMode::Global,
             consensus_mode: ConsensusMode::HeaviestPath,
             warn_on_long_unbanded: true,
+            phasing_bubble_min_span: 10,
         }
     }
 }

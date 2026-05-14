@@ -304,7 +304,8 @@ const LOOKAHEAD_K: usize = 5;
 /// advantage position after accounting for any tie positions.
 const LOOKAHEAD_MARGIN: i32 = 2;
 /// Maximum nodes walked when materialising a single bubble arm.
-const LOOKAHEAD_MAX_ARM_DEPTH: usize = 512;
+/// 4096 covers AAGGG × 800 (one arm) and similar long STR bubbles.
+const ARM_MAX_DEPTH: usize = 4096;
 
 /// Walks one bubble arm from `start_idx` forward, collecting node indices
 /// until the bubble exit (topo rank `exit_t`) is reached.  The exit node
@@ -320,7 +321,7 @@ fn collect_arm_nodes(
 ) -> Option<Vec<usize>> {
     let mut path = Vec::new();
     let mut cur = start_idx;
-    for _ in 0..LOOKAHEAD_MAX_ARM_DEPTH {
+    for _ in 0..ARM_MAX_DEPTH {
         if rank_of[cur] == exit_t {
             return Some(path);
         }
@@ -358,6 +359,127 @@ fn score_arm_prefix(
             }
         })
         .sum()
+}
+
+// ─── Slide-and-lock ──────────────────────────────────────────────────────────
+
+/// Number of consecutive positions where one arm uniquely matches the query
+/// before we commit to it.  Two positions guards against single-base read
+/// errors flipping the decision in repetitive sequence.
+const SLIDE_MIN_CONSEC: usize = 2;
+
+/// Slide all arms against `query[j_entry..]` simultaneously, base by base,
+/// until one arm can be uniquely identified as the correct path.
+///
+/// **Lock conditions** (first to fire wins):
+/// - *Exhaustion*: an arm runs out of nodes while the query has remaining
+///   bases and at least one other arm can still continue.  The exhausted arm
+///   cannot account for the remaining query and is eliminated.
+/// - *Unique mismatch*: exactly one alive arm matches the query base at the
+///   current position for `SLIDE_MIN_CONSEC` consecutive steps.  All others
+///   are eliminated.
+/// - *Single survivor*: only one arm remains after eliminations above.
+///
+/// Returns the winning arm index into `all_arms`, or `None` if no lock fires
+/// within the arm bounds.  `None` falls back to windowed DP, which is always
+/// correct.
+///
+/// **No retroactive gap-state fill is required.**  Because slide-and-lock is
+/// decided at the bubble *entry* node (before arm nodes are processed in topo
+/// order), the winning arm's nodes proceed through the normal windowed DP and
+/// accumulate correct M/I/D cells for traceback.
+fn slide_lock(all_arms: &[Vec<usize>], nodes: &[Node], query: &[u8], j_entry: usize) -> Option<usize> {
+    let n_arms = all_arms.len();
+    let remaining = query.len().saturating_sub(j_entry);
+    if remaining == 0 || n_arms < 2 {
+        return None;
+    }
+
+    // Only slide when ALL arms are at least LOOKAHEAD_K nodes long.
+    // Short arms are produced by individual read errors (1-4 nodes):
+    //   - insertion bubbles have one empty arm (0 nodes, direct edge to exit)
+    //     which exhausts immediately, incorrectly eliminating the no-insertion path
+    //   - 2-3 consecutive substitution errors produce 2-3 node arms where a
+    //     single read error can produce SLIDE_MIN_CONSEC false unique matches
+    // Requiring all arms ≥ LOOKAHEAD_K ensures we only slide on structural
+    // bubbles of at least one full repeat unit.
+    let min_arm_len = all_arms.iter().map(|a| a.len()).min().unwrap_or(0);
+    if min_arm_len < LOOKAHEAD_K {
+        return None;
+    }
+
+    let max_steps = all_arms
+        .iter()
+        .map(|a| a.len())
+        .max()
+        .unwrap_or(0)
+        .min(remaining);
+
+    let mut alive = vec![true; n_arms];
+    let mut alive_count = n_arms;
+    let mut consec_unique = 0usize;
+    let mut consec_winner: Option<usize> = None;
+
+    for i in 0..max_steps {
+        // ── Exhaustion ────────────────────────────────────────────────────────
+        // Eliminate arms that have run out of nodes while at least one other arm
+        // can still continue.  If ALL alive arms exhaust simultaneously the query
+        // continues past the bubble at the shared exit — no lock from exhaustion.
+        let any_continuing = (0..n_arms).any(|idx| alive[idx] && all_arms[idx].len() > i);
+        if any_continuing {
+            for idx in 0..n_arms {
+                if alive[idx] && all_arms[idx].len() <= i {
+                    alive[idx] = false;
+                    alive_count -= 1;
+                }
+            }
+        }
+        if alive_count <= 1 {
+            break;
+        }
+
+        // ── Unique mismatch ───────────────────────────────────────────────────
+        let q = query[j_entry + i];
+        // Bounds check on arm index: alive arms always have len > i here (ensured
+        // by the exhaustion block above which eliminates len <= i arms first).
+        let matched: Vec<bool> = (0..n_arms)
+            .map(|idx| {
+                alive[idx]
+                    && all_arms[idx].len() > i
+                    && nodes[all_arms[idx][i]].base == q
+            })
+            .collect();
+        let match_count = matched.iter().filter(|&&m| m).count();
+        let mismatch_count = (0..n_arms).filter(|&idx| alive[idx] && !matched[idx]).count();
+
+        if match_count == 1 && mismatch_count > 0 {
+            let candidate = matched.iter().position(|&m| m).unwrap();
+            if consec_winner == Some(candidate) {
+                consec_unique += 1;
+            } else {
+                consec_unique = 1;
+                consec_winner = Some(candidate);
+            }
+            if consec_unique >= SLIDE_MIN_CONSEC {
+                for idx in 0..n_arms {
+                    if alive[idx] && !matched[idx] {
+                        alive[idx] = false;
+                        alive_count -= 1;
+                    }
+                }
+                break;
+            }
+        } else {
+            consec_unique = 0;
+            consec_winner = None;
+        }
+    }
+
+    if alive_count == 1 {
+        alive.iter().position(|&a| a)
+    } else {
+        None
+    }
 }
 
 // ─── Bubble-aware DP alignment ────────────────────────────────────────────────
@@ -696,19 +818,30 @@ fn align(
             };
         }
 
-        // ── Lookahead resolve ─────────────────────────────────────────────────
-        // At a bubble entry node: score each arm's first LOOKAHEAD_K bases
-        // against the query.  If one arm beats the runner-up by LOOKAHEAD_MARGIN
-        // points, mark every losing arm's nodes in `lookahead_skip` so their
-        // windowed DP is skipped.  The winning arm runs its normal windowed DP
-        // (the existing j-window is already correctly anchored to bubble_entry_j).
-        // The exit node then reads from the winning arm's cells — losing arms
-        // are all UNSET and invisible to traceback.
+        // ── Lookahead resolve + slide-and-lock ───────────────────────────────
+        // At a bubble entry node, attempt to identify the correct arm before
+        // processing its nodes.  Losing arm nodes are marked in `lookahead_skip`
+        // and their windowed DP is entirely skipped; the winning arm proceeds
+        // through normal windowed DP, producing correct M/I/D cells for
+        // traceback without any retroactive gap-state fill.
+        //
+        // Dispatch order:
+        //   1. Lookahead  — score first LOOKAHEAD_K bases; fast, reliable for
+        //                   structural bubbles (interruption motifs, allele SNPs)
+        //                   where one arm is clearly better within one repeat unit.
+        //   2. Slide-and-lock — slide base-by-base past LOOKAHEAD_K until an arm
+        //                   exhausts or uniquely matches for SLIDE_MIN_CONSEC steps;
+        //                   handles long repetitive bubbles (RFC1, C9orf72) where
+        //                   arms share a long identical prefix.
+        //   3. Windowed DP fallback — always correct; used when arms are complex
+        //                   (internally branched) or no lock fires.
         if let Some((entry_t, exit_t)) = bubble_ranges[t] {
             if t == entry_t && nodes[node_idx].out_edges.len() >= 2 {
                 let j_entry = best_j_per_t[t];
                 if j_entry < l {
-                    // Materialise each arm; bail if any is internally branched.
+                    // Materialise each arm.  Arms with internal branches (nested
+                    // bubbles) or exceeding ARM_MAX_DEPTH return None → complex=true
+                    // → fall through to windowed DP.
                     let mut all_arms: Vec<Vec<usize>> = Vec::new();
                     let mut complex = false;
                     for &(arm_start, _) in &nodes[node_idx].out_edges {
@@ -721,56 +854,67 @@ fn align(
                         }
                     }
 
-                    // Only fire lookahead when the longest arm provides the
-                    // full LOOKAHEAD_K bases to score.  Short arms (< K nodes)
-                    // are unreliable: a single read error in the window can flip
-                    // the decision, causing incorrect arm elimination.  Requiring
-                    // the full K bases means only genuine structural bubbles
-                    // (≥ one repeat unit long) trigger lookahead; error-induced
-                    // single-node arms always fall back to windowed DP.
-                    let max_scored = all_arms
-                        .iter()
-                        .map(|arm| {
-                            arm.len()
-                                .min(LOOKAHEAD_K)
-                                .min(query.len().saturating_sub(j_entry))
-                        })
-                        .max()
-                        .unwrap_or(0);
-
-                    if !complex && all_arms.len() >= 2 && max_scored >= LOOKAHEAD_K {
-                        let scores: Vec<i32> = all_arms
+                    if !complex && all_arms.len() >= 2 {
+                        // ── 1. Lookahead ──────────────────────────────────────
+                        // Only fires when the longest arm provides all LOOKAHEAD_K
+                        // bases.  Short arms (< K) are unreliable at ONT error
+                        // rates: one read error flips the decision.
+                        let max_scored = all_arms
                             .iter()
                             .map(|arm| {
-                                score_arm_prefix(
-                                    arm,
-                                    nodes,
-                                    query,
-                                    j_entry,
-                                    cfg.match_score,
-                                    cfg.mismatch_score,
-                                )
+                                arm.len()
+                                    .min(LOOKAHEAD_K)
+                                    .min(query.len().saturating_sub(j_entry))
                             })
-                            .collect();
+                            .max()
+                            .unwrap_or(0);
 
-                        let best = *scores.iter().max().unwrap();
-                        let winner_count = scores.iter().filter(|&&s| s == best).count();
-
-                        if winner_count == 1 {
-                            let second_best = scores
+                        let winner = if max_scored >= LOOKAHEAD_K {
+                            let scores: Vec<i32> = all_arms
                                 .iter()
-                                .copied()
-                                .filter(|&s| s != best)
-                                .max()
-                                .unwrap_or(i32::MIN);
+                                .map(|arm| {
+                                    score_arm_prefix(
+                                        arm,
+                                        nodes,
+                                        query,
+                                        j_entry,
+                                        cfg.match_score,
+                                        cfg.mismatch_score,
+                                    )
+                                })
+                                .collect();
+                            let best = *scores.iter().max().unwrap();
+                            let winner_count =
+                                scores.iter().filter(|&&s| s == best).count();
+                            if winner_count == 1 {
+                                let second_best = scores
+                                    .iter()
+                                    .copied()
+                                    .filter(|&s| s != best)
+                                    .max()
+                                    .unwrap_or(i32::MIN);
+                                if best - second_best >= LOOKAHEAD_MARGIN {
+                                    scores.iter().position(|&s| s == best)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
 
-                            if best - second_best >= LOOKAHEAD_MARGIN {
-                                let winner = scores.iter().position(|&s| s == best).unwrap();
-                                for (arm_idx, arm) in all_arms.iter().enumerate() {
-                                    if arm_idx != winner {
-                                        for &losing_node in arm {
-                                            lookahead_skip[losing_node] = true;
-                                        }
+                        // ── 2. Slide-and-lock ─────────────────────────────────
+                        let winner =
+                            winner.or_else(|| slide_lock(&all_arms, nodes, query, j_entry));
+
+                        // ── Mark losers ───────────────────────────────────────
+                        if let Some(w) = winner {
+                            for (arm_idx, arm) in all_arms.iter().enumerate() {
+                                if arm_idx != w {
+                                    for &losing_node in arm {
+                                        lookahead_skip[losing_node] = true;
                                     }
                                 }
                             }
@@ -1166,6 +1310,161 @@ fn find_bubbles(
         .collect()
 }
 
+/// Finds bubbles where at least one arm has structural size (span ≥ cfg.phasing_bubble_min_span).
+/// These represent genuine length variants or SVs rather than SNPs / short indels.
+/// Used for cross-bubble compatibility phasing in consensus_multi.
+fn find_structural_bubbles(
+    nodes: &[Node],
+    topo: &[usize],
+    n_reads: usize,
+    cfg: &PoaConfig,
+) -> Vec<(usize, Vec<usize>)> {
+    let threshold = ((n_reads as f64 * cfg.min_allele_freq).ceil() as i32).max(1);
+    let max_check = cfg.phasing_bubble_min_span.saturating_add(1);
+
+    topo.iter()
+        .copied()
+        .filter_map(|entry_node| {
+            let arms: Vec<usize> = nodes[entry_node]
+                .out_edges
+                .iter()
+                .filter(|&&(_, w)| w >= threshold)
+                .map(|&(to, _)| to)
+                .collect();
+
+            if arms.len() < 2 {
+                return None;
+            }
+
+            // An arm whose start node already has multiple in-edges is a direct edge to
+            // the bubble exit (arm span 0). Otherwise measure the single-successor chain.
+            let max_span = arms
+                .iter()
+                .map(|&start| {
+                    if nodes[start].in_edges.len() > 1 {
+                        0
+                    } else {
+                        materialize_arm_len(nodes, start, max_check)
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+
+            if max_span >= cfg.phasing_bubble_min_span {
+                Some((entry_node, arms))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Groups reads by arm-choice compatibility across all structural bubbles.
+///
+/// For each structural bubble, edge_reads tells us which reads entered each arm.
+/// Two reads are in the same haplotype group when they agree on every bubble
+/// where both have a recorded arm choice. Reads with no arm assignment at any
+/// structural bubble (pre-dating all bubbles, or not spanning them) are folded
+/// into the largest group. Groups below min_reads are also folded into the largest.
+fn phasing_groups(
+    edge_reads: &HashMap<(usize, usize), Vec<u32>>,
+    bubbles: &[(usize, Vec<usize>)],
+    n_reads: usize,
+    min_reads: usize,
+) -> Vec<Vec<usize>> {
+    let n_bubbles = bubbles.len();
+
+    // sig[read][bubble] = Some(arm_idx) if that read entered that bubble arm, else None.
+    let mut sig: Vec<Vec<Option<usize>>> = vec![vec![None; n_bubbles]; n_reads];
+    for (b, (entry, arm_starts)) in bubbles.iter().enumerate() {
+        for (arm_idx, &arm_start) in arm_starts.iter().enumerate() {
+            if let Some(reads) = edge_reads.get(&(*entry, arm_start)) {
+                for &r in reads {
+                    let r = r as usize;
+                    if r < n_reads {
+                        sig[r][b] = Some(arm_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Split reads into those with at least one recorded arm choice and those with none.
+    let mut assigned: Vec<usize> = Vec::new();
+    let mut unassigned: Vec<usize> = Vec::new();
+    for r in 0..n_reads {
+        if sig[r].iter().any(|s| s.is_some()) {
+            assigned.push(r);
+        } else {
+            unassigned.push(r);
+        }
+    }
+
+    // Union-find over assigned reads: merge reads whose arm choices never conflict.
+    let n = assigned.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let ri = assigned[i];
+            let rj = assigned[j];
+            let compatible = (0..n_bubbles).all(|b| match (sig[ri][b], sig[rj][b]) {
+                (Some(a), Some(bv)) => a == bv,
+                _ => true,
+            });
+            if compatible {
+                let mut pi = i;
+                while parent[pi] != pi {
+                    pi = parent[pi];
+                }
+                let mut pj = j;
+                while parent[pj] != pj {
+                    pj = parent[pj];
+                }
+                if pi != pj {
+                    parent[pj] = pi;
+                }
+            }
+        }
+    }
+
+    // Path compression.
+    for i in 0..n {
+        let mut root = i;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        parent[i] = root;
+    }
+
+    // Collect groups.
+    let mut group_map: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (slot, &r) in assigned.iter().enumerate() {
+        group_map.entry(parent[slot]).or_default().push(r);
+    }
+
+    let mut groups: Vec<Vec<usize>> = group_map.into_values().collect();
+    groups.sort_unstable_by(|a, b| b.len().cmp(&a.len()));
+
+    if groups.is_empty() {
+        groups.push(Vec::new());
+    }
+
+    // Fold groups below min_reads and unassigned reads into the largest group.
+    let mut i = 1;
+    while i < groups.len() {
+        if groups[i].len() < min_reads {
+            let g = groups.remove(i);
+            groups[0].extend(g);
+        } else {
+            i += 1;
+        }
+    }
+    groups[0].extend(unassigned);
+    groups.retain(|g| !g.is_empty());
+    groups
+}
+
 fn partition_reads_by_bubble(
     edge_reads: &HashMap<(usize, usize), Vec<u32>>,
     entry_node: usize,
@@ -1480,6 +1779,10 @@ impl PoaGraph {
     }
 
     /// Build one consensus per detected allele.
+    ///
+    /// Structural bubbles (arm span ≥ phasing_bubble_min_span) are phased first using
+    /// cross-bubble compatibility grouping. If no structural bubbles are found, falls
+    /// back to single-best SNP bubble partitioning for substitution haplotypes.
     pub fn consensus_multi(&self) -> Result<Vec<Consensus>, PoaError> {
         if self.n_reads < self.config.min_reads {
             return Err(PoaError::InsufficientDepth {
@@ -1489,29 +1792,31 @@ impl PoaGraph {
         }
 
         let (topo, _) = topological_order(&self.nodes);
-        let bubbles = find_bubbles(
-            &self.nodes,
-            &topo,
-            self.n_reads,
-            self.config.min_allele_freq,
-        );
 
-        if bubbles.is_empty() {
-            return Ok(vec![self.consensus()?]);
-        }
+        // Try structural bubble phasing first (length variants, SVs, large indels).
+        let structural = find_structural_bubbles(&self.nodes, &topo, self.n_reads, &self.config);
 
-        let (entry, arm_starts) = bubbles
-            .iter()
-            .max_by_key(|(entry, arms)| {
-                arms.iter()
-                    .filter_map(|&arm| self.edge_reads.get(&(*entry, arm)))
-                    .map(|v| v.len())
-                    .min()
-                    .unwrap_or(0)
-            })
-            .unwrap();
-
-        let groups = partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads);
+        let groups = if !structural.is_empty() {
+            phasing_groups(&self.edge_reads, &structural, self.n_reads, self.config.min_reads)
+        } else {
+            // Fall back to single-best SNP bubble partitioning.
+            let snp_bubbles =
+                find_bubbles(&self.nodes, &topo, self.n_reads, self.config.min_allele_freq);
+            if snp_bubbles.is_empty() {
+                return Ok(vec![self.consensus()?]);
+            }
+            let (entry, arm_starts) = snp_bubbles
+                .iter()
+                .max_by_key(|(entry, arms)| {
+                    arms.iter()
+                        .filter_map(|&arm| self.edge_reads.get(&(*entry, arm)))
+                        .map(|v| v.len())
+                        .min()
+                        .unwrap_or(0)
+                })
+                .unwrap();
+            partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads)
+        };
 
         if groups.len() < 2 {
             return Ok(vec![self.consensus()?]);
