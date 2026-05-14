@@ -82,7 +82,7 @@ pub struct PoaGraph {
 // ─── DP cell ─────────────────────────────────────────────────────────────────
 
 /// Sentinel topo index meaning "came from the virtual start node".
-const VIRTUAL: usize = usize::MAX;
+const VIRTUAL: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -91,10 +91,12 @@ enum State {
     D,
 }
 
+/// DP cell: 8 bytes (i32 score + u32 pred_t, no padding).
+/// pred_t stores the topo-order row of the best predecessor, or VIRTUAL.
 #[derive(Clone, Copy)]
 struct Cell {
     score: i32,
-    pred_t: usize,
+    pred_t: u32,
 }
 
 impl Cell {
@@ -500,6 +502,37 @@ const SPINE_MARGIN: usize = 50;
 /// bubble nodes get a window anchored on the bubble entry's j position extended
 /// by the bubble span.  Cells outside the window remain UNSET and are invisible
 /// to traceback.
+// Bounds-safe read from a banded matrix (m or ins).  j=0 is always UNSET
+// for these two matrices.  Returns UNSET when j falls outside [j_lo, j_hi].
+#[inline(always)]
+fn gs(mat: &[Cell], t: usize, j: usize, j_lo: usize, j_hi: usize, rw: usize) -> i32 {
+    if j == 0 || j < j_lo || j > j_hi {
+        UNSET
+    } else {
+        mat[t * rw + (j - j_lo)].score
+    }
+}
+
+// Bounds-safe read for the del matrix.  j=0 is stored in del0 (separate array).
+#[inline(always)]
+fn gsd(
+    del: &[Cell],
+    del0: &[Cell],
+    t: usize,
+    j: usize,
+    j_lo: usize,
+    j_hi: usize,
+    rw: usize,
+) -> i32 {
+    if j == 0 {
+        del0[t].score
+    } else if j < j_lo || j > j_hi {
+        UNSET
+    } else {
+        del[t * rw + (j - j_lo)].score
+    }
+}
+
 fn align(
     nodes: &[Node],
     topo: &[usize],
@@ -513,12 +546,6 @@ fn align(
     let go = cfg.gap_open;
     let ge = cfg.gap_extend;
     let semi = cfg.alignment_mode == AlignmentMode::SemiGlobal;
-
-    // Flat DP tables: index = t * (l+1) + j
-    let size = n * (l + 1);
-    let mut m = vec![Cell::unset(); size];
-    let mut ins = vec![Cell::unset(); size];
-    let mut del = vec![Cell::unset(); size];
 
     // Spine membership: for each node index, the previous spine node (if on spine).
     // Used to gate the relaxed diagonal skip.
@@ -545,10 +572,28 @@ fn align(
     // the exit node naturally reads only from the winning arm's predecessors.
     let mut lookahead_skip = vec![false; nn];
 
-    #[inline]
-    fn idx(t: usize, j: usize, l: usize) -> usize {
-        t * (l + 1) + j
-    }
+    // Banded DP tables.  Each row stores j = j_lo_arr[t]..=j_hi_arr[t] (j >= 1).
+    // Spine rows use ±SPINE_MARGIN around the diagonal; bubble rows widen by the
+    // bubble span.  The j=0 del column is stored separately in del0 because
+    // m[t][0] and ins[t][0] are structurally UNSET and never stored.
+    // +2 ensures the left-edge j-1 access from the next row stays in range.
+    let max_bubble_span = bubble_ranges
+        .iter()
+        .filter_map(|&r| r)
+        .map(|(entry_t, exit_t)| exit_t.saturating_sub(entry_t) + 1)
+        .max()
+        .unwrap_or(0);
+    let row_width = (max_bubble_span + 2 * SPINE_MARGIN + 2).min(l).max(1);
+
+    let mut del0 = vec![Cell::unset(); n];
+    let bsize = n * row_width;
+    let mut m = vec![Cell::unset(); bsize];
+    let mut ins = vec![Cell::unset(); bsize];
+    let mut del = vec![Cell::unset(); bsize];
+    // Per-row band: j_lo_arr[t] is the lowest stored j (>= 1).
+    // j_hi_arr[t] is set when the row is processed; reads before then return UNSET.
+    let mut j_lo_arr = vec![1usize; n];
+    let mut j_hi_arr = vec![0usize; n];
 
     for (t, &node_idx) in topo.iter().enumerate() {
         // Lookahead: skip nodes on losing bubble arms entirely.
@@ -559,97 +604,11 @@ fn align(
         let node_base = nodes[node_idx].base;
         let is_source = nodes[node_idx].in_edges.is_empty();
 
-        // ── Diagonal skip ──────────────────────────────────────────────────────
-        // O(1) fast path for consecutive exact matches along the spine.
-        //
-        // Correct formulation: predecessor has consumed `bj` query bases
-        // (M[pt][bj] is its best cell).  We advance by one — consuming query[bj]
-        // (0-indexed) — and record M[t][bj+1] = M[pt][bj] + match_score.
-        // best_j[t] = bj+1, so the NEXT spine node will find M[t][bj+1] set and
-        // fire its own skip.  This allows runs of consecutive diagonal skips.
-        //
-        // Guards:
-        //   - node must be on the spine (so we know which predecessor to trust)
-        //   - exactly one in-edge, from the previous spine node (no competing arm)
-        //   - exactly one out-edge (not a bubble entry — those need full DP so the
-        //     non-spine arms can read correct predecessor scores)
-        //   - no open insert/delete state at predecessor's best column
-        #[cfg(test)]
-        if !is_source {
-            NODE_COUNTER.with(|c| c.set(c.get() + 1));
-        }
-
-        if !is_source && on_spine[node_idx] {
-            if let Some(prev_sp) = spine_prev[node_idx] {
-                if nodes[node_idx].in_edges == [prev_sp] && nodes[node_idx].out_edges.len() == 1 {
-                    let pt = rank_of[prev_sp];
-                    let bj = best_j_per_t[pt];
-                    if bj < l && node_base == query[bj] {
-                        let m_prev = m[idx(pt, bj, l)].score;
-                        let i_prev = ins[idx(pt, bj, l)].score;
-                        let d_prev = del[idx(pt, bj, l)].score;
-                        // The source node always has I[source][j] set from global
-                        // alignment initialization (leading-insert penalties).
-                        // It's safe to skip through source if M clearly dominates —
-                        // I[source][bj] is just the penalty for a leading insertion,
-                        // not an ongoing gap run.  For all non-source predecessors
-                        // we require I/D to be strictly UNSET: an ongoing gap run
-                        // must not be cut off by the skip.
-                        let pred_is_source = nodes[topo[pt]].in_edges.is_empty();
-                        let i_ok = i_prev == UNSET || (pred_is_source && m_prev > i_prev);
-                        let d_ok = d_prev == UNSET || (pred_is_source && m_prev > d_prev);
-                        if m_prev != UNSET && i_ok && d_ok {
-                            let score = m_prev + cfg.match_score;
-                            m[idx(t, bj + 1, l)] = Cell { score, pred_t: pt };
-                            best_j_per_t[t] = bj + 1;
-                            #[cfg(test)]
-                            SKIP_COUNTER.with(|c| c.set(c.get() + 1));
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── j = 0: delete-only ──────────────────────────────────────────────────
-        {
-            let ix0 = idx(t, 0, l);
-            let (mut best, mut best_pred) = (UNSET, 0usize);
-            if is_source {
-                let val = go + ge;
-                if val > best {
-                    best = val;
-                    best_pred = VIRTUAL;
-                }
-            }
-            for &p in &nodes[node_idx].in_edges {
-                let pt = rank_of[p];
-                let vm = safe_add(m[idx(pt, 0, l)].score, go + ge);
-                if vm > best {
-                    best = vm;
-                    best_pred = pt;
-                }
-                let vd = safe_add(del[idx(pt, 0, l)].score, ge);
-                if vd > best {
-                    best = vd;
-                    best_pred = pt;
-                }
-            }
-            if best != UNSET {
-                del[ix0] = Cell {
-                    score: best,
-                    pred_t: best_pred,
-                };
-            }
-        }
-
-        // ── j range: narrow window for both spine and bubble nodes ────────────
-        // The window is centred on the expected diagonal position.
-        //   Spine node  : j_center = predecessor's best_j + 1  (±SPINE_MARGIN)
-        //   Bubble node : j_center = bubble-entry's predecessor j
-        //                 hi  extended by bubble span so all arm lengths fit
-        // Source nodes always use the full range.
-        // Cells outside the range remain UNSET and traceback skips them.
+        // ── j range: compute window FIRST (needed for diagonal skip write) ─────
+        // Spine node  : j_center = predecessor's best_j + 1  (±SPINE_MARGIN)
+        // Bubble node : j_center = bubble-entry's predecessor j, hi widened by span
+        // Source node : clamped full range [1, row_width] (large-j cells are UNSET
+        //               in predecessors so they're never winners; safe to clamp).
         let j_pred_max = if is_source {
             0
         } else {
@@ -662,11 +621,10 @@ fn align(
         };
 
         let (j_lo, j_hi) = if is_source {
-            (1usize, l)
+            (1usize, row_width.min(l))
         } else {
             match bubble_ranges[t] {
                 Some((entry_t, exit_t)) => {
-                    // Record this bubble's entry-predecessor j the first time we see it.
                     if t == entry_t {
                         bubble_entry_j[entry_t] = j_pred_max;
                     }
@@ -677,7 +635,6 @@ fn align(
                     (lo, hi)
                 }
                 None => {
-                    // Spine: narrow diagonal window.
                     let j_center = j_pred_max.saturating_add(1);
                     let lo = j_center.saturating_sub(SPINE_MARGIN).max(1);
                     let hi = (j_center + SPINE_MARGIN).min(l);
@@ -685,6 +642,143 @@ fn align(
                 }
             }
         };
+        // Clamp hi to the banded row width.
+        let j_hi = j_hi.min(j_lo + row_width - 1);
+        j_lo_arr[t] = j_lo;
+        j_hi_arr[t] = j_hi;
+
+        // ── Diagonal skip ──────────────────────────────────────────────────────
+        // O(1) fast path for consecutive exact matches along the spine.
+        //
+        // Extended to fire at bubble entries: if a spine node has multiple
+        // out-edges (e.g. a low-weight error arm), a 1-base pre-resolve checks
+        // whether query[bj+1] uniquely matches the spine successor's first base.
+        // If so, losing arms are marked lookahead_skip and the skip fires as if
+        // the node had a single out-edge.  Error arms never block spine sliding.
+        //
+        // In-edge guard is relaxed: predecessors already in lookahead_skip (from
+        // a previously resolved bubble) are ignored, so exit nodes of resolved
+        // bubbles re-enter the skip path immediately.
+        #[cfg(test)]
+        if !is_source {
+            NODE_COUNTER.with(|c| c.set(c.get() + 1));
+        }
+
+        if !is_source && on_spine[node_idx] {
+            if let Some(prev_sp) = spine_prev[node_idx] {
+                // Relaxed in-edge check: fast for the common single-predecessor case;
+                // falls through to a loop only when there are extra predecessors that
+                // might all be lookahead_skip (exit nodes of resolved bubbles).
+                let active_pred_ok = match nodes[node_idx].in_edges.as_slice() {
+                    [p] => *p == prev_sp,
+                    _ => {
+                        nodes[node_idx]
+                            .in_edges
+                            .iter()
+                            .all(|&p| p == prev_sp || lookahead_skip[p])
+                            && nodes[node_idx].in_edges.contains(&prev_sp)
+                    }
+                };
+
+                if active_pred_ok {
+                    let pt = rank_of[prev_sp];
+                    let bj = best_j_per_t[pt];
+                    if bj < l && node_base == query[bj] {
+                        let m_prev = gs(&m, pt, bj, j_lo_arr[pt], j_hi_arr[pt], row_width);
+                        let i_prev = gs(&ins, pt, bj, j_lo_arr[pt], j_hi_arr[pt], row_width);
+                        let d_prev =
+                            gsd(&del, &del0, pt, bj, j_lo_arr[pt], j_hi_arr[pt], row_width);
+                        let pred_is_source = nodes[topo[pt]].in_edges.is_empty();
+                        let i_ok = i_prev == UNSET || (pred_is_source && m_prev > i_prev);
+                        let d_ok = d_prev == UNSET || (pred_is_source && m_prev > d_prev);
+                        if m_prev != UNSET && i_ok && d_ok {
+                            // For a bubble entry: 1-base pre-resolve against query[bj+1].
+                            // Mark losing arms by setting only their first node as skip;
+                            // the UNSET cascade through the arm is correct and avoids the
+                            // alloc inside collect_arm_nodes on the hot path.
+                            let do_skip = match nodes[node_idx].out_edges.as_slice() {
+                                [_] => true,
+                                _ if bj + 1 < l => {
+                                    let next_q = query[bj + 1];
+                                    let mut spine_succ = None;
+                                    let mut resolved = true;
+                                    for &(s, _) in &nodes[node_idx].out_edges {
+                                        if on_spine[s] && spine_prev[s] == Some(node_idx) {
+                                            if nodes[s].base == next_q {
+                                                spine_succ = Some(s);
+                                            } else {
+                                                resolved = false;
+                                                break;
+                                            }
+                                        } else if !lookahead_skip[s] && nodes[s].base == next_q {
+                                            resolved = false;
+                                            break;
+                                        }
+                                    }
+                                    if resolved {
+                                        if let Some(ss) = spine_succ {
+                                            for &(s, _) in &nodes[node_idx].out_edges {
+                                                if s != ss && !lookahead_skip[s] {
+                                                    lookahead_skip[s] = true;
+                                                }
+                                            }
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            };
+
+                            if do_skip {
+                                let score = m_prev + cfg.match_score;
+                                // bj+1 is the centre of this row's band: within [j_lo, j_hi].
+                                m[t * row_width + (bj + 1 - j_lo)] = Cell {
+                                    score,
+                                    pred_t: pt as u32,
+                                };
+                                best_j_per_t[t] = bj + 1;
+                                #[cfg(test)]
+                                SKIP_COUNTER.with(|c| c.set(c.get() + 1));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── j = 0: delete-only ──────────────────────────────────────────────────
+        // m[t][0] and ins[t][0] are structurally UNSET (never stored); only del[t][0]
+        // (del0[t]) needs initialisation here.
+        {
+            let (mut best, mut best_pred) = (UNSET, 0u32);
+            if is_source {
+                let val = go + ge;
+                if val > best {
+                    best = val;
+                    best_pred = VIRTUAL;
+                }
+            }
+            for &p in &nodes[node_idx].in_edges {
+                let pt = rank_of[p];
+                // m[pt][0] is always UNSET; only del0 carries the j=0 chain.
+                let vd = safe_add(del0[pt].score, ge);
+                if vd > best {
+                    best = vd;
+                    best_pred = pt as u32;
+                }
+            }
+            if best != UNSET {
+                del0[t] = Cell {
+                    score: best,
+                    pred_t: best_pred,
+                };
+            }
+        }
 
         // ── j = j_lo..=j_hi ───────────────────────────────────────────────────
         let mut row_best_j = 0usize;
@@ -697,7 +791,7 @@ fn align(
             } else {
                 cfg.mismatch_score
             };
-            let ixcur = idx(t, j, l);
+            let ixcur = t * row_width + (j - j_lo);
 
             // M[t][j]
             {
@@ -716,20 +810,34 @@ fn align(
                 }
                 for &p in &nodes[node_idx].in_edges {
                     let pt = rank_of[p];
-                    let vm = safe_add(m[idx(pt, j - 1, l)].score, sc);
+                    let vm = safe_add(gs(&m, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width), sc);
                     if vm != UNSET && vm > best {
                         best = vm;
-                        best_pred = pt;
+                        best_pred = pt as u32;
                     }
-                    let vi = safe_add(ins[idx(pt, j - 1, l)].score, sc);
+                    let vi = safe_add(
+                        gs(&ins, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width),
+                        sc,
+                    );
                     if vi != UNSET && vi > best {
                         best = vi;
-                        best_pred = pt;
+                        best_pred = pt as u32;
                     }
-                    let vd = safe_add(del[idx(pt, j - 1, l)].score, sc);
+                    let vd = safe_add(
+                        gsd(
+                            &del,
+                            &del0,
+                            pt,
+                            j - 1,
+                            j_lo_arr[pt],
+                            j_hi_arr[pt],
+                            row_width,
+                        ),
+                        sc,
+                    );
                     if vd != UNSET && vd > best {
                         best = vd;
-                        best_pred = pt;
+                        best_pred = pt as u32;
                     }
                 }
                 if best != UNSET {
@@ -744,9 +852,9 @@ fn align(
                 }
             }
 
-            // I[t][j]
+            // I[t][j] — reads from same row at j-1.
+            // When j == j_lo, j-1 is outside the banded window → treat as UNSET.
             {
-                let ixprev = idx(t, j - 1, l);
                 let (mut best, mut best_pred) = (UNSET, VIRTUAL);
                 if is_source && j == 1 {
                     let val = go + ge;
@@ -755,15 +863,18 @@ fn align(
                         best_pred = VIRTUAL;
                     }
                 }
-                let vm = safe_add(m[ixprev].score, go + ge);
-                if vm != UNSET && vm > best {
-                    best = vm;
-                    best_pred = t;
-                }
-                let vi = safe_add(ins[ixprev].score, ge);
-                if vi != UNSET && vi > best {
-                    best = vi;
-                    best_pred = t;
+                if j > j_lo {
+                    let ixprev = t * row_width + (j - 1 - j_lo);
+                    let vm = safe_add(m[ixprev].score, go + ge);
+                    if vm != UNSET && vm > best {
+                        best = vm;
+                        best_pred = t as u32;
+                    }
+                    let vi = safe_add(ins[ixprev].score, ge);
+                    if vi != UNSET && vi > best {
+                        best = vi;
+                        best_pred = t as u32;
+                    }
                 }
                 if best != UNSET {
                     ins[ixcur] = Cell {
@@ -775,23 +886,32 @@ fn align(
 
             // D[t][j]
             {
-                let (mut best, mut best_pred) = (UNSET, 0usize);
+                let (mut best, mut best_pred) = (UNSET, 0u32);
                 for &p in &nodes[node_idx].in_edges {
                     let pt = rank_of[p];
-                    let vm = safe_add(m[idx(pt, j, l)].score, go + ge);
+                    let vm = safe_add(
+                        gs(&m, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
+                        go + ge,
+                    );
                     if vm != UNSET && vm > best {
                         best = vm;
-                        best_pred = pt;
+                        best_pred = pt as u32;
                     }
-                    let vi = safe_add(ins[idx(pt, j, l)].score, go + ge);
+                    let vi = safe_add(
+                        gs(&ins, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
+                        go + ge,
+                    );
                     if vi != UNSET && vi > best {
                         best = vi;
-                        best_pred = pt;
+                        best_pred = pt as u32;
                     }
-                    let vd = safe_add(del[idx(pt, j, l)].score, ge);
+                    let vd = safe_add(
+                        gsd(&del, &del0, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
+                        ge,
+                    );
                     if vd != UNSET && vd > best {
                         best = vd;
-                        best_pred = pt;
+                        best_pred = pt as u32;
                     }
                 }
                 if best != UNSET {
@@ -923,9 +1043,11 @@ fn align(
     // ── Find best terminal cell at column l ─────────────────────────────────────
     let terminal_best = (0..n)
         .flat_map(|t| {
-            let sm = m[idx(t, l, l)].score;
-            let si = ins[idx(t, l, l)].score;
-            let sd = del[idx(t, l, l)].score;
+            let jlo = j_lo_arr[t];
+            let jhi = j_hi_arr[t];
+            let sm = gs(&m, t, l, jlo, jhi, row_width);
+            let si = gs(&ins, t, l, jlo, jhi, row_width);
+            let sd = gsd(&del, &del0, t, l, jlo, jhi, row_width);
             let best_sc = [sm, si, sd].into_iter().filter(|&s| s != UNSET).max();
             best_sc.map(|sc| {
                 let st = if sm == sc {
@@ -953,10 +1075,34 @@ fn align(
     let mut cur_state = best_state;
 
     loop {
-        let cell = match cur_state {
-            State::M => m[idx(t, j, l)],
-            State::I => ins[idx(t, j, l)],
-            State::D => del[idx(t, j, l)],
+        let cell = {
+            let jlo = j_lo_arr[t];
+            let jhi = j_hi_arr[t];
+            match cur_state {
+                State::M => {
+                    if j < jlo || j > jhi {
+                        Cell::unset()
+                    } else {
+                        m[t * row_width + (j - jlo)]
+                    }
+                }
+                State::I => {
+                    if j < jlo || j > jhi {
+                        Cell::unset()
+                    } else {
+                        ins[t * row_width + (j - jlo)]
+                    }
+                }
+                State::D => {
+                    if j == 0 {
+                        del0[t]
+                    } else if j < jlo || j > jhi {
+                        Cell::unset()
+                    } else {
+                        del[t * row_width + (j - jlo)]
+                    }
+                }
+            }
         };
 
         if cell.score == UNSET {
@@ -972,9 +1118,11 @@ fn align(
                     }
                     break;
                 }
-                t = cell.pred_t;
+                t = cell.pred_t as usize;
                 j -= 1;
-                cur_state = best_prev_state(&m, &ins, &del, t, j, l);
+                cur_state = best_prev_state_banded(
+                    &m, &ins, &del, &del0, t, j, &j_lo_arr, &j_hi_arr, row_width,
+                );
             }
             State::I => {
                 ops.push(AlignOp::Insert(query[j - 1]));
@@ -985,19 +1133,19 @@ fn align(
                     }
                     break;
                 }
-                cur_state = if m[idx(t, j, l)].score >= ins[idx(t, j, l)].score {
-                    State::M
-                } else {
-                    State::I
-                };
+                let sm = gs(&m, t, j, j_lo_arr[t], j_hi_arr[t], row_width);
+                let si = gs(&ins, t, j, j_lo_arr[t], j_hi_arr[t], row_width);
+                cur_state = if sm >= si { State::M } else { State::I };
             }
             State::D => {
                 ops.push(AlignOp::Delete(topo[t]));
                 if cell.pred_t == VIRTUAL {
                     break;
                 }
-                t = cell.pred_t;
-                cur_state = best_prev_state(&m, &ins, &del, t, j, l);
+                t = cell.pred_t as usize;
+                cur_state = best_prev_state_banded(
+                    &m, &ins, &del, &del0, t, j, &j_lo_arr, &j_hi_arr, row_width,
+                );
             }
         }
 
@@ -1010,11 +1158,24 @@ fn align(
     Ok(ops)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
-fn best_prev_state(m: &[Cell], ins: &[Cell], del: &[Cell], t: usize, j: usize, l: usize) -> State {
-    let sm = m[t * (l + 1) + j].score;
-    let si = ins[t * (l + 1) + j].score;
-    let sd = del[t * (l + 1) + j].score;
+fn best_prev_state_banded(
+    m: &[Cell],
+    ins: &[Cell],
+    del: &[Cell],
+    del0: &[Cell],
+    t: usize,
+    j: usize,
+    j_lo_arr: &[usize],
+    j_hi_arr: &[usize],
+    row_width: usize,
+) -> State {
+    let jlo = j_lo_arr[t];
+    let jhi = j_hi_arr[t];
+    let sm = gs(m, t, j, jlo, jhi, row_width);
+    let si = gs(ins, t, j, jlo, jhi, row_width);
+    let sd = gsd(del, del0, t, j, jlo, jhi, row_width);
     if sm != UNSET && sm >= si && sm >= sd {
         State::M
     } else if si != UNSET && si >= sd {
