@@ -4,7 +4,7 @@
 /// Each workload is a function that builds a PoaGraph from N reads and calls
 /// consensus(). Wall time and peak heap allocation are measured across REPS
 /// repetitions. No external deps.
-use poa_consensus::{PoaConfig, PoaGraph};
+use poa_consensus::PoaConfig;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -22,7 +22,7 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
+        let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             let mut peak = PEAK.load(Ordering::Relaxed);
@@ -37,7 +37,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
+        unsafe { System.dealloc(ptr, layout) };
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
     }
 }
