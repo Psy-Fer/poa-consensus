@@ -2279,9 +2279,15 @@ fn locked_arm_deep_bubble_alleles_lost() {
     let mut expected = vec![g_allele.clone(), a_allele.clone()];
     expected.sort_unstable();
     assert_eq!(
-        seqs, expected,
+        seqs,
+        expected,
         "deep arm: allele recovery failed.\n  got:      {:?}\n  expected: {:?}",
-        seqs.iter().map(|s| String::from_utf8_lossy(s).to_string()).collect::<Vec<_>>(),
-        expected.iter().map(|s| String::from_utf8_lossy(s).to_string()).collect::<Vec<_>>(),
+        seqs.iter()
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect::<Vec<_>>(),
     );
 }

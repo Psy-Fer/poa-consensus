@@ -55,7 +55,10 @@ struct AlignScratch {
 
 impl AlignScratch {
     fn new() -> Self {
-        Self { lock_node_j: Vec::new(), lock_exit_j: Vec::new() }
+        Self {
+            lock_node_j: Vec::new(),
+            lock_exit_j: Vec::new(),
+        }
     }
 
     fn clear(&mut self) {
@@ -1124,8 +1127,14 @@ fn align(
                             let exit_j = (j_entry + arm_len).min(l) as u32;
                             // Insert sorted (exit_node may already be present from
                             // a previous bubble in the same align() call).
-                            match scratch.lock_exit_j.binary_search_by_key(&exit_node, |&(idx, _)| idx) {
-                                Ok(pos) => scratch.lock_exit_j[pos].1 = exit_j.max(scratch.lock_exit_j[pos].1),
+                            match scratch
+                                .lock_exit_j
+                                .binary_search_by_key(&exit_node, |&(idx, _)| idx)
+                            {
+                                Ok(pos) => {
+                                    scratch.lock_exit_j[pos].1 =
+                                        exit_j.max(scratch.lock_exit_j[pos].1)
+                                }
                                 Err(pos) => scratch.lock_exit_j.insert(pos, (exit_node, exit_j)),
                             }
                         }
@@ -1965,7 +1974,15 @@ impl PoaGraph {
     ) -> Result<(Vec<AlignOp>, usize, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
         let spine = heaviest_path(&self.nodes, &topo, &rank_of);
-        let ops = align(&self.nodes, &topo, &rank_of, &spine, read, &self.config, &mut AlignScratch::new())?;
+        let ops = align(
+            &self.nodes,
+            &topo,
+            &rank_of,
+            &spine,
+            read,
+            &self.config,
+            &mut AlignScratch::new(),
+        )?;
         Ok((ops, 0, rank_of))
     }
 
@@ -1976,7 +1993,15 @@ impl PoaGraph {
     ) -> Result<(Vec<AlignOp>, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
         let spine = heaviest_path(&self.nodes, &topo, &rank_of);
-        let ops = align(&self.nodes, &topo, &rank_of, &spine, read, &self.config, &mut AlignScratch::new())?;
+        let ops = align(
+            &self.nodes,
+            &topo,
+            &rank_of,
+            &spine,
+            read,
+            &self.config,
+            &mut AlignScratch::new(),
+        )?;
         Ok((ops, rank_of))
     }
 
