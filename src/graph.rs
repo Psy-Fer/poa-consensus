@@ -3,10 +3,83 @@ use crate::error::PoaError;
 use crate::types::{Consensus, CoverageGap, GapKind, GraphStats};
 use std::collections::HashMap;
 
+#[cfg(test)]
+use std::cell::Cell as StdCell;
+
+// Per-thread diagonal-skip counters, only compiled in test builds.
+// SKIP_COUNTER: total diagonal skips fired; NODE_COUNTER: total non-source nodes.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SKIP_COUNTER: StdCell<u64> = StdCell::new(0);
+    pub(crate) static NODE_COUNTER: StdCell<u64> = StdCell::new(0);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_skip_counters() {
+    SKIP_COUNTER.with(|c| c.set(0));
+    NODE_COUNTER.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn skip_rate() -> f64 {
+    let skips = SKIP_COUNTER.with(|c| c.get());
+    let nodes = NODE_COUNTER.with(|c| c.get());
+    if nodes == 0 {
+        0.0
+    } else {
+        skips as f64 / nodes as f64
+    }
+}
+
 // ─── Sentinel ────────────────────────────────────────────────────────────────
 
-/// "Not yet filled" sentinel. Safe to add gap_extend once without i32 overflow.
+/// "Not yet filled" sentinel.
 const UNSET: i32 = i32::MIN / 2;
+
+/// Half-width of the per-node j-window given to a locked winning arm node.
+/// Wide enough to absorb ~5 cumulative indels at 5% ONT error rate.
+const LOCK_EPS: usize = 5;
+
+// ─── Align scratch ───────────────────────────────────────────────────────────
+
+/// Per-call scratch reused across `align()` calls to avoid per-call heap
+/// allocation for the lock-window tables.  Both vecs are sorted by node_idx
+/// and binary-searched; they are empty when no lock fired, so the check is
+/// O(1) in the common case.
+struct AlignScratch {
+    /// Locked winning arm nodes: (node_idx, j_center as u32).
+    lock_node_j: Vec<(usize, u32)>,
+    /// Locked exit nodes: (node_idx, j_center as u32).
+    lock_exit_j: Vec<(usize, u32)>,
+}
+
+impl AlignScratch {
+    fn new() -> Self {
+        Self {
+            lock_node_j: Vec::new(),
+            lock_exit_j: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lock_node_j.clear();
+        self.lock_exit_j.clear();
+    }
+
+    fn get_node_j(&self, node_idx: usize) -> Option<usize> {
+        self.lock_node_j
+            .binary_search_by_key(&node_idx, |&(idx, _)| idx)
+            .ok()
+            .map(|pos| self.lock_node_j[pos].1 as usize)
+    }
+
+    fn get_exit_j(&self, node_idx: usize) -> Option<usize> {
+        self.lock_exit_j
+            .binary_search_by_key(&node_idx, |&(idx, _)| idx)
+            .ok()
+            .map(|pos| self.lock_exit_j[pos].1 as usize)
+    }
+}
 
 #[inline]
 fn safe_add(a: i32, b: i32) -> i32 {
@@ -14,150 +87,6 @@ fn safe_add(a: i32, b: i32) -> i32 {
         UNSET
     } else {
         a.saturating_add(b)
-    }
-}
-
-/// Sentinel topo index meaning "came from the virtual start node".
-const VIRTUAL: usize = usize::MAX;
-
-// ─── Band helpers ─────────────────────────────────────────────────────────────
-
-/// Returned by `compute_effective_band` to mean "no band restriction".
-const UNBANDED: usize = usize::MAX;
-
-/// Minimum cells between `best_j` and the band edge before the approaching-edge
-/// detector fires. Set to `ceil(|gap_open| / |gap_extend|) + slack` so that a
-/// gap path opening at the edge cannot beat the diagonal match before we detect it.
-const GAP_MARGIN: usize = 4;
-
-/// Compute the effective band width for aligning `read_len` bases against a
-/// graph with `graph_nodes` nodes.
-///
-/// Each Insert operation from a previous read adds a node to the graph,
-/// shifting the topological rank of every subsequent node by one.  Over many
-/// reads this "graph expansion" can push the correct alignment path far from
-/// the read-position diagonal even for a low-error read.  The accumulated
-/// rank shift is approximately `graph_nodes - read_len`, so the band must
-/// cover both per-read drift *and* that expansion:
-///
-///   w = b + f × max(read_len, graph_nodes)
-///
-/// For `adaptive_band = false` the fixed `band_width` is returned unchanged
-/// (the caller chose it explicitly).
-fn compute_effective_band(cfg: &PoaConfig, read_len: usize, graph_nodes: usize) -> usize {
-    if cfg.adaptive_band {
-        let span = read_len.max(graph_nodes);
-        let w = cfg.adaptive_band_b + (cfg.adaptive_band_f * span as f32).ceil() as usize;
-        let w = if cfg.band_width > 0 {
-            w.max(cfg.band_width)
-        } else {
-            w
-        };
-        w.max(1)
-    } else if cfg.band_width > 0 {
-        cfg.band_width
-    } else {
-        UNBANDED
-    }
-}
-
-/// Lowest j >= 1 reachable from a band centred at `centre` with width `w`.
-#[inline]
-fn j_lo_centred(centre: usize, w: usize) -> usize {
-    if w == UNBANDED {
-        1
-    } else {
-        centre.saturating_sub(w).max(1)
-    }
-}
-
-/// Highest j reachable from a band centred at `centre` with width `w`.
-#[inline]
-fn j_hi_centred(centre: usize, w: usize, l: usize) -> usize {
-    if w == UNBANDED {
-        l
-    } else {
-        (centre + w).min(l)
-    }
-}
-
-/// True if cell (centre_row, j) is within the band for a row whose band is
-/// centred at `centre`.  j=0 is in-band only when `centre <= w`.
-#[inline]
-fn in_band_centred(centre: usize, j: usize, w: usize, l: usize) -> bool {
-    if w == UNBANDED {
-        return true;
-    }
-    j >= centre.saturating_sub(w) && j <= (centre + w).min(l)
-}
-
-/// Cells per row in band-indexed storage.
-/// Unbanded: l+1 (direct j indexing). Banded: 2*w+2 (slot 0 = j=0; slots 1..=2w+1 = j=j_lo..j_hi).
-#[inline]
-fn row_stride_for(w: usize, l: usize) -> usize {
-    if w == UNBANDED { l + 1 } else { 2 * w + 2 }
-}
-
-// ─── DP table ─────────────────────────────────────────────────────────────────
-
-/// DP table backed by a flat Vec with per-row tracking-band layout.
-///
-/// Each row stores one slot for j=0 (index 0) and up to `2w+1` slots for
-/// j in [j_lo, j_hi] (indices 1..=2w+1).  The per-row band origin is held in
-/// `centres[t]`; it is set by the caller *before* the row is processed.
-///
-/// `get` returns `Cell::unset()` for any (t, j) outside the stored band.
-struct DpTable {
-    data: Vec<Cell>,
-    rs: usize,
-    w: usize,
-    /// Band centre for each row (= best_j at the time the row was filled).
-    centres: Vec<usize>,
-}
-
-impl DpTable {
-    fn new(n: usize, w: usize, l: usize) -> Self {
-        let rs = row_stride_for(w, l);
-        DpTable {
-            data: vec![Cell::unset(); n * rs],
-            rs,
-            w,
-            centres: vec![1usize; n], // 1 = first read position; set properly before each row
-        }
-    }
-
-    #[inline]
-    fn get(&self, t: usize, j: usize) -> Cell {
-        if self.w == UNBANDED {
-            return self.data[t * self.rs + j];
-        }
-        if j == 0 {
-            return self.data[t * self.rs];
-        }
-        let centre = self.centres[t];
-        let j_lo = centre.saturating_sub(self.w).max(1);
-        // Out-of-band: return sentinel rather than panic.
-        if j < j_lo || j > centre + self.w {
-            return Cell::unset();
-        }
-        self.data[t * self.rs + (j - j_lo + 1)]
-    }
-
-    #[inline]
-    fn set(&mut self, t: usize, j: usize, cell: Cell) {
-        if self.w == UNBANDED {
-            let idx = t * self.rs + j;
-            self.data[idx] = cell;
-            return;
-        }
-        if j == 0 {
-            self.data[t * self.rs] = cell;
-            return;
-        }
-        let centre = self.centres[t];
-        let j_lo = centre.saturating_sub(self.w).max(1);
-        let idx = t * self.rs + (j - j_lo + 1);
-        self.data[idx] = cell;
     }
 }
 
@@ -186,9 +115,21 @@ pub struct PoaGraph {
     edge_reads: HashMap<(usize, usize), Vec<u32>>,
     /// number of times the long-unbanded warning was emitted
     warnings: usize,
+    /// Cached heaviest-path spine, recomputed adaptively rather than every read.
+    cached_spine: Vec<(usize, u8, i32)>,
+    /// `n_reads` at the time the spine was last recomputed.
+    spine_updated_at: usize,
+    /// Current recompute interval; doubles when the spine is stable, resets
+    /// to 1 when it changes significantly.
+    spine_interval: usize,
+    /// Reusable scratch for lock-window tables; avoids per-call heap allocation.
+    align_scratch: AlignScratch,
 }
 
-// ─── DP cell types ───────────────────────────────────────────────────────────
+// ─── DP cell ─────────────────────────────────────────────────────────────────
+
+/// Sentinel topo index meaning "came from the virtual start node".
+const VIRTUAL: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -197,11 +138,12 @@ enum State {
     D,
 }
 
+/// DP cell: 8 bytes (i32 score + u32 pred_t, no padding).
+/// pred_t stores the topo-order row of the best predecessor, or VIRTUAL.
 #[derive(Clone, Copy)]
 struct Cell {
     score: i32,
-    /// topo rank of predecessor node, or VIRTUAL
-    pred_t: usize,
+    pred_t: u32,
 }
 
 impl Cell {
@@ -279,89 +221,621 @@ fn topological_order(nodes: &[Node]) -> (Vec<usize>, Vec<usize>) {
     (topo, rank_of)
 }
 
-// ─── DP alignment ────────────────────────────────────────────────────────────
+/// Measure the length of an arm starting at `start` by walking single-successor chains.
+///
+/// Stops at `max_depth`, a fork (multiple out-edges), or a reconvergence point
+/// (a node reached from multiple in-edges, after the first step).
+/// The reconvergence node itself is NOT counted.
+fn materialize_arm_len(nodes: &[Node], start: usize, max_depth: usize) -> usize {
+    let mut len = 0;
+    let mut cur = start;
+    for _ in 0..max_depth {
+        // After the first step, a node with multiple in-edges is a reconvergence.
+        if len >= 1 && nodes[cur].in_edges.len() > 1 {
+            break;
+        }
+        len += 1;
+        match nodes[cur].out_edges.as_slice() {
+            [(next, _)] => cur = *next,
+            _ => break,
+        }
+    }
+    len
+}
 
-/// Align `query` into the graph using band width `w` (`UNBANDED` = full NW).
+// ─── Bubble detection ────────────────────────────────────────────────────────
+
+/// Find the topo rank of the exit node for a bubble starting at `entry_t`.
 ///
-/// **Tracking band.** The band centre follows `best_j` — the argmax M score
-/// from the previous row — rather than the nominal diagonal `t`.  Phase
-/// shifts and large indel events are self-correcting: the first non-trivial
-/// row after a shift re-centres the band, and subsequent rows follow.
+/// Uses the path-budget algorithm: budget starts at `out_degree(entry)` — one open
+/// path per arm.  For each subsequent node (in topo order) that is reachable from
+/// entry within the bubble, budget decrements by the number of in-edges arriving
+/// from already-seen bubble nodes, then increments by the node's own out-degree.
+/// When budget reaches 0 all paths have reconverged — that node is the exit.
 ///
-/// **Diagonal skip.** When a graph node is a base match on a linear spine
-/// (single predecessor/successor, no pending gaps), the I and D tables are
-/// not filled for that cell and the match score is carried forward in O(1).
-/// Falls back to full O(w) DP at branch points, mismatches, or when a gap
-/// may be open.
+/// Returns `None` when the graph ends before reconvergence (open-ended bubble).
+/// For each topo rank, compute the bubble it belongs to as `Some((entry_t, exit_t))`,
+/// or `None` for spine nodes outside any bubble.
 ///
-/// **Approaching-edge detector.** If `best_j` comes within `GAP_MARGIN` cells
-/// of the band edge during any non-trivial row, `BandTooNarrow { required }`
-/// is returned with the estimated required width so the caller can retry.
+/// Uses a generation-counter scratch (`gen_mark`) so the inner bubble search never
+/// allocates: each new bubble increments the generation and marks nodes with it
+/// instead of resetting a bool array.
+fn compute_bubble_ranges(nodes: &[Node], topo: &[usize]) -> Vec<Option<(usize, usize)>> {
+    let n = topo.len();
+    let nn = nodes.len();
+    let mut ranges: Vec<Option<(usize, usize)>> = vec![None; n];
+    // gen_mark[node_idx] == current_gen  ⟺  node is inside the active bubble search.
+    // Allocated once; never cleared between bubbles.
+    let mut gen_mark = vec![0u32; nn];
+    let mut current_gen = 0u32;
+
+    let mut t = 0;
+    while t < n {
+        if nodes[topo[t]].out_edges.len() >= 2 {
+            // Start a new bubble search from entry topo rank t.
+            current_gen = current_gen.wrapping_add(1);
+            let entry_node = topo[t];
+            gen_mark[entry_node] = current_gen;
+            let mut outstanding = nodes[entry_node].out_edges.len();
+            let mut exit_t = None;
+
+            for (tt, &node_idx) in topo.iter().enumerate().skip(t + 1) {
+                let bubble_in = nodes[node_idx]
+                    .in_edges
+                    .iter()
+                    .filter(|&&p| gen_mark[p] == current_gen)
+                    .count();
+                if bubble_in == 0 {
+                    continue;
+                }
+                gen_mark[node_idx] = current_gen;
+                outstanding -= bubble_in;
+                if outstanding == 0 {
+                    exit_t = Some(tt);
+                    break;
+                }
+                outstanding += nodes[node_idx].out_edges.len();
+            }
+
+            if let Some(et) = exit_t {
+                ranges[t..=et].fill(Some((t, et)));
+                t = et + 1;
+            } else {
+                // Open-ended bubble: mark everything remaining conservatively.
+                ranges[t..n].fill(Some((t, n - 1)));
+                break;
+            }
+        } else {
+            t += 1;
+        }
+    }
+    ranges
+}
+
+// ─── Stale-spine helpers ─────────────────────────────────────────────────────
+
+/// Base-level differences between two spines: length delta + per-position
+/// mismatches over the shared prefix.  Returns `usize::MAX` when `old` is
+/// empty (forces the first recompute to be treated as fully unstable).
+fn spine_diff(old: &[(usize, u8, i32)], new: &[(usize, u8, i32)]) -> usize {
+    if old.is_empty() {
+        return usize::MAX;
+    }
+    let len_diff = old.len().abs_diff(new.len());
+    let base_diffs = old[..old.len().min(new.len())]
+        .iter()
+        .zip(new.iter())
+        .filter(|(o, n)| o.1 != n.1)
+        .count();
+    base_diffs + len_diff
+}
+
+/// Spine is "stable" if it changed by this many bases or fewer.
+const SPINE_STABLE_THRESHOLD: usize = 3;
+/// Maximum recompute interval (reads between spine refreshes).
+const SPINE_MAX_INTERVAL: usize = 32;
+
+// ─── Lookahead resolve ───────────────────────────────────────────────────────
+
+/// Query bases scored per arm when resolving a bubble entry.
+/// Set to one repeat unit (5 bases covers AAGGG, GGGGCC, CAG etc.).
+/// Larger windows increase false-positive risk at typical ONT error rates
+/// because a single read error in the window can flip the decision.
+const LOOKAHEAD_K: usize = 5;
+/// Winning arm must beat the runner-up by at least this many score points.
+/// One match+mismatch swing = 2 points, so MARGIN=2 requires one net
+/// advantage position after accounting for any tie positions.
+const LOOKAHEAD_MARGIN: i32 = 2;
+/// Maximum nodes walked when materialising a single bubble arm.
+/// 4096 covers AAGGG × 800 (one arm) and similar long STR bubbles.
+const ARM_MAX_DEPTH: usize = 4096;
+
+/// Walks one bubble arm from `start_idx` forward, collecting node indices
+/// until the bubble exit (topo rank `exit_t`) is reached.  The exit node
+/// itself is NOT included — it runs its own windowed DP normally.
+///
+/// Returns `None` if the arm has internal branching (a nested bubble) or
+/// exceeds the depth cap; both are signals to fall back to windowed DP.
+/// Walk one bubble arm from `start_idx` to (but not including) the exit node,
+/// appending node indices into `out`.  Clears `out` first.
+/// Returns `false` if the arm has an internal branch or exceeds `ARM_MAX_DEPTH`.
+fn collect_arm_nodes(
+    nodes: &[Node],
+    rank_of: &[usize],
+    start_idx: usize,
+    exit_t: usize,
+    out: &mut Vec<usize>,
+) -> bool {
+    out.clear();
+    let mut cur = start_idx;
+    for _ in 0..ARM_MAX_DEPTH {
+        if rank_of[cur] == exit_t {
+            return true;
+        }
+        out.push(cur);
+        match nodes[cur].out_edges.as_slice() {
+            [(next, _)] => cur = *next,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Scores the first `min(LOOKAHEAD_K, arm.len(), query[j..].len())` bases of
+/// `arm` against `query` starting at position `j`.
+fn score_arm_prefix(
+    arm: &[usize],
+    nodes: &[Node],
+    query: &[u8],
+    j: usize,
+    match_score: i32,
+    mismatch_score: i32,
+) -> i32 {
+    let len = arm
+        .len()
+        .min(LOOKAHEAD_K)
+        .min(query.len().saturating_sub(j));
+    arm[..len]
+        .iter()
+        .enumerate()
+        .map(|(i, &nidx)| {
+            if nodes[nidx].base == query[j + i] {
+                match_score
+            } else {
+                mismatch_score
+            }
+        })
+        .sum()
+}
+
+// ─── Slide-and-lock ──────────────────────────────────────────────────────────
+
+/// Number of consecutive positions where one arm uniquely matches the query
+/// before we commit to it.  Two positions guards against single-base read
+/// errors flipping the decision in repetitive sequence.
+const SLIDE_MIN_CONSEC: usize = 2;
+
+/// Slide all arms against `query[j_entry..]` simultaneously, base by base,
+/// until one arm can be uniquely identified as the correct path.
+///
+/// **Lock conditions** (first to fire wins):
+/// - *Exhaustion*: an arm runs out of nodes while the query has remaining
+///   bases and at least one other arm can still continue.  The exhausted arm
+///   cannot account for the remaining query and is eliminated.
+/// - *Unique mismatch*: exactly one alive arm matches the query base at the
+///   current position for `SLIDE_MIN_CONSEC` consecutive steps.  All others
+///   are eliminated.
+/// - *Single survivor*: only one arm remains after eliminations above.
+///
+/// Returns the winning arm index into `all_arms`, or `None` if no lock fires
+/// within the arm bounds.  `None` falls back to windowed DP, which is always
+/// correct.
+///
+/// **No retroactive gap-state fill is required.**  Because slide-and-lock is
+/// decided at the bubble *entry* node (before arm nodes are processed in topo
+/// order), the winning arm's nodes proceed through the normal windowed DP and
+/// accumulate correct M/I/D cells for traceback.
+fn slide_lock(
+    all_arms: &[Vec<usize>],
+    nodes: &[Node],
+    query: &[u8],
+    j_entry: usize,
+) -> Option<usize> {
+    let n_arms = all_arms.len();
+    let remaining = query.len().saturating_sub(j_entry);
+    if remaining == 0 || n_arms < 2 {
+        return None;
+    }
+
+    // Only slide when ALL arms are at least LOOKAHEAD_K nodes long.
+    // Short arms are produced by individual read errors (1-4 nodes):
+    //   - insertion bubbles have one empty arm (0 nodes, direct edge to exit)
+    //     which exhausts immediately, incorrectly eliminating the no-insertion path
+    //   - 2-3 consecutive substitution errors produce 2-3 node arms where a
+    //     single read error can produce SLIDE_MIN_CONSEC false unique matches
+    // Requiring all arms ≥ LOOKAHEAD_K ensures we only slide on structural
+    // bubbles of at least one full repeat unit.
+    let min_arm_len = all_arms.iter().map(|a| a.len()).min().unwrap_or(0);
+    if min_arm_len < LOOKAHEAD_K {
+        return None;
+    }
+
+    let max_steps = all_arms
+        .iter()
+        .map(|a| a.len())
+        .max()
+        .unwrap_or(0)
+        .min(remaining);
+
+    let mut alive = vec![true; n_arms];
+    let mut alive_count = n_arms;
+    let mut consec_unique = 0usize;
+    let mut consec_winner: Option<usize> = None;
+
+    for i in 0..max_steps {
+        // ── Exhaustion ────────────────────────────────────────────────────────
+        // Eliminate arms that have run out of nodes while at least one other arm
+        // can still continue.  If ALL alive arms exhaust simultaneously the query
+        // continues past the bubble at the shared exit — no lock from exhaustion.
+        let any_continuing = (0..n_arms).any(|idx| alive[idx] && all_arms[idx].len() > i);
+        if any_continuing {
+            for idx in 0..n_arms {
+                if alive[idx] && all_arms[idx].len() <= i {
+                    alive[idx] = false;
+                    alive_count -= 1;
+                }
+            }
+        }
+        if alive_count <= 1 {
+            break;
+        }
+
+        // ── Unique mismatch ───────────────────────────────────────────────────
+        let q = query[j_entry + i];
+        // Bounds check on arm index: alive arms always have len > i here (ensured
+        // by the exhaustion block above which eliminates len <= i arms first).
+        let matched: Vec<bool> = (0..n_arms)
+            .map(|idx| alive[idx] && all_arms[idx].len() > i && nodes[all_arms[idx][i]].base == q)
+            .collect();
+        let match_count = matched.iter().filter(|&&m| m).count();
+        let mismatch_count = (0..n_arms)
+            .filter(|&idx| alive[idx] && !matched[idx])
+            .count();
+
+        if match_count == 1 && mismatch_count > 0 {
+            let candidate = matched.iter().position(|&m| m).unwrap();
+            if consec_winner == Some(candidate) {
+                consec_unique += 1;
+            } else {
+                consec_unique = 1;
+                consec_winner = Some(candidate);
+            }
+            if consec_unique >= SLIDE_MIN_CONSEC {
+                for idx in 0..n_arms {
+                    if alive[idx] && !matched[idx] {
+                        alive[idx] = false;
+                        alive_count -= 1;
+                    }
+                }
+                break;
+            }
+        } else {
+            consec_unique = 0;
+            consec_winner = None;
+        }
+    }
+
+    if alive_count == 1 {
+        alive.iter().position(|&a| a)
+    } else {
+        None
+    }
+}
+
+// ─── Bubble-aware DP alignment ────────────────────────────────────────────────
+
+/// Half-width of the DP band applied to spine (non-bubble) nodes.
+/// Minimum SPINE_MARGIN when nothing else constrains it (no band specified).
+/// Covers ±SPINE_MARGIN_MIN query positions for unbanded or wide-band configs.
+const SPINE_MARGIN_MIN: usize = 50;
+
+/// Align `query` against the graph using spine-guided affine-gap DAG DP.
+///
+/// **Diagonal skip** — O(1) fast path for consecutive exact matches along the
+/// heaviest-path spine.  Fires whenever the spine node's base matches the query
+/// base AND the M score at the predecessor dominates any open I/D state.  After
+/// each read is added the spine converges toward the true consensus, so later
+/// reads align almost entirely via diagonal skip with only small local-DP
+/// bursts at divergence points.
+///
+/// **j-range restriction** — spine nodes get a narrow ±[`SPINE_MARGIN`] window;
+/// bubble nodes get a window anchored on the bubble entry's j position extended
+/// by the bubble span.  Cells outside the window remain UNSET and are invisible
+/// to traceback.
+// Bounds-safe read from a banded matrix (m or ins).  j=0 is always UNSET
+// for these two matrices.  Returns UNSET when j falls outside [j_lo, j_hi].
+#[inline(always)]
+fn gs(mat: &[Cell], t: usize, j: usize, j_lo: usize, j_hi: usize, rw: usize) -> i32 {
+    if j == 0 || j < j_lo || j > j_hi {
+        UNSET
+    } else {
+        mat[t * rw + (j - j_lo)].score
+    }
+}
+
+// Bounds-safe read for the del matrix.  j=0 is stored in del0 (separate array).
+#[inline(always)]
+fn gsd(
+    del: &[Cell],
+    del0: &[Cell],
+    t: usize,
+    j: usize,
+    j_lo: usize,
+    j_hi: usize,
+    rw: usize,
+) -> i32 {
+    if j == 0 {
+        del0[t].score
+    } else if j < j_lo || j > j_hi {
+        UNSET
+    } else {
+        del[t * rw + (j - j_lo)].score
+    }
+}
+
 fn align(
     nodes: &[Node],
     topo: &[usize],
     rank_of: &[usize],
+    spine: &[(usize, u8, i32)],
     query: &[u8],
     cfg: &PoaConfig,
-    w: usize,
+    scratch: &mut AlignScratch,
 ) -> Result<Vec<AlignOp>, PoaError> {
+    scratch.clear();
     let n = topo.len();
     let l = query.len();
+    let go = cfg.gap_open;
+    let ge = cfg.gap_extend;
+    let semi = cfg.alignment_mode == AlignmentMode::SemiGlobal;
 
-    let go = cfg.gap_open; // negative
-    let ge = cfg.gap_extend; // negative
+    // Spine membership: for each node index, the previous spine node (if on spine).
+    // Used to gate the relaxed diagonal skip.
+    let nn = nodes.len();
+    let mut on_spine = vec![false; nn];
+    let mut spine_prev: Vec<Option<usize>> = vec![None; nn];
+    for (sp, &(node_idx, _, _)) in spine.iter().enumerate() {
+        on_spine[node_idx] = true;
+        if sp > 0 {
+            spine_prev[node_idx] = Some(spine[sp - 1].0);
+        }
+    }
 
-    let mut m = DpTable::new(n, w, l);
-    let mut ins = DpTable::new(n, w, l);
-    let mut del = DpTable::new(n, w, l);
+    // Bubble membership: Some((entry_t, exit_t)) or None for spine.
+    let bubble_ranges = compute_bubble_ranges(nodes, topo);
+    // j position of each bubble's entry node's predecessors — filled dynamically.
+    let mut bubble_entry_j = vec![0usize; n];
 
-    // Tracking band state: best read position from the previous row's M cells.
-    let mut best_j: usize = 1;
-    // Accumulated required width measured by approaching-edge checks.
-    let mut max_required: usize = 0;
+    // Track best_j per row for diagonal skip.
+    let mut best_j_per_t = vec![0usize; n];
+
+    // Nodes marked here are on a losing bubble arm identified by lookahead
+    // resolve.  Their entire windowed DP is skipped; their cells stay UNSET so
+    // the exit node naturally reads only from the winning arm's predecessors.
+    let mut lookahead_skip = vec![false; nn];
+
+    // Spine margin: matches the DP band width so memory usage scales with the
+    // configured band rather than always allocating SPINE_MARGIN_MIN columns.
+    // Uses the same adaptive formula as main (b + f*L), floored at SPINE_MARGIN_MIN
+    // only when band_width=0 and adaptive_band=false (unbanded / no guidance).
+    let spine_margin: usize = if cfg.adaptive_band {
+        let w = cfg.adaptive_band_b + (cfg.adaptive_band_f * l as f32).ceil() as usize;
+        let w = if cfg.band_width > 0 {
+            w.max(cfg.band_width)
+        } else {
+            w
+        };
+        w.max(4)
+    } else if cfg.band_width > 0 {
+        cfg.band_width
+    } else {
+        SPINE_MARGIN_MIN
+    };
+
+    // Banded DP tables.  Each row stores j = j_lo_arr[t]..=j_hi_arr[t] (j >= 1).
+    // Spine rows use ±spine_margin around the diagonal; bubble rows widen by the
+    // bubble span.  The j=0 del column is stored separately in del0 because
+    // m[t][0] and ins[t][0] are structurally UNSET and never stored.
+    // +2 ensures the left-edge j-1 access from the next row stays in range.
+    let row_width = (2 * spine_margin + 2).min(l).max(1);
+
+    let mut del0 = vec![Cell::unset(); n];
+    let bsize = n * row_width;
+    let mut m = vec![Cell::unset(); bsize];
+    let mut ins = vec![Cell::unset(); bsize];
+    let mut del = vec![Cell::unset(); bsize];
+    // Per-row band: j_lo_arr[t] is the lowest stored j (>= 1).
+    // j_hi_arr[t] is set when the row is processed; reads before then return UNSET.
+    let mut j_lo_arr = vec![1usize; n];
+    let mut j_hi_arr = vec![0usize; n];
+
+    // Reusable scratch for bubble-arm materialisation (avoids per-bubble alloc).
+    let mut arm_scratch: Vec<usize> = Vec::new();
+    let mut all_arms: Vec<Vec<usize>> = Vec::new();
 
     for (t, &node_idx) in topo.iter().enumerate() {
+        // Lookahead: skip nodes on losing bubble arms entirely.
+        if lookahead_skip[node_idx] {
+            continue;
+        }
+
         let node_base = nodes[node_idx].base;
         let is_source = nodes[node_idx].in_edges.is_empty();
 
-        // Set the band centre for this row before any table access.
-        let centre = best_j;
-        m.centres[t] = centre;
-        ins.centres[t] = centre;
-        del.centres[t] = centre;
+        // ── j range: compute window FIRST (needed for diagonal skip write) ─────
+        // Spine node  : j_center = predecessor's best_j + 1  (±SPINE_MARGIN)
+        // Bubble node : j_center = bubble-entry's predecessor j, hi widened by span
+        // Source node : clamped full range [1, row_width] (large-j cells are UNSET
+        //               in predecessors so they're never winners; safe to clamp).
+        let j_pred_max = if is_source {
+            0
+        } else {
+            nodes[node_idx]
+                .in_edges
+                .iter()
+                .map(|&p| best_j_per_t[rank_of[p]])
+                .max()
+                .unwrap_or(0)
+        };
 
-        let j_lo = j_lo_centred(centre, w);
-        let j_hi = j_hi_centred(centre, w, l);
+        let (j_lo, j_hi) = if is_source {
+            (1usize, row_width.min(l))
+        } else if let Some(j_center) = scratch.get_node_j(node_idx) {
+            // Locked winning arm node: tight per-node window centred at the
+            // exact query column this depth corresponds to.
+            let lo = j_center.saturating_sub(LOCK_EPS).max(1);
+            let hi = (j_center + LOCK_EPS).min(l);
+            (lo, hi)
+        } else if let Some(j_center) = scratch.get_exit_j(node_idx) {
+            // Locked exit node: spine-width window centred at winning arm's
+            // terminal query column, so it reads the arm's actual best cells.
+            let lo = j_center.saturating_sub(spine_margin).max(1);
+            let hi = (j_center + spine_margin).min(l);
+            (lo, hi)
+        } else {
+            match bubble_ranges[t] {
+                Some((entry_t, exit_t)) => {
+                    if t == entry_t {
+                        bubble_entry_j[entry_t] = j_pred_max;
+                    }
+                    let bej = bubble_entry_j[entry_t];
+                    let bubble_span = exit_t.saturating_sub(entry_t) + 1;
+                    let lo = bej.saturating_sub(spine_margin).max(1);
+                    let hi = (bej + bubble_span.min(spine_margin) + spine_margin).min(l);
+                    (lo, hi)
+                }
+                None => {
+                    let j_center = j_pred_max.saturating_add(1);
+                    let lo = j_center.saturating_sub(spine_margin).max(1);
+                    let hi = (j_center + spine_margin).min(l);
+                    (lo, hi)
+                }
+            }
+        };
+        // Clamp hi to the banded row width.
+        let j_hi = j_hi.min(j_lo + row_width - 1);
+        j_lo_arr[t] = j_lo;
+        j_hi_arr[t] = j_hi;
 
-        // ── Diagonal skip ───────────────────────────────────────────────────────
-        // O(1) fast path: carry the match score forward without filling I or D.
-        // Safe when the node is a linear base match and no gap is pending at the
-        // predecessor's diagonal position (I and D both UNSET there).
-        if w != UNBANDED && !is_source {
-            if let [pred_node] = nodes[node_idx].in_edges.as_slice() {
-                if nodes[node_idx].out_edges.len() == 1 {
-                    let pt = rank_of[*pred_node];
-                    let bj = centre;
-                    if bj >= 1
-                        && bj <= l
-                        && node_base == query[bj - 1]
-                        && m.get(pt, bj - 1).score != UNSET
-                        && ins.get(pt, bj - 1).score == UNSET
-                        && del.get(pt, bj - 1).score == UNSET
-                    {
-                        let score = m.get(pt, bj - 1).score + cfg.match_score;
-                        m.set(t, bj, Cell { score, pred_t: pt });
-                        // I and D at (t, bj) remain UNSET.
-                        // best_j and max_required unchanged.
-                        continue;
+        // ── Diagonal skip ──────────────────────────────────────────────────────
+        // O(1) fast path for consecutive exact matches along the spine.
+        //
+        // Extended to fire at bubble entries: if a spine node has multiple
+        // out-edges (e.g. a low-weight error arm), a 1-base pre-resolve checks
+        // whether query[bj+1] uniquely matches the spine successor's first base.
+        // If so, losing arms are marked lookahead_skip and the skip fires as if
+        // the node had a single out-edge.  Error arms never block spine sliding.
+        //
+        // In-edge guard is relaxed: predecessors already in lookahead_skip (from
+        // a previously resolved bubble) are ignored, so exit nodes of resolved
+        // bubbles re-enter the skip path immediately.
+        #[cfg(test)]
+        if !is_source {
+            NODE_COUNTER.with(|c| c.set(c.get() + 1));
+        }
+
+        if !is_source && on_spine[node_idx] {
+            if let Some(prev_sp) = spine_prev[node_idx] {
+                // Relaxed in-edge check: fast for the common single-predecessor case;
+                // falls through to a loop only when there are extra predecessors that
+                // might all be lookahead_skip (exit nodes of resolved bubbles).
+                let active_pred_ok = match nodes[node_idx].in_edges.as_slice() {
+                    [p] => *p == prev_sp,
+                    _ => {
+                        nodes[node_idx]
+                            .in_edges
+                            .iter()
+                            .all(|&p| p == prev_sp || lookahead_skip[p])
+                            && nodes[node_idx].in_edges.contains(&prev_sp)
+                    }
+                };
+
+                if active_pred_ok {
+                    let pt = rank_of[prev_sp];
+                    let bj = best_j_per_t[pt];
+                    if bj < l && node_base == query[bj] {
+                        let m_prev = gs(&m, pt, bj, j_lo_arr[pt], j_hi_arr[pt], row_width);
+                        let i_prev = gs(&ins, pt, bj, j_lo_arr[pt], j_hi_arr[pt], row_width);
+                        let d_prev =
+                            gsd(&del, &del0, pt, bj, j_lo_arr[pt], j_hi_arr[pt], row_width);
+                        let pred_is_source = nodes[topo[pt]].in_edges.is_empty();
+                        let i_ok = i_prev == UNSET || (pred_is_source && m_prev > i_prev);
+                        let d_ok = d_prev == UNSET || (pred_is_source && m_prev > d_prev);
+                        if m_prev != UNSET && i_ok && d_ok {
+                            // For a bubble entry: 1-base pre-resolve against query[bj+1].
+                            // Mark losing arms by setting only their first node as skip;
+                            // the UNSET cascade through the arm is correct and avoids the
+                            // alloc inside collect_arm_nodes on the hot path.
+                            let do_skip = match nodes[node_idx].out_edges.as_slice() {
+                                [_] => true,
+                                _ if bj + 1 < l => {
+                                    let next_q = query[bj + 1];
+                                    let mut spine_succ = None;
+                                    let mut resolved = true;
+                                    for &(s, _) in &nodes[node_idx].out_edges {
+                                        if on_spine[s] && spine_prev[s] == Some(node_idx) {
+                                            if nodes[s].base == next_q {
+                                                spine_succ = Some(s);
+                                            } else {
+                                                resolved = false;
+                                                break;
+                                            }
+                                        } else if !lookahead_skip[s] && nodes[s].base == next_q {
+                                            resolved = false;
+                                            break;
+                                        }
+                                    }
+                                    if resolved {
+                                        if let Some(ss) = spine_succ {
+                                            for &(s, _) in &nodes[node_idx].out_edges {
+                                                if s != ss && !lookahead_skip[s] {
+                                                    lookahead_skip[s] = true;
+                                                }
+                                            }
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            };
+
+                            if do_skip {
+                                let score = m_prev + cfg.match_score;
+                                // bj+1 is the centre of this row's band: within [j_lo, j_hi].
+                                m[t * row_width + (bj + 1 - j_lo)] = Cell {
+                                    score,
+                                    pred_t: pt as u32,
+                                };
+                                best_j_per_t[t] = bj + 1;
+                                #[cfg(test)]
+                                SKIP_COUNTER.with(|c| c.set(c.get() + 1));
+                                continue;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // ── j = 0: del only; in-band when centre <= w ──────────────────────────
-        if in_band_centred(centre, 0, w, l) {
-            let (mut best, mut best_pred) = (UNSET, 0usize);
+        // ── j = 0: delete-only ──────────────────────────────────────────────────
+        // m[t][0] and ins[t][0] are structurally UNSET (never stored); only del[t][0]
+        // (del0[t]) needs initialisation here.
+        {
+            let (mut best, mut best_pred) = (UNSET, 0u32);
             if is_source {
                 let val = go + ge;
                 if val > best {
@@ -370,92 +844,96 @@ fn align(
                 }
             }
             for &p in &nodes[node_idx].in_edges {
-                let p_t = rank_of[p];
-                if in_band_centred(m.centres[p_t], 0, w, l) {
-                    let vm = safe_add(m.get(p_t, 0).score, go + ge);
-                    if vm > best {
-                        best = vm;
-                        best_pred = p_t;
-                    }
-                    let vd = safe_add(del.get(p_t, 0).score, ge);
-                    if vd > best {
-                        best = vd;
-                        best_pred = p_t;
-                    }
+                let pt = rank_of[p];
+                // m[pt][0] is always UNSET; only del0 carries the j=0 chain.
+                let vd = safe_add(del0[pt].score, ge);
+                if vd > best {
+                    best = vd;
+                    best_pred = pt as u32;
                 }
             }
             if best != UNSET {
-                del.set(
-                    t,
-                    0,
-                    Cell {
-                        score: best,
-                        pred_t: best_pred,
-                    },
-                );
+                del0[t] = Cell {
+                    score: best,
+                    pred_t: best_pred,
+                };
             }
         }
 
         // ── j = j_lo..=j_hi ───────────────────────────────────────────────────
+        let mut row_best_j = 0usize;
+        let mut row_best_score = UNSET;
+
         for j in j_lo..=j_hi {
             let q_base = query[j - 1];
-            let score_fn = if node_base == q_base {
+            let sc = if node_base == q_base {
                 cfg.match_score
             } else {
                 cfg.mismatch_score
             };
+            let ixcur = t * row_width + (j - j_lo);
 
             // M[t][j]
             {
                 let (mut best, mut best_pred) = (UNSET, VIRTUAL);
-                if j == 1 && (is_source || cfg.alignment_mode == AlignmentMode::SemiGlobal) {
-                    // Source nodes start clean at j=1.
-                    // Semi-global: any node can begin alignment here (free graph prefix).
-                    if score_fn > best {
-                        best = score_fn;
-                        best_pred = VIRTUAL;
-                    }
+                // Free-start at j=1: applies when j_lo==1 (source or bubble nodes).
+                if j == 1 && (is_source || semi) && sc > best {
+                    best = sc;
+                    best_pred = VIRTUAL;
                 }
                 if is_source && j > 1 {
-                    let val = safe_add(go + (j as i32 - 1) * ge, score_fn);
-                    if val > best {
+                    let val = safe_add(go + (j as i32 - 1) * ge, sc);
+                    if val != UNSET && val > best {
                         best = val;
                         best_pred = VIRTUAL;
                     }
                 }
                 for &p in &nodes[node_idx].in_edges {
-                    let p_t = rank_of[p];
-                    if in_band_centred(m.centres[p_t], j - 1, w, l) {
-                        let vm = safe_add(m.get(p_t, j - 1).score, score_fn);
-                        if vm > best {
-                            best = vm;
-                            best_pred = p_t;
-                        }
-                        let vi = safe_add(ins.get(p_t, j - 1).score, score_fn);
-                        if vi > best {
-                            best = vi;
-                            best_pred = p_t;
-                        }
-                        let vd = safe_add(del.get(p_t, j - 1).score, score_fn);
-                        if vd > best {
-                            best = vd;
-                            best_pred = p_t;
-                        }
+                    let pt = rank_of[p];
+                    let vm = safe_add(gs(&m, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width), sc);
+                    if vm != UNSET && vm > best {
+                        best = vm;
+                        best_pred = pt as u32;
+                    }
+                    let vi = safe_add(
+                        gs(&ins, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width),
+                        sc,
+                    );
+                    if vi != UNSET && vi > best {
+                        best = vi;
+                        best_pred = pt as u32;
+                    }
+                    let vd = safe_add(
+                        gsd(
+                            &del,
+                            &del0,
+                            pt,
+                            j - 1,
+                            j_lo_arr[pt],
+                            j_hi_arr[pt],
+                            row_width,
+                        ),
+                        sc,
+                    );
+                    if vd != UNSET && vd > best {
+                        best = vd;
+                        best_pred = pt as u32;
                     }
                 }
                 if best != UNSET {
-                    m.set(
-                        t,
-                        j,
-                        Cell {
-                            score: best,
-                            pred_t: best_pred,
-                        },
-                    );
+                    m[ixcur] = Cell {
+                        score: best,
+                        pred_t: best_pred,
+                    };
+                    if best > row_best_score {
+                        row_best_score = best;
+                        row_best_j = j;
+                    }
                 }
             }
 
-            // I[t][j]
+            // I[t][j] — reads from same row at j-1.
+            // When j == j_lo, j-1 is outside the banded window → treat as UNSET.
             {
                 let (mut best, mut best_pred) = (UNSET, VIRTUAL);
                 if is_source && j == 1 {
@@ -465,135 +943,232 @@ fn align(
                         best_pred = VIRTUAL;
                     }
                 }
-                if in_band_centred(centre, j - 1, w, l) {
-                    let vm = safe_add(m.get(t, j - 1).score, go + ge);
-                    if vm > best {
+                if j > j_lo {
+                    let ixprev = t * row_width + (j - 1 - j_lo);
+                    let vm = safe_add(m[ixprev].score, go + ge);
+                    if vm != UNSET && vm > best {
                         best = vm;
-                        best_pred = t;
+                        best_pred = t as u32;
                     }
-                    let vi = safe_add(ins.get(t, j - 1).score, ge);
-                    if vi > best {
+                    let vi = safe_add(ins[ixprev].score, ge);
+                    if vi != UNSET && vi > best {
                         best = vi;
-                        best_pred = t;
+                        best_pred = t as u32;
                     }
                 }
                 if best != UNSET {
-                    ins.set(
-                        t,
-                        j,
-                        Cell {
-                            score: best,
-                            pred_t: best_pred,
-                        },
-                    );
+                    ins[ixcur] = Cell {
+                        score: best,
+                        pred_t: best_pred,
+                    };
                 }
             }
 
             // D[t][j]
-            // No is_source init: source-deletion init belongs only in j=0 column.
             {
-                let (mut best, mut best_pred) = (UNSET, 0usize);
+                let (mut best, mut best_pred) = (UNSET, 0u32);
                 for &p in &nodes[node_idx].in_edges {
-                    let p_t = rank_of[p];
-                    if in_band_centred(m.centres[p_t], j, w, l) {
-                        let vm = safe_add(m.get(p_t, j).score, go + ge);
-                        if vm > best {
-                            best = vm;
-                            best_pred = p_t;
-                        }
-                        let vi = safe_add(ins.get(p_t, j).score, go + ge);
-                        if vi > best {
-                            best = vi;
-                            best_pred = p_t;
-                        }
-                        let vd = safe_add(del.get(p_t, j).score, ge);
-                        if vd > best {
-                            best = vd;
-                            best_pred = p_t;
-                        }
+                    let pt = rank_of[p];
+                    let vm = safe_add(
+                        gs(&m, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
+                        go + ge,
+                    );
+                    if vm != UNSET && vm > best {
+                        best = vm;
+                        best_pred = pt as u32;
+                    }
+                    let vi = safe_add(
+                        gs(&ins, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
+                        go + ge,
+                    );
+                    if vi != UNSET && vi > best {
+                        best = vi;
+                        best_pred = pt as u32;
+                    }
+                    let vd = safe_add(
+                        gsd(&del, &del0, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
+                        ge,
+                    );
+                    if vd != UNSET && vd > best {
+                        best = vd;
+                        best_pred = pt as u32;
                     }
                 }
                 if best != UNSET {
-                    del.set(
-                        t,
-                        j,
-                        Cell {
-                            score: best,
-                            pred_t: best_pred,
-                        },
-                    );
+                    del[ixcur] = Cell {
+                        score: best,
+                        pred_t: best_pred,
+                    };
                 }
             }
         }
 
-        // ── Update best_j + approaching-edge check ──────────────────────────────
-        if w != UNBANDED {
-            let mut new_best_j = centre;
-            let mut new_best_score = UNSET;
-            for j in j_lo..=j_hi {
-                let s = m.get(t, j).score;
-                if s != UNSET && s > new_best_score {
-                    new_best_score = s;
-                    new_best_j = j;
-                }
-            }
-            if new_best_score != UNSET {
-                best_j = new_best_j;
-            }
+        if row_best_score != UNSET {
+            best_j_per_t[t] = row_best_j;
+        } else {
+            // No M cell set: estimate j from predecessor + 1 (diagonal advance).
+            best_j_per_t[t] = if is_source {
+                1
+            } else {
+                j_pred_max.saturating_add(1).min(l)
+            };
+        }
 
-            // Only check sides where the band is a real constraint: j_lo > 1 means
-            // there are valid positions to the left that weren't computed; j_hi < l
-            // means there are valid positions to the right. At the absolute boundaries
-            // (j=1 or j=l) there are no missing cells, so treat those sides as safe.
-            let left_margin = if j_lo > 1 {
-                best_j.saturating_sub(j_lo)
-            } else {
-                GAP_MARGIN
-            };
-            let right_margin = if j_hi < l {
-                j_hi.saturating_sub(best_j)
-            } else {
-                GAP_MARGIN
-            };
-            let margin = left_margin.min(right_margin);
-            if margin < GAP_MARGIN {
-                let extra = (GAP_MARGIN - margin) * 2 + GAP_MARGIN;
-                max_required = max_required.max(w + extra);
+        // ── Lookahead resolve + slide-and-lock ───────────────────────────────
+        // At a bubble entry node, attempt to identify the correct arm before
+        // processing its nodes.  Losing arm nodes are marked in `lookahead_skip`
+        // and their windowed DP is entirely skipped; the winning arm proceeds
+        // through normal windowed DP, producing correct M/I/D cells for
+        // traceback without any retroactive gap-state fill.
+        //
+        // Dispatch order:
+        //   1. Lookahead  — score first LOOKAHEAD_K bases; fast, reliable for
+        //                   structural bubbles (interruption motifs, allele SNPs)
+        //                   where one arm is clearly better within one repeat unit.
+        //   2. Slide-and-lock — slide base-by-base past LOOKAHEAD_K until an arm
+        //                   exhausts or uniquely matches for SLIDE_MIN_CONSEC steps;
+        //                   handles long repetitive bubbles (RFC1, C9orf72) where
+        //                   arms share a long identical prefix.
+        //   3. Windowed DP fallback — always correct; used when arms are complex
+        //                   (internally branched) or no lock fires.
+        if let Some((entry_t, exit_t)) = bubble_ranges[t] {
+            if t == entry_t && nodes[node_idx].out_edges.len() >= 2 {
+                let j_entry = best_j_per_t[t];
+                if j_entry < l {
+                    // Materialise each arm.  Arms with internal branches (nested
+                    // bubbles) or exceeding ARM_MAX_DEPTH return None → complex=true
+                    // → fall through to windowed DP.
+                    all_arms.clear();
+                    let mut complex = false;
+                    for &(arm_start, _) in &nodes[node_idx].out_edges {
+                        if collect_arm_nodes(nodes, rank_of, arm_start, exit_t, &mut arm_scratch) {
+                            all_arms.push(arm_scratch.clone());
+                        } else {
+                            complex = true;
+                            break;
+                        }
+                    }
+
+                    if !complex && all_arms.len() >= 2 {
+                        // ── 1. Lookahead ──────────────────────────────────────
+                        // Only fires when the longest arm provides all LOOKAHEAD_K
+                        // bases.  Short arms (< K) are unreliable at ONT error
+                        // rates: one read error flips the decision.
+                        let max_scored = all_arms
+                            .iter()
+                            .map(|arm| {
+                                arm.len()
+                                    .min(LOOKAHEAD_K)
+                                    .min(query.len().saturating_sub(j_entry))
+                            })
+                            .max()
+                            .unwrap_or(0);
+
+                        let winner = if max_scored >= LOOKAHEAD_K {
+                            let scores: Vec<i32> = all_arms
+                                .iter()
+                                .map(|arm| {
+                                    score_arm_prefix(
+                                        arm,
+                                        nodes,
+                                        query,
+                                        j_entry,
+                                        cfg.match_score,
+                                        cfg.mismatch_score,
+                                    )
+                                })
+                                .collect();
+                            let best = *scores.iter().max().unwrap();
+                            let winner_count = scores.iter().filter(|&&s| s == best).count();
+                            if winner_count == 1 {
+                                let second_best = scores
+                                    .iter()
+                                    .copied()
+                                    .filter(|&s| s != best)
+                                    .max()
+                                    .unwrap_or(i32::MIN);
+                                if best - second_best >= LOOKAHEAD_MARGIN {
+                                    scores.iter().position(|&s| s == best)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        // ── 2. Slide-and-lock ─────────────────────────────────
+                        let winner =
+                            winner.or_else(|| slide_lock(&all_arms, nodes, query, j_entry));
+
+                        // ── Mark losers + lock winning arm windows ────────────
+                        if let Some(w) = winner {
+                            for (arm_idx, arm) in all_arms.iter().enumerate() {
+                                if arm_idx != w {
+                                    for &losing_node in arm {
+                                        lookahead_skip[losing_node] = true;
+                                    }
+                                }
+                            }
+                            // Give winning arm nodes tight per-depth j-windows
+                            // so cells at the correct query column are always
+                            // filled even when arm depth > spine_margin.
+                            let arm = &all_arms[w];
+                            let arm_len = arm.len();
+                            for (d, &win_node) in arm.iter().enumerate() {
+                                let j_c = (j_entry + d + 1).min(l) as u32;
+                                scratch.lock_node_j.push((win_node, j_c));
+                            }
+                            scratch.lock_node_j.sort_unstable_by_key(|&(idx, _)| idx);
+                            // Exit node: centred at the arm's expected terminal j.
+                            let exit_node = topo[exit_t];
+                            let exit_j = (j_entry + arm_len).min(l) as u32;
+                            // Insert sorted (exit_node may already be present from
+                            // a previous bubble in the same align() call).
+                            match scratch
+                                .lock_exit_j
+                                .binary_search_by_key(&exit_node, |&(idx, _)| idx)
+                            {
+                                Ok(pos) => {
+                                    scratch.lock_exit_j[pos].1 =
+                                        exit_j.max(scratch.lock_exit_j[pos].1)
+                                }
+                                Err(pos) => scratch.lock_exit_j.insert(pos, (exit_node, exit_j)),
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Approaching-edge flag: the DP may have run with cells near or outside the
-    // band. Return before traceback to force a clean retry with the wider band.
-    if max_required > w && w != UNBANDED {
-        return Err(PoaError::BandTooNarrow {
-            configured: w,
-            required: max_required,
-        });
-    }
-
-    // ── Find best terminal cell at column l ───────────────────────────────────
+    // ── Find best terminal cell at column l ─────────────────────────────────────
     let terminal_best = (0..n)
-        .filter(|&t| in_band_centred(m.centres[t], l, w, l))
         .flat_map(|t| {
-            [
-                (t, State::M, m.get(t, l).score),
-                (t, State::I, ins.get(t, l).score),
-                (t, State::D, del.get(t, l).score),
-            ]
+            let jlo = j_lo_arr[t];
+            let jhi = j_hi_arr[t];
+            let sm = gs(&m, t, l, jlo, jhi, row_width);
+            let si = gs(&ins, t, l, jlo, jhi, row_width);
+            let sd = gsd(&del, &del0, t, l, jlo, jhi, row_width);
+            let best_sc = [sm, si, sd].into_iter().filter(|&s| s != UNSET).max();
+            best_sc.map(|sc| {
+                let st = if sm == sc {
+                    State::M
+                } else if si == sc {
+                    State::I
+                } else {
+                    State::D
+                };
+                (t, st, sc)
+            })
         })
-        .filter(|&(_, _, sc)| sc != UNSET)
         .max_by_key(|&(_, _, sc)| sc)
         .map(|(t, s, _)| (t, s));
 
     let (best_t, best_state) = match terminal_best {
         Some(result) => result,
-        None if w != UNBANDED && l > 0 => {
-            return Err(PoaError::BandTooNarrow {
-                configured: w,
-                required: w * 2,
-            });
-        }
         None => (0, State::M),
     };
 
@@ -604,10 +1179,34 @@ fn align(
     let mut cur_state = best_state;
 
     loop {
-        let cell = match cur_state {
-            State::M => m.get(t, j),
-            State::I => ins.get(t, j),
-            State::D => del.get(t, j),
+        let cell = {
+            let jlo = j_lo_arr[t];
+            let jhi = j_hi_arr[t];
+            match cur_state {
+                State::M => {
+                    if j < jlo || j > jhi {
+                        Cell::unset()
+                    } else {
+                        m[t * row_width + (j - jlo)]
+                    }
+                }
+                State::I => {
+                    if j < jlo || j > jhi {
+                        Cell::unset()
+                    } else {
+                        ins[t * row_width + (j - jlo)]
+                    }
+                }
+                State::D => {
+                    if j == 0 {
+                        del0[t]
+                    } else if j < jlo || j > jhi {
+                        Cell::unset()
+                    } else {
+                        del[t * row_width + (j - jlo)]
+                    }
+                }
+            }
         };
 
         if cell.score == UNSET {
@@ -623,9 +1222,11 @@ fn align(
                     }
                     break;
                 }
-                t = cell.pred_t;
+                t = cell.pred_t as usize;
                 j -= 1;
-                cur_state = best_prev_state(&m, &ins, &del, t, j);
+                cur_state = best_prev_state_banded(
+                    &m, &ins, &del, &del0, t, j, &j_lo_arr, &j_hi_arr, row_width,
+                );
             }
             State::I => {
                 ops.push(AlignOp::Insert(query[j - 1]));
@@ -636,19 +1237,19 @@ fn align(
                     }
                     break;
                 }
-                cur_state = if m.get(t, j).score >= ins.get(t, j).score {
-                    State::M
-                } else {
-                    State::I
-                };
+                let sm = gs(&m, t, j, j_lo_arr[t], j_hi_arr[t], row_width);
+                let si = gs(&ins, t, j, j_lo_arr[t], j_hi_arr[t], row_width);
+                cur_state = if sm >= si { State::M } else { State::I };
             }
             State::D => {
                 ops.push(AlignOp::Delete(topo[t]));
                 if cell.pred_t == VIRTUAL {
                     break;
                 }
-                t = cell.pred_t;
-                cur_state = best_prev_state(&m, &ins, &del, t, j);
+                t = cell.pred_t as usize;
+                cur_state = best_prev_state_banded(
+                    &m, &ins, &del, &del0, t, j, &j_lo_arr, &j_hi_arr, row_width,
+                );
             }
         }
 
@@ -661,56 +1262,30 @@ fn align(
     Ok(ops)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
-fn best_prev_state(m: &DpTable, ins: &DpTable, del: &DpTable, t: usize, j: usize) -> State {
-    let sm = m.get(t, j).score;
-    let si = ins.get(t, j).score;
-    let sd = del.get(t, j).score;
+fn best_prev_state_banded(
+    m: &[Cell],
+    ins: &[Cell],
+    del: &[Cell],
+    del0: &[Cell],
+    t: usize,
+    j: usize,
+    j_lo_arr: &[usize],
+    j_hi_arr: &[usize],
+    row_width: usize,
+) -> State {
+    let jlo = j_lo_arr[t];
+    let jhi = j_hi_arr[t];
+    let sm = gs(m, t, j, jlo, jhi, row_width);
+    let si = gs(ins, t, j, jlo, jhi, row_width);
+    let sd = gsd(del, del0, t, j, jlo, jhi, row_width);
     if sm != UNSET && sm >= si && sm >= sd {
         State::M
     } else if si != UNSET && si >= sd {
         State::I
     } else {
         State::D
-    }
-}
-
-/// Align `query` against the graph, retrying with a wider band if the first
-/// Align `query` against the graph, retrying with progressively wider bands if
-/// the first attempt returns `BandTooNarrow`.
-///
-/// Pass 1: the initial band `w`. Exits early if the approaching-edge detector
-///   fires, saving most of the DP work.
-/// Pass 2: `required` from pass 1, which corrects for the drift observed so far.
-///   Wider DP may expose new drift that was hidden by the narrower band.
-/// Pass 3 (fallback): unbanded. Always correct; used only when pass 2 also fails.
-///   For reads under ~1 kb the unbanded DP is negligible in cost.
-fn align_with_retry(
-    nodes: &[Node],
-    topo: &[usize],
-    rank_of: &[usize],
-    query: &[u8],
-    cfg: &PoaConfig,
-    w: usize,
-) -> Result<Vec<AlignOp>, PoaError> {
-    let r1 = align(nodes, topo, rank_of, query, cfg, w);
-    let required = match r1 {
-        Ok(ops) => return Ok(ops),
-        Err(PoaError::BandTooNarrow { required, .. }) => required,
-        Err(e) => return Err(e),
-    };
-
-    // Pass 2: use the estimated required width.
-    let w2 = required.max(w + 1);
-    let r2 = align(nodes, topo, rank_of, query, cfg, w2);
-    match r2 {
-        Ok(ops) => Ok(ops),
-        Err(PoaError::BandTooNarrow { .. }) => {
-            // Pass 2 exposed new drift hidden by the narrower band. Fall back
-            // to unbanded which is always correct.
-            align(nodes, topo, rank_of, query, cfg, UNBANDED)
-        }
-        Err(e) => Err(e),
     }
 }
 
@@ -762,7 +1337,6 @@ fn add_to_graph(
                 prev = Some(new_idx);
             }
             AlignOp::Delete(node_idx) => {
-                // Traverse without consuming a query base; counts as a gap vote for MF.
                 nodes[node_idx].delete_count += 1;
                 if let Some(p) = prev {
                     increment_or_add_edge(nodes, p, node_idx);
@@ -778,7 +1352,6 @@ fn add_to_graph(
 
 fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usize, u8, i32)> {
     let n = topo.len();
-    // (cumulative_score, predecessor_t, edge_weight_from_predecessor)
     let mut cum: Vec<(i64, Option<usize>, i32)> = vec![(0, None, 0); n];
 
     for t in 0..n {
@@ -794,15 +1367,12 @@ fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usiz
     }
 
     let max_cum = (0..n).map(|t| cum[t].0).max().unwrap_or(0);
-    // Prefer shortest path among equal-weight termini.
     let best_t = (0..n).find(|&t| cum[t].0 == max_cum).unwrap_or(0);
 
     let mut path: Vec<(usize, u8, i32)> = Vec::new();
     let mut t = best_t;
     loop {
         let node_idx = topo[t];
-        // For the first node (no predecessor edge) use coverage so the fraction
-        // helper has a meaningful denominator at position 0.
         let w = if cum[t].1.is_none() {
             nodes[node_idx].coverage as i32
         } else {
@@ -820,13 +1390,6 @@ fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usiz
 
 // ─── Majority-frequency consensus ────────────────────────────────────────────
 
-/// Column-wise plurality vote: include a node when its base votes outnumber its
-/// gap votes AND enough reads voted at that column to meet `min_cov`.
-///
-/// `coverage` = reads that matched the node. `delete_count` = reads that deleted
-/// it (traversed without consuming a base). Reads that took a different branch
-/// through a bubble don't vote at this column at all, so the denominator is
-/// `coverage + delete_count`, not `n_reads`.
 fn majority_frequency(nodes: &[Node], topo: &[usize], min_cov: u32) -> Vec<(usize, u8, i32)> {
     topo.iter()
         .copied()
@@ -846,7 +1409,6 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
     let node_count = nodes.len();
     let edge_count: usize = nodes.iter().map(|nd| nd.out_edges.len()).sum();
 
-    // Coverage mean and variance
     let coverages: Vec<f64> = nodes.iter().map(|nd| nd.coverage as f64).collect();
     let coverage_mean = if node_count == 0 {
         0.0
@@ -863,7 +1425,6 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
             / node_count as f64
     };
 
-    // Single-support fraction
     let single_support = nodes.iter().filter(|nd| nd.coverage == 1).count();
     let single_support_fraction = if node_count == 0 {
         0.0
@@ -871,7 +1432,6 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
         single_support as f64 / node_count as f64
     };
 
-    // Edge weight Gini coefficient
     let mut weights: Vec<f64> = nodes
         .iter()
         .flat_map(|nd| nd.out_edges.iter().map(|&(_, w)| w as f64))
@@ -894,7 +1454,6 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
         }
     };
 
-    // Bubble count and max_bubble_depth.
     let threshold = (n_reads as f64 * min_allele_freq).ceil() as i32;
     let mut bubble_count = 0usize;
     let mut max_bubble_depth = 0usize;
@@ -912,7 +1471,6 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
         }
     }
 
-    // Mean per-column Shannon entropy (bits).
     let mean_column_entropy = {
         let mut sum = 0.0f64;
         let mut count = 0usize;
@@ -954,14 +1512,6 @@ fn binary_entropy(p: f64) -> f64 {
 
 // ─── Coverage gap detection ───────────────────────────────────────────────────
 
-/// Scan a consensus `coverage` slice and return interior runs where
-/// `coverage[i] < 2` (seed-only: no independent read corroborated the base)
-/// that are flanked on both sides by positions with `coverage >= 2`.
-///
-/// These represent regions where partial reads from opposite ends of the
-/// template did not overlap; the bases are present (from the seed) but
-/// unverified, and `gap.size()` is the minimum base-count estimate for that
-/// region.
 fn detect_coverage_gaps(coverage: &[u32]) -> Vec<CoverageGap> {
     let first = coverage.iter().position(|&c| c >= 2);
     let last = coverage.iter().rposition(|&c| c >= 2);
@@ -995,9 +1545,6 @@ fn detect_coverage_gaps(coverage: &[u32]) -> Vec<CoverageGap> {
 
 // ─── Multi-allele helpers ─────────────────────────────────────────────────────
 
-/// Returns `(entry_node_idx, arm_start_node_idxs)` for every bubble in the
-/// graph — nodes that have 2+ outgoing edges each above the min_allele_freq
-/// threshold. The list is in topological order.
 fn find_bubbles(
     nodes: &[Node],
     topo: &[usize],
@@ -1023,10 +1570,161 @@ fn find_bubbles(
         .collect()
 }
 
-/// Partition reads into allele groups by examining which arm of `entry_node`
-/// each read traversed, using per-edge read membership recorded in `edge_reads`.
-/// Reads not observed on any qualifying arm are absorbed into the largest group.
-/// Returns at most 2 groups (the two highest-support arms).
+/// Finds bubbles where at least one arm has structural size (span ≥ cfg.phasing_bubble_min_span).
+/// These represent genuine length variants or SVs rather than SNPs / short indels.
+/// Used for cross-bubble compatibility phasing in consensus_multi.
+fn find_structural_bubbles(
+    nodes: &[Node],
+    topo: &[usize],
+    n_reads: usize,
+    cfg: &PoaConfig,
+) -> Vec<(usize, Vec<usize>)> {
+    let threshold = ((n_reads as f64 * cfg.min_allele_freq).ceil() as i32).max(1);
+    let max_check = cfg.phasing_bubble_min_span.saturating_add(1);
+
+    topo.iter()
+        .copied()
+        .filter_map(|entry_node| {
+            let arms: Vec<usize> = nodes[entry_node]
+                .out_edges
+                .iter()
+                .filter(|&&(_, w)| w >= threshold)
+                .map(|&(to, _)| to)
+                .collect();
+
+            if arms.len() < 2 {
+                return None;
+            }
+
+            // An arm whose start node already has multiple in-edges is a direct edge to
+            // the bubble exit (arm span 0). Otherwise measure the single-successor chain.
+            let max_span = arms
+                .iter()
+                .map(|&start| {
+                    if nodes[start].in_edges.len() > 1 {
+                        0
+                    } else {
+                        materialize_arm_len(nodes, start, max_check)
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+
+            if max_span >= cfg.phasing_bubble_min_span {
+                Some((entry_node, arms))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Groups reads by arm-choice compatibility across all structural bubbles.
+///
+/// For each structural bubble, edge_reads tells us which reads entered each arm.
+/// Two reads are in the same haplotype group when they agree on every bubble
+/// where both have a recorded arm choice. Reads with no arm assignment at any
+/// structural bubble (pre-dating all bubbles, or not spanning them) are folded
+/// into the largest group. Groups below min_reads are also folded into the largest.
+fn phasing_groups(
+    edge_reads: &HashMap<(usize, usize), Vec<u32>>,
+    bubbles: &[(usize, Vec<usize>)],
+    n_reads: usize,
+    min_reads: usize,
+) -> Vec<Vec<usize>> {
+    let n_bubbles = bubbles.len();
+
+    // sig[read][bubble] = Some(arm_idx) if that read entered that bubble arm, else None.
+    let mut sig: Vec<Vec<Option<usize>>> = vec![vec![None; n_bubbles]; n_reads];
+    for (b, (entry, arm_starts)) in bubbles.iter().enumerate() {
+        for (arm_idx, &arm_start) in arm_starts.iter().enumerate() {
+            if let Some(reads) = edge_reads.get(&(*entry, arm_start)) {
+                for &r in reads {
+                    let r = r as usize;
+                    if r < n_reads {
+                        sig[r][b] = Some(arm_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Split reads into those with at least one recorded arm choice and those with none.
+    let mut assigned: Vec<usize> = Vec::new();
+    let mut unassigned: Vec<usize> = Vec::new();
+    for (r, row) in sig.iter().enumerate() {
+        if row.iter().any(|s| s.is_some()) {
+            assigned.push(r);
+        } else {
+            unassigned.push(r);
+        }
+    }
+
+    // Union-find over assigned reads: merge reads whose arm choices never conflict.
+    let n = assigned.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let ri = assigned[i];
+            let rj = assigned[j];
+            let compatible = (0..n_bubbles).all(|b| match (sig[ri][b], sig[rj][b]) {
+                (Some(a), Some(bv)) => a == bv,
+                _ => true,
+            });
+            if compatible {
+                let mut pi = i;
+                while parent[pi] != pi {
+                    pi = parent[pi];
+                }
+                let mut pj = j;
+                while parent[pj] != pj {
+                    pj = parent[pj];
+                }
+                if pi != pj {
+                    parent[pj] = pi;
+                }
+            }
+        }
+    }
+
+    // Path compression.
+    for i in 0..n {
+        let mut root = i;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        parent[i] = root;
+    }
+
+    // Collect groups.
+    let mut group_map: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (slot, &r) in assigned.iter().enumerate() {
+        group_map.entry(parent[slot]).or_default().push(r);
+    }
+
+    let mut groups: Vec<Vec<usize>> = group_map.into_values().collect();
+    groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.len()));
+
+    if groups.is_empty() {
+        groups.push(Vec::new());
+    }
+
+    // Fold groups below min_reads and unassigned reads into the largest group.
+    let mut i = 1;
+    while i < groups.len() {
+        if groups[i].len() < min_reads {
+            let g = groups.remove(i);
+            groups[0].extend(g);
+        } else {
+            i += 1;
+        }
+    }
+    groups[0].extend(unassigned);
+    groups.retain(|g| !g.is_empty());
+    groups
+}
+
 fn partition_reads_by_bubble(
     edge_reads: &HashMap<(usize, usize), Vec<u32>>,
     entry_node: usize,
@@ -1061,7 +1759,6 @@ fn partition_reads_by_bubble(
         }
     }
 
-    // Reads not on any arm go to the largest group.
     let largest = groups
         .iter()
         .enumerate()
@@ -1078,7 +1775,6 @@ fn partition_reads_by_bubble(
     groups
 }
 
-/// Index within `group` of the read whose length is closest to the median.
 fn choose_seed(group: &[usize], reads: &[Vec<u8>]) -> usize {
     if group.len() == 1 {
         return 0;
@@ -1121,6 +1817,10 @@ impl PoaGraph {
             reads: vec![seed.to_vec()],
             edge_reads,
             warnings: 0,
+            cached_spine: Vec::new(),
+            spine_updated_at: 0,
+            spine_interval: 1,
+            align_scratch: AlignScratch::new(),
         })
     }
 
@@ -1129,20 +1829,35 @@ impl PoaGraph {
             return Err(PoaError::EmptyInput);
         }
 
-        let w = compute_effective_band(&self.config, read.len(), self.nodes.len());
+        let (topo, rank_of) = topological_order(&self.nodes);
 
-        if self.config.warn_on_long_unbanded && w == UNBANDED && read.len() > 1000 {
-            eprintln!(
-                "poa-consensus: warning: read length {} bp with band_width=0 (unbanded). \
-                 Memory usage is O(n*m). Consider setting band_width or adaptive_band=true. \
-                 Suppress with warn_on_long_unbanded=false.",
-                read.len()
-            );
-            self.warnings += 1;
+        // Refresh the spine when the cache is empty or the interval has elapsed.
+        // The interval doubles each time the spine is stable (≤ SPINE_STABLE_THRESHOLD
+        // base changes), and resets to 1 when it changes significantly.  The final
+        // consensus always recomputes the heaviest path from scratch, so a stale
+        // spine only affects alignment speed, never correctness.
+        let reads_since_update = self.n_reads.saturating_sub(self.spine_updated_at);
+        if self.cached_spine.is_empty() || reads_since_update >= self.spine_interval {
+            let new_spine = heaviest_path(&self.nodes, &topo, &rank_of);
+            let diff = spine_diff(&self.cached_spine, &new_spine);
+            self.cached_spine = new_spine;
+            self.spine_updated_at = self.n_reads;
+            if diff <= SPINE_STABLE_THRESHOLD {
+                self.spine_interval = (self.spine_interval * 2).min(SPINE_MAX_INTERVAL);
+            } else {
+                self.spine_interval = 1;
+            }
         }
 
-        let (topo, rank_of) = topological_order(&self.nodes);
-        let ops = align_with_retry(&self.nodes, &topo, &rank_of, read, &self.config, w)?;
+        let ops = align(
+            &self.nodes,
+            &topo,
+            &rank_of,
+            &self.cached_spine,
+            read,
+            &self.config,
+            &mut self.align_scratch,
+        )?;
         let read_idx = self.n_reads as u32;
         add_to_graph(&mut self.nodes, &mut self.edge_reads, read, &ops, read_idx);
         self.reads.push(read.to_vec());
@@ -1232,6 +1947,7 @@ impl PoaGraph {
     }
 
     /// Number of long-unbanded warnings emitted during `add_read` calls.
+    /// With the new bubble-aware aligner this always returns 0 (warnings removed).
     pub fn warnings_emitted(&self) -> usize {
         self.warnings
     }
@@ -1252,26 +1968,40 @@ impl PoaGraph {
 
     /// Align `read` into the current graph and return the alignment operations
     /// without modifying the graph.
-    ///
-    /// Also returns the effective band width used (`usize::MAX` = unbanded) and
-    /// the topological rank of every node.
     pub fn align_read_ops(
         &self,
         read: &[u8],
     ) -> Result<(Vec<AlignOp>, usize, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
-        let w = compute_effective_band(&self.config, read.len(), self.nodes.len());
-        let ops = align_with_retry(&self.nodes, &topo, &rank_of, read, &self.config, w)?;
-        Ok((ops, w, rank_of))
+        let spine = heaviest_path(&self.nodes, &topo, &rank_of);
+        let ops = align(
+            &self.nodes,
+            &topo,
+            &rank_of,
+            &spine,
+            read,
+            &self.config,
+            &mut AlignScratch::new(),
+        )?;
+        Ok((ops, 0, rank_of))
     }
 
-    /// Like [`align_read_ops`] but always runs unbanded.
+    /// Like [`align_read_ops`] but kept for compatibility.
     pub fn align_read_ops_unbanded(
         &self,
         read: &[u8],
     ) -> Result<(Vec<AlignOp>, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
-        let ops = align(&self.nodes, &topo, &rank_of, read, &self.config, UNBANDED)?;
+        let spine = heaviest_path(&self.nodes, &topo, &rank_of);
+        let ops = align(
+            &self.nodes,
+            &topo,
+            &rank_of,
+            &spine,
+            read,
+            &self.config,
+            &mut AlignScratch::new(),
+        )?;
         Ok((ops, rank_of))
     }
 
@@ -1280,8 +2010,57 @@ impl PoaGraph {
         self.nodes.len()
     }
 
-    /// Build one consensus per detected allele by partitioning reads at the
-    /// strongest bubble and running a fresh POA for each allele group.
+    /// For each node, return `(out_edges_count, max_out_edge_weight, min_out_edge_weight)`.
+    pub fn node_out_edge_info(&self) -> Vec<(usize, i32, i32)> {
+        self.nodes
+            .iter()
+            .map(|n| {
+                let count = n.out_edges.len();
+                let max_w = n.out_edges.iter().map(|&(_, w)| w).max().unwrap_or(0);
+                let min_w = n.out_edges.iter().map(|&(_, w)| w).min().unwrap_or(0);
+                (count, max_w, min_w)
+            })
+            .collect()
+    }
+
+    /// Return arm lengths for each bubble node with 2+ qualifying arms (weight >= threshold).
+    ///
+    /// Arm length is measured by walking the single-successor chain from each arm start,
+    /// stopping at reconvergence points (nodes with multiple in-edges after the first step).
+    pub fn bubble_arm_lengths(
+        &self,
+        weight_threshold: i32,
+        arm_len_threshold: usize,
+    ) -> Vec<(usize, Vec<usize>)> {
+        let (topo, _) = topological_order(&self.nodes);
+        let mut result = Vec::new();
+        for (t, &node_idx) in topo.iter().enumerate() {
+            let qualifying: Vec<usize> = self.nodes[node_idx]
+                .out_edges
+                .iter()
+                .filter(|&&(_, w)| w >= weight_threshold)
+                .map(|&(succ, _)| succ)
+                .collect();
+            if qualifying.len() >= 2 {
+                // Measure each arm by walking single-successor chains.
+                let arm_lens: Vec<usize> = qualifying
+                    .iter()
+                    .map(|&arm_start| materialize_arm_len(&self.nodes, arm_start, 500))
+                    .collect();
+                let min_len = arm_lens.iter().copied().min().unwrap_or(0);
+                if min_len >= arm_len_threshold {
+                    result.push((t, arm_lens));
+                }
+            }
+        }
+        result
+    }
+
+    /// Build one consensus per detected allele.
+    ///
+    /// Structural bubbles (arm span ≥ phasing_bubble_min_span) are phased first using
+    /// cross-bubble compatibility grouping. If no structural bubbles are found, falls
+    /// back to single-best SNP bubble partitioning for substitution haplotypes.
     pub fn consensus_multi(&self) -> Result<Vec<Consensus>, PoaError> {
         if self.n_reads < self.config.min_reads {
             return Err(PoaError::InsufficientDepth {
@@ -1291,29 +2070,40 @@ impl PoaGraph {
         }
 
         let (topo, _) = topological_order(&self.nodes);
-        let bubbles = find_bubbles(
-            &self.nodes,
-            &topo,
-            self.n_reads,
-            self.config.min_allele_freq,
-        );
 
-        if bubbles.is_empty() {
-            return Ok(vec![self.consensus()?]);
-        }
+        // Try structural bubble phasing first (length variants, SVs, large indels).
+        let structural = find_structural_bubbles(&self.nodes, &topo, self.n_reads, &self.config);
 
-        let (entry, arm_starts) = bubbles
-            .iter()
-            .max_by_key(|(entry, arms)| {
-                arms.iter()
-                    .filter_map(|&arm| self.edge_reads.get(&(*entry, arm)))
-                    .map(|v| v.len())
-                    .min()
-                    .unwrap_or(0)
-            })
-            .unwrap();
-
-        let groups = partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads);
+        let groups = if !structural.is_empty() {
+            phasing_groups(
+                &self.edge_reads,
+                &structural,
+                self.n_reads,
+                self.config.min_reads,
+            )
+        } else {
+            // Fall back to single-best SNP bubble partitioning.
+            let snp_bubbles = find_bubbles(
+                &self.nodes,
+                &topo,
+                self.n_reads,
+                self.config.min_allele_freq,
+            );
+            if snp_bubbles.is_empty() {
+                return Ok(vec![self.consensus()?]);
+            }
+            let (entry, arm_starts) = snp_bubbles
+                .iter()
+                .max_by_key(|(entry, arms)| {
+                    arms.iter()
+                        .filter_map(|&arm| self.edge_reads.get(&(*entry, arm)))
+                        .map(|v| v.len())
+                        .min()
+                        .unwrap_or(0)
+                })
+                .unwrap();
+            partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads)
+        };
 
         if groups.len() < 2 {
             return Ok(vec![self.consensus()?]);

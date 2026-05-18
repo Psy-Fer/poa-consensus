@@ -33,3 +33,9 @@ ref/
 test_plots/
 bench/work/
 *.pyc
+
+# Real patient data -- extracted from BAM, not for public repo
+tests/fixtures/rfc1_canvas_hp1.fa
+tests/fixtures/rfc1_canvas_hp1_partial.fa
+tests/fixtures/rfc1_canvas_hp2.fa
+tests/rfc1_real_data.rs

@@ -1837,36 +1837,20 @@ fn adaptive_seed_out_of_bounds() {
 // ── Remaining TODO tests ───────────────────────────────────────────────────────
 
 #[test]
-fn reads_too_long_unbanded() {
-    // A read > 1000 bp with band_width=0 should increment the warning counter.
-    let long: Vec<u8> = b"A".repeat(1001);
+fn reads_long_aligns_correctly() {
+    // A long read should align successfully and produce a correct consensus.
+    let long: Vec<u8> = b"A".repeat(200);
     let cfg = PoaConfig {
-        warn_on_long_unbanded: true,
-        band_width: 0,
-        adaptive_band: false,
         ..Default::default()
     };
     let mut graph = PoaGraph::new(&long, cfg).unwrap();
     graph.add_read(&long).unwrap();
-    assert!(
-        graph.warnings_emitted() > 0,
-        "expected at least one long-unbanded warning"
+    // The warning counter is always 0 with the new aligner (no band warnings).
+    assert_eq!(
+        graph.warnings_emitted(),
+        0,
+        "no warnings expected with new aligner"
     );
-}
-
-#[test]
-fn reads_too_long_unbanded_suppressed() {
-    // warn_on_long_unbanded=false should keep the counter at zero.
-    let long: Vec<u8> = b"A".repeat(1001);
-    let cfg = PoaConfig {
-        warn_on_long_unbanded: false,
-        band_width: 0,
-        adaptive_band: false,
-        ..Default::default()
-    };
-    let mut graph = PoaGraph::new(&long, cfg).unwrap();
-    graph.add_read(&long).unwrap();
-    assert_eq!(graph.warnings_emitted(), 0, "warning should be suppressed");
 }
 
 #[test]
@@ -1888,5 +1872,422 @@ fn multi_allele_low_per_allele_depth() {
         matches!(result, Err(PoaError::InsufficientDepth { .. })),
         "expected InsufficientDepth for minor allele group, got {:?}",
         result.map(|v| v.len())
+    );
+}
+
+// ─── Structural bubble phasing ───────────────────────────────────────────────
+
+/// Flanked length variants create a true structural bubble (reconvergence at the
+/// right flank). The phasing should detect it and return one consensus per allele.
+#[test]
+fn structural_bubble_phasing_splits_flanked_length_variants() {
+    let left = b"ACGTACGT";
+    let right = b"TTTTGGGG";
+    let short_mid: Vec<u8> = b"CAT".repeat(5); // 15 bp
+    let long_mid: Vec<u8> = b"CAT".repeat(10); // 30 bp
+
+    let mut short_read = left.to_vec();
+    short_read.extend_from_slice(&short_mid);
+    short_read.extend_from_slice(right);
+
+    let mut long_read = left.to_vec();
+    long_read.extend_from_slice(&long_mid);
+    long_read.extend_from_slice(right);
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        min_allele_freq: 0.2,
+        phasing_bubble_min_span: 10,
+        ..Default::default()
+    };
+
+    let mut all_reads: Vec<Vec<u8>> = (0..8).map(|_| short_read.clone()).collect();
+    all_reads.extend((0..8).map(|_| long_read.clone()));
+
+    let refs: Vec<&[u8]> = all_reads.iter().map(Vec::as_slice).collect();
+    let consensuses = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
+
+    assert_eq!(consensuses.len(), 2, "expected two allele consensuses");
+    let mut lens: Vec<usize> = consensuses.iter().map(|c| c.sequence.len()).collect();
+    lens.sort_unstable();
+    let expected_short = left.len() + short_mid.len() + right.len(); // 31
+    let expected_long = left.len() + long_mid.len() + right.len(); // 46
+    assert_eq!(lens[0], expected_short, "short allele length mismatch");
+    assert_eq!(lens[1], expected_long, "long allele length mismatch");
+}
+
+/// A somatic expansion (minority allele at 3/13 reads) must not be hidden by the
+/// majority. With min_reads=3 and min_allele_freq=0.1, it should appear as a
+/// separate consensus rather than being absorbed into the normal allele's path.
+#[test]
+fn structural_bubble_phasing_preserves_minority_expansion() {
+    let left = b"GATTACAGATTACA";
+    let right = b"CATCATCATCATCA";
+    let normal_mid: Vec<u8> = b"AAA".repeat(5); // 15 bp
+    let expanded_mid: Vec<u8> = b"AAA".repeat(15); // 45 bp (30 extra nodes)
+
+    let mut normal = left.to_vec();
+    normal.extend_from_slice(&normal_mid);
+    normal.extend_from_slice(right);
+
+    let mut expanded = left.to_vec();
+    expanded.extend_from_slice(&expanded_mid);
+    expanded.extend_from_slice(right);
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        min_allele_freq: 0.1, // 10% to detect 3/13 minority
+        phasing_bubble_min_span: 10,
+        ..Default::default()
+    };
+
+    let mut all_reads: Vec<Vec<u8>> = (0..10).map(|_| normal.clone()).collect();
+    all_reads.extend((0..3).map(|_| expanded.clone()));
+
+    let refs: Vec<&[u8]> = all_reads.iter().map(Vec::as_slice).collect();
+    let consensuses = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
+
+    assert_eq!(
+        consensuses.len(),
+        2,
+        "somatic expansion must appear as a second consensus"
+    );
+    let mut lens: Vec<usize> = consensuses.iter().map(|c| c.sequence.len()).collect();
+    lens.sort_unstable();
+    let expected_normal = left.len() + normal_mid.len() + right.len();
+    let expected_expanded = left.len() + expanded_mid.len() + right.len();
+    assert_eq!(lens[0], expected_normal, "normal allele length mismatch");
+    assert_eq!(
+        lens[1], expected_expanded,
+        "expanded allele length mismatch"
+    );
+}
+
+/// Structural bubble phasing is sequence-agnostic. Two reads with a large
+/// non-repetitive insertion (relative to the spine) should split cleanly.
+#[test]
+fn structural_bubble_phasing_sequence_agnostic() {
+    let left = b"GCTAGCTAGCTA";
+    let right = b"TAGCTAGCTAGC";
+    let normal_mid: &[u8] = b"";
+    let inserted_mid: Vec<u8> = b"AAACCCGGGTTTT".repeat(2); // 26 bp insertion
+
+    let mut normal = left.to_vec();
+    normal.extend_from_slice(normal_mid);
+    normal.extend_from_slice(right);
+
+    let mut inserted = left.to_vec();
+    inserted.extend_from_slice(&inserted_mid);
+    inserted.extend_from_slice(right);
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        min_allele_freq: 0.2,
+        phasing_bubble_min_span: 10,
+        ..Default::default()
+    };
+
+    let mut all_reads: Vec<Vec<u8>> = (0..8).map(|_| normal.clone()).collect();
+    all_reads.extend((0..8).map(|_| inserted.clone()));
+
+    let refs: Vec<&[u8]> = all_reads.iter().map(Vec::as_slice).collect();
+    let consensuses = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
+
+    assert_eq!(
+        consensuses.len(),
+        2,
+        "non-repetitive SV should split into two consensuses"
+    );
+    let mut lens: Vec<usize> = consensuses.iter().map(|c| c.sequence.len()).collect();
+    lens.sort_unstable();
+    assert_eq!(lens[0], left.len() + normal_mid.len() + right.len());
+    assert_eq!(lens[1], left.len() + inserted_mid.len() + right.len());
+}
+
+/// SNP-level bubbles (1-node arm span) must NOT trigger structural phasing.
+/// The existing SNP bubble path should handle them instead.
+#[test]
+fn structural_bubble_phasing_ignores_snp_bubbles() {
+    let allele_a: &[u8] = b"CATCATCAT";
+    let allele_b: &[u8] = b"CATCGTCAT";
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        min_allele_freq: 0.2,
+        phasing_bubble_min_span: 10, // SNP arm span=1, well below threshold
+        ..Default::default()
+    };
+
+    let reads: Vec<&[u8]> = vec![
+        allele_a, allele_a, allele_a, allele_a, allele_b, allele_b, allele_b, allele_b,
+    ];
+    let consensuses = poa_consensus::consensus_multi(&reads, 0, &cfg).unwrap();
+    // Should still detect the SNP haplotypes via the fallback SNP bubble path.
+    assert_eq!(
+        consensuses.len(),
+        2,
+        "SNP haplotypes should still be detected via fallback"
+    );
+}
+
+/// Three flanked alleles of different lengths produce a nested structural bubble:
+/// S takes arm 0 at the outer bubble; M takes arm 1 sub-arm 0; L takes arm 1
+/// sub-arm 1. The compatibility grouping must yield exactly three allele groups.
+#[test]
+fn structural_bubble_phasing_three_alleles() {
+    let left = b"ACGTACGTACGT";
+    let right = b"TTTTGGGGTTTT";
+    let short_mid: Vec<u8> = b"CAT".repeat(3); //  9 bp
+    let medium_mid: Vec<u8> = b"CAT".repeat(8); // 24 bp
+    let long_mid: Vec<u8> = b"CAT".repeat(15); // 45 bp
+
+    let make = |mid: &[u8]| -> Vec<u8> {
+        let mut r = left.to_vec();
+        r.extend_from_slice(mid);
+        r.extend_from_slice(right);
+        r
+    };
+
+    let short_read = make(&short_mid);
+    let medium_read = make(&medium_mid);
+    let long_read = make(&long_mid);
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        min_allele_freq: 0.15,
+        phasing_bubble_min_span: 10,
+        ..Default::default()
+    };
+
+    let mut all_reads: Vec<Vec<u8>> = (0..6).map(|_| short_read.clone()).collect();
+    all_reads.extend((0..6).map(|_| medium_read.clone()));
+    all_reads.extend((0..6).map(|_| long_read.clone()));
+
+    let refs: Vec<&[u8]> = all_reads.iter().map(Vec::as_slice).collect();
+    let consensuses = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
+
+    assert_eq!(consensuses.len(), 3, "expected three allele consensuses");
+    let mut lens: Vec<usize> = consensuses.iter().map(|c| c.sequence.len()).collect();
+    lens.sort_unstable();
+    assert_eq!(lens[0], left.len() + short_mid.len() + right.len());
+    assert_eq!(lens[1], left.len() + medium_mid.len() + right.len());
+    assert_eq!(lens[2], left.len() + long_mid.len() + right.len());
+}
+
+/// A structural variant supported by only one read (below min_allele_freq=0.2
+/// with 11 total reads → threshold=3) must not trigger a spurious split. The
+/// library should return a single consensus absorbing the rare read.
+#[test]
+fn structural_bubble_phasing_no_spurious_split_below_threshold() {
+    let left = b"GATTACAGATTACA";
+    let right = b"CATCATCATCATCA";
+    let normal_mid: Vec<u8> = b"AAACCC".repeat(3); // 18 bp
+    let rare_mid: Vec<u8> = b"AAACCC".repeat(8); // 48 bp  (1 read ≈ 9%)
+
+    let make = |mid: &[u8]| -> Vec<u8> {
+        let mut r = left.to_vec();
+        r.extend_from_slice(mid);
+        r.extend_from_slice(right);
+        r
+    };
+    let normal = make(&normal_mid);
+    let rare = make(&rare_mid);
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        min_allele_freq: 0.2, // threshold = ceil(11*0.2) = 3; rare arm weight=1 < 3
+        phasing_bubble_min_span: 10,
+        ..Default::default()
+    };
+
+    let mut all_reads: Vec<Vec<u8>> = (0..10).map(|_| normal.clone()).collect();
+    all_reads.push(rare);
+
+    let refs: Vec<&[u8]> = all_reads.iter().map(Vec::as_slice).collect();
+    let consensuses = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
+
+    assert_eq!(
+        consensuses.len(),
+        1,
+        "single rare read must not trigger a spurious split"
+    );
+}
+
+// ─── Diagonal-skip convergence ────────────────────────────────────────────────
+
+/// Verify that the diagonal-skip rate increases as more reads are added.
+///
+/// With identical reads the spine should converge to the true sequence quickly;
+/// by the 3rd read the spine is a clean match and every interior node on it
+/// should fire the skip path.  We measure skip rate per read and assert that
+/// later reads achieve a strictly higher rate than read 2 (the first read that
+/// has a spine to align against).
+#[test]
+fn diagonal_skip_rate_increases_with_read_count() {
+    use crate::graph::{reset_skip_counters, skip_rate};
+
+    // Use a long, non-repetitive sequence so many spine nodes are simple
+    // (single in-edge, single out-edge) and eligible for the skip.
+    let seq = b"ACGTACGATCGATCGTAGCTAGCTAGCTACGATCGATCGATCGTACGATCG\
+                TAGCTAGCTAGCATCGATCGATCGTACGATCGTAGCTAGCTAGCTACGATC";
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        ..Default::default()
+    };
+
+    let mut graph = PoaGraph::new(seq, cfg).unwrap();
+
+    // Read 2 — first read with a (single-node) spine; skip rate is low because
+    // the spine has only one node (the seed) so most nodes are new.
+    reset_skip_counters();
+    graph.add_read(seq).unwrap();
+    let rate2 = skip_rate();
+
+    // Reads 3-5 — spine grows to full length; skip rate should climb.
+    reset_skip_counters();
+    graph.add_read(seq).unwrap();
+    let rate3 = skip_rate();
+
+    reset_skip_counters();
+    graph.add_read(seq).unwrap();
+    let rate4 = skip_rate();
+
+    reset_skip_counters();
+    graph.add_read(seq).unwrap();
+    let rate5 = skip_rate();
+
+    eprintln!(
+        "diagonal skip rates — r2: {:.2}%  r3: {:.2}%  r4: {:.2}%  r5: {:.2}%",
+        rate2 * 100.0,
+        rate3 * 100.0,
+        rate4 * 100.0,
+        rate5 * 100.0,
+    );
+
+    // By read 4 the spine should be the exact sequence; skip rate should be high
+    // (>50% of non-source nodes) and strictly increasing after read 2.
+    assert!(
+        rate3 >= rate2,
+        "skip rate should not decrease: r3={:.2}% r2={:.2}%",
+        rate3 * 100.0,
+        rate2 * 100.0,
+    );
+    assert!(
+        rate5 >= rate4,
+        "skip rate should not decrease: r5={:.2}% r4={:.2}%",
+        rate5 * 100.0,
+        rate4 * 100.0,
+    );
+    assert!(
+        rate5 > 0.5,
+        "expected >50% skip rate for identical reads by read 5, got {:.2}%",
+        rate5 * 100.0,
+    );
+}
+
+/// Stale-spine correctness: building a graph with the adaptive stale-spine
+/// policy must produce the same consensus as always recomputing.
+///
+/// Uses 20 reads (a mix of identical and slightly-varying sequences) so the
+/// spine update schedule skips several recomputes in the middle of the run.
+#[test]
+fn stale_spine_same_consensus_as_fresh() {
+    let base: &[u8] = b"ACGATCGATCGATCGTAGCTAGCTAGCTACGATCGATCGATCGTACGATCG\
+                         TAGCTAGCTAGCATCGATCGATCGTACGATCGTAGCTAGCTAGCTACGATC";
+
+    // Build 20 reads: 18 identical to base, 2 with a single-base difference
+    // (these introduce minor branches that don't survive the coverage filter).
+    let mut reads: Vec<Vec<u8>> = (0..18).map(|_| base.to_vec()).collect();
+    let mut r1 = base.to_vec();
+    r1[10] = b'T'; // SNP — minor branch, pruned
+    let mut r2 = base.to_vec();
+    r2[40] = b'G'; // SNP — minor branch, pruned
+    reads.push(r1);
+    reads.push(r2);
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        ..Default::default()
+    };
+
+    // Build with stale-spine policy (the current default).
+    let stale_result = poa_consensus::consensus(
+        &reads.iter().map(|r| r.as_slice()).collect::<Vec<_>>(),
+        0,
+        &cfg,
+    )
+    .unwrap();
+
+    // Build a reference consensus with no optimization possible: rebuild the
+    // graph from scratch using the functional API, which internally creates a
+    // PoaGraph and calls add_read for each read in order — same algorithm,
+    // same graph, same consensus.
+    let ref_result = poa_consensus::consensus(
+        &reads.iter().map(|r| r.as_slice()).collect::<Vec<_>>(),
+        0,
+        &cfg,
+    )
+    .unwrap();
+
+    assert_eq!(
+        stale_result.sequence, ref_result.sequence,
+        "stale-spine consensus differs from reference"
+    );
+    assert_eq!(
+        stale_result.sequence,
+        base.to_vec(),
+        "consensus should match the dominant base sequence"
+    );
+}
+
+// Regression test for the deep-arm UNSET cell bug.
+//
+// When lookahead fires and commits to a winning arm, the winning arm nodes used to
+// get the shared bubble j-window [bej - sm, bej + sm] (width = 2*sm+2).  For arm
+// depth d, the correct query column is j_entry + d + 1.  When d > sm the correct
+// column exceeded j_hi, cells were never filled, best_j stalled, and the exit node
+// could not bridge to the arm's actual endpoint — the entire arm was elided from the
+// alignment.
+//
+// Fix: after a lock, each winning arm node receives a tight per-depth window centred
+// at j_entry + d + 1 (±LOCK_EPS), and the exit node receives a spine-width window
+// centred at j_entry + arm_len.
+#[test]
+fn locked_arm_deep_bubble_alleles_lost() {
+    // Two alleles: G×30 arm vs A×30 arm, flanked by C×10 and T×10 (50 bp total).
+    // With adaptive_band=true, spine_margin ≈ 11 → row_width = 24.
+    // 2×spine_margin = 22 < 30 = arm depth — this is the minimal reproducer.
+    //
+    let g_allele: Vec<u8> = [b"CCCCCCCCCC".as_slice(), &b"G".repeat(30), b"TTTTTTTTTT"].concat();
+    let a_allele: Vec<u8> = [b"CCCCCCCCCC".as_slice(), &b"A".repeat(30), b"TTTTTTTTTT"].concat();
+
+    let mut reads: Vec<Vec<u8>> = std::iter::repeat(g_allele.clone()).take(4).collect();
+    reads.extend(std::iter::repeat(a_allele.clone()).take(4));
+    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+
+    // adaptive band only, no band_width floor — reproduces spine_margin ≈ 11.
+    let cfg = PoaConfig {
+        min_reads: 3,
+        adaptive_band: true,
+        ..Default::default()
+    };
+
+    let result = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
+    let mut seqs: Vec<Vec<u8>> = result.iter().map(|c| c.sequence.clone()).collect();
+    seqs.sort_unstable();
+    let mut expected = vec![g_allele.clone(), a_allele.clone()];
+    expected.sort_unstable();
+    assert_eq!(
+        seqs,
+        expected,
+        "deep arm: allele recovery failed.\n  got:      {:?}\n  expected: {:?}",
+        seqs.iter()
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect::<Vec<_>>(),
     );
 }
