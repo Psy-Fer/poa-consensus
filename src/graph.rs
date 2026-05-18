@@ -207,53 +207,52 @@ fn materialize_arm_len(nodes: &[Node], start: usize, max_depth: usize) -> usize 
 /// When budget reaches 0 all paths have reconverged — that node is the exit.
 ///
 /// Returns `None` when the graph ends before reconvergence (open-ended bubble).
-fn find_bubble_exit(nodes: &[Node], topo: &[usize], entry_t: usize) -> Option<usize> {
-    let entry_node = topo[entry_t];
-    let nn = nodes.len();
-    let mut in_bubble = vec![false; nn];
-    in_bubble[entry_node] = true;
-
-    let mut outstanding = nodes[entry_node].out_edges.len();
-
-    for (t, &node_idx) in topo.iter().enumerate().skip(entry_t + 1) {
-        let bubble_in = nodes[node_idx]
-            .in_edges
-            .iter()
-            .filter(|&&p| in_bubble[p])
-            .count();
-
-        if bubble_in == 0 {
-            continue;
-        }
-
-        in_bubble[node_idx] = true;
-        outstanding -= bubble_in;
-
-        if outstanding == 0 {
-            return Some(t);
-        }
-
-        outstanding += nodes[node_idx].out_edges.len();
-    }
-
-    None
-}
-
 /// For each topo rank, compute the bubble it belongs to as `Some((entry_t, exit_t))`,
 /// or `None` for spine nodes outside any bubble.
 ///
-/// Bubble nodes restrict the DP to a window sized by the bubble span; spine nodes
-/// use a narrow diagonal window.  All nodes in `entry_t..=exit_t` share the same
-/// entry's j position as their window anchor.
+/// Uses a generation-counter scratch (`gen_mark`) so the inner bubble search never
+/// allocates: each new bubble increments the generation and marks nodes with it
+/// instead of resetting a bool array.
 fn compute_bubble_ranges(nodes: &[Node], topo: &[usize]) -> Vec<Option<(usize, usize)>> {
     let n = topo.len();
+    let nn = nodes.len();
     let mut ranges: Vec<Option<(usize, usize)>> = vec![None; n];
+    // gen_mark[node_idx] == current_gen  ⟺  node is inside the active bubble search.
+    // Allocated once; never cleared between bubbles.
+    let mut gen_mark = vec![0u32; nn];
+    let mut current_gen = 0u32;
+
     let mut t = 0;
     while t < n {
         if nodes[topo[t]].out_edges.len() >= 2 {
-            if let Some(exit_t) = find_bubble_exit(nodes, topo, t) {
-                ranges[t..=exit_t].fill(Some((t, exit_t)));
-                t = exit_t + 1;
+            // Start a new bubble search from entry topo rank t.
+            current_gen = current_gen.wrapping_add(1);
+            let entry_node = topo[t];
+            gen_mark[entry_node] = current_gen;
+            let mut outstanding = nodes[entry_node].out_edges.len();
+            let mut exit_t = None;
+
+            for (tt, &node_idx) in topo.iter().enumerate().skip(t + 1) {
+                let bubble_in = nodes[node_idx]
+                    .in_edges
+                    .iter()
+                    .filter(|&&p| gen_mark[p] == current_gen)
+                    .count();
+                if bubble_in == 0 {
+                    continue;
+                }
+                gen_mark[node_idx] = current_gen;
+                outstanding -= bubble_in;
+                if outstanding == 0 {
+                    exit_t = Some(tt);
+                    break;
+                }
+                outstanding += nodes[node_idx].out_edges.len();
+            }
+
+            if let Some(et) = exit_t {
+                ranges[t..=et].fill(Some((t, et)));
+                t = et + 1;
             } else {
                 // Open-ended bubble: mark everything remaining conservatively.
                 ranges[t..n].fill(Some((t, n - 1)));
@@ -310,25 +309,29 @@ const ARM_MAX_DEPTH: usize = 4096;
 ///
 /// Returns `None` if the arm has internal branching (a nested bubble) or
 /// exceeds the depth cap; both are signals to fall back to windowed DP.
+/// Walk one bubble arm from `start_idx` to (but not including) the exit node,
+/// appending node indices into `out`.  Clears `out` first.
+/// Returns `false` if the arm has an internal branch or exceeds `ARM_MAX_DEPTH`.
 fn collect_arm_nodes(
     nodes: &[Node],
     rank_of: &[usize],
     start_idx: usize,
     exit_t: usize,
-) -> Option<Vec<usize>> {
-    let mut path = Vec::new();
+    out: &mut Vec<usize>,
+) -> bool {
+    out.clear();
     let mut cur = start_idx;
     for _ in 0..ARM_MAX_DEPTH {
         if rank_of[cur] == exit_t {
-            return Some(path);
+            return true;
         }
-        path.push(cur);
+        out.push(cur);
         match nodes[cur].out_edges.as_slice() {
             [(next, _)] => cur = *next,
-            _ => return None, // internal branch or dead end before exit
+            _ => return false,
         }
     }
-    None // depth cap exceeded
+    false
 }
 
 /// Scores the first `min(LOOKAHEAD_K, arm.len(), query[j..].len())` bases of
@@ -485,9 +488,9 @@ fn slide_lock(
 // ─── Bubble-aware DP alignment ────────────────────────────────────────────────
 
 /// Half-width of the DP band applied to spine (non-bubble) nodes.
-/// Covers ±SPINE_MARGIN query positions around the expected diagonal.
-/// 50 accommodates up to ~10 % indel rate over a 500-node spine segment.
-const SPINE_MARGIN: usize = 50;
+/// Minimum SPINE_MARGIN when nothing else constrains it (no band specified).
+/// Covers ±SPINE_MARGIN_MIN query positions for unbanded or wide-band configs.
+const SPINE_MARGIN_MIN: usize = 50;
 
 /// Align `query` against the graph using spine-guided affine-gap DAG DP.
 ///
@@ -572,18 +575,27 @@ fn align(
     // the exit node naturally reads only from the winning arm's predecessors.
     let mut lookahead_skip = vec![false; nn];
 
+    // Spine margin: matches the DP band width so memory usage scales with the
+    // configured band rather than always allocating SPINE_MARGIN_MIN columns.
+    // Uses the same adaptive formula as main (b + f*L), floored at SPINE_MARGIN_MIN
+    // only when band_width=0 and adaptive_band=false (unbanded / no guidance).
+    let spine_margin: usize = if cfg.adaptive_band {
+        let w = cfg.adaptive_band_b
+            + (cfg.adaptive_band_f * l as f32).ceil() as usize;
+        let w = if cfg.band_width > 0 { w.max(cfg.band_width) } else { w };
+        w.max(4)
+    } else if cfg.band_width > 0 {
+        cfg.band_width
+    } else {
+        SPINE_MARGIN_MIN
+    };
+
     // Banded DP tables.  Each row stores j = j_lo_arr[t]..=j_hi_arr[t] (j >= 1).
-    // Spine rows use ±SPINE_MARGIN around the diagonal; bubble rows widen by the
+    // Spine rows use ±spine_margin around the diagonal; bubble rows widen by the
     // bubble span.  The j=0 del column is stored separately in del0 because
     // m[t][0] and ins[t][0] are structurally UNSET and never stored.
     // +2 ensures the left-edge j-1 access from the next row stays in range.
-    let max_bubble_span = bubble_ranges
-        .iter()
-        .filter_map(|&r| r)
-        .map(|(entry_t, exit_t)| exit_t.saturating_sub(entry_t) + 1)
-        .max()
-        .unwrap_or(0);
-    let row_width = (max_bubble_span + 2 * SPINE_MARGIN + 2).min(l).max(1);
+    let row_width = (2 * spine_margin + 2).min(l).max(1);
 
     let mut del0 = vec![Cell::unset(); n];
     let bsize = n * row_width;
@@ -594,6 +606,10 @@ fn align(
     // j_hi_arr[t] is set when the row is processed; reads before then return UNSET.
     let mut j_lo_arr = vec![1usize; n];
     let mut j_hi_arr = vec![0usize; n];
+
+    // Reusable scratch for bubble-arm materialisation (avoids per-bubble alloc).
+    let mut arm_scratch: Vec<usize> = Vec::new();
+    let mut all_arms: Vec<Vec<usize>> = Vec::new();
 
     for (t, &node_idx) in topo.iter().enumerate() {
         // Lookahead: skip nodes on losing bubble arms entirely.
@@ -630,14 +646,14 @@ fn align(
                     }
                     let bej = bubble_entry_j[entry_t];
                     let bubble_span = exit_t.saturating_sub(entry_t) + 1;
-                    let lo = bej.saturating_sub(SPINE_MARGIN).max(1);
-                    let hi = (bej + bubble_span + SPINE_MARGIN).min(l);
+                    let lo = bej.saturating_sub(spine_margin).max(1);
+                    let hi = (bej + bubble_span.min(spine_margin) + spine_margin).min(l);
                     (lo, hi)
                 }
                 None => {
                     let j_center = j_pred_max.saturating_add(1);
-                    let lo = j_center.saturating_sub(SPINE_MARGIN).max(1);
-                    let hi = (j_center + SPINE_MARGIN).min(l);
+                    let lo = j_center.saturating_sub(spine_margin).max(1);
+                    let hi = (j_center + spine_margin).min(l);
                     (lo, hi)
                 }
             }
@@ -958,15 +974,14 @@ fn align(
                     // Materialise each arm.  Arms with internal branches (nested
                     // bubbles) or exceeding ARM_MAX_DEPTH return None → complex=true
                     // → fall through to windowed DP.
-                    let mut all_arms: Vec<Vec<usize>> = Vec::new();
+                    all_arms.clear();
                     let mut complex = false;
                     for &(arm_start, _) in &nodes[node_idx].out_edges {
-                        match collect_arm_nodes(nodes, rank_of, arm_start, exit_t) {
-                            Some(arm) => all_arms.push(arm),
-                            None => {
-                                complex = true;
-                                break;
-                            }
+                        if collect_arm_nodes(nodes, rank_of, arm_start, exit_t, &mut arm_scratch) {
+                            all_arms.push(arm_scratch.clone());
+                        } else {
+                            complex = true;
+                            break;
                         }
                     }
 
