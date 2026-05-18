@@ -36,6 +36,48 @@ pub(crate) fn skip_rate() -> f64 {
 /// "Not yet filled" sentinel.
 const UNSET: i32 = i32::MIN / 2;
 
+/// Half-width of the per-node j-window given to a locked winning arm node.
+/// Wide enough to absorb ~5 cumulative indels at 5% ONT error rate.
+const LOCK_EPS: usize = 5;
+
+// ─── Align scratch ───────────────────────────────────────────────────────────
+
+/// Per-call scratch reused across `align()` calls to avoid per-call heap
+/// allocation for the lock-window tables.  Both vecs are sorted by node_idx
+/// and binary-searched; they are empty when no lock fired, so the check is
+/// O(1) in the common case.
+struct AlignScratch {
+    /// Locked winning arm nodes: (node_idx, j_center as u32).
+    lock_node_j: Vec<(usize, u32)>,
+    /// Locked exit nodes: (node_idx, j_center as u32).
+    lock_exit_j: Vec<(usize, u32)>,
+}
+
+impl AlignScratch {
+    fn new() -> Self {
+        Self { lock_node_j: Vec::new(), lock_exit_j: Vec::new() }
+    }
+
+    fn clear(&mut self) {
+        self.lock_node_j.clear();
+        self.lock_exit_j.clear();
+    }
+
+    fn get_node_j(&self, node_idx: usize) -> Option<usize> {
+        self.lock_node_j
+            .binary_search_by_key(&node_idx, |&(idx, _)| idx)
+            .ok()
+            .map(|pos| self.lock_node_j[pos].1 as usize)
+    }
+
+    fn get_exit_j(&self, node_idx: usize) -> Option<usize> {
+        self.lock_exit_j
+            .binary_search_by_key(&node_idx, |&(idx, _)| idx)
+            .ok()
+            .map(|pos| self.lock_exit_j[pos].1 as usize)
+    }
+}
+
 #[inline]
 fn safe_add(a: i32, b: i32) -> i32 {
     if a == UNSET {
@@ -77,6 +119,8 @@ pub struct PoaGraph {
     /// Current recompute interval; doubles when the spine is stable, resets
     /// to 1 when it changes significantly.
     spine_interval: usize,
+    /// Reusable scratch for lock-window tables; avoids per-call heap allocation.
+    align_scratch: AlignScratch,
 }
 
 // ─── DP cell ─────────────────────────────────────────────────────────────────
@@ -543,7 +587,9 @@ fn align(
     spine: &[(usize, u8, i32)],
     query: &[u8],
     cfg: &PoaConfig,
+    scratch: &mut AlignScratch,
 ) -> Result<Vec<AlignOp>, PoaError> {
+    scratch.clear();
     let n = topo.len();
     let l = query.len();
     let go = cfg.gap_open;
@@ -641,6 +687,18 @@ fn align(
 
         let (j_lo, j_hi) = if is_source {
             (1usize, row_width.min(l))
+        } else if let Some(j_center) = scratch.get_node_j(node_idx) {
+            // Locked winning arm node: tight per-node window centred at the
+            // exact query column this depth corresponds to.
+            let lo = j_center.saturating_sub(LOCK_EPS).max(1);
+            let hi = (j_center + LOCK_EPS).min(l);
+            (lo, hi)
+        } else if let Some(j_center) = scratch.get_exit_j(node_idx) {
+            // Locked exit node: spine-width window centred at winning arm's
+            // terminal query column, so it reads the arm's actual best cells.
+            let lo = j_center.saturating_sub(spine_margin).max(1);
+            let hi = (j_center + spine_margin).min(l);
+            (lo, hi)
         } else {
             match bubble_ranges[t] {
                 Some((entry_t, exit_t)) => {
@@ -1042,7 +1100,7 @@ fn align(
                         let winner =
                             winner.or_else(|| slide_lock(&all_arms, nodes, query, j_entry));
 
-                        // ── Mark losers ───────────────────────────────────────
+                        // ── Mark losers + lock winning arm windows ────────────
                         if let Some(w) = winner {
                             for (arm_idx, arm) in all_arms.iter().enumerate() {
                                 if arm_idx != w {
@@ -1050,6 +1108,25 @@ fn align(
                                         lookahead_skip[losing_node] = true;
                                     }
                                 }
+                            }
+                            // Give winning arm nodes tight per-depth j-windows
+                            // so cells at the correct query column are always
+                            // filled even when arm depth > spine_margin.
+                            let arm = &all_arms[w];
+                            let arm_len = arm.len();
+                            for (d, &win_node) in arm.iter().enumerate() {
+                                let j_c = (j_entry + d + 1).min(l) as u32;
+                                scratch.lock_node_j.push((win_node, j_c));
+                            }
+                            scratch.lock_node_j.sort_unstable_by_key(|&(idx, _)| idx);
+                            // Exit node: centred at the arm's expected terminal j.
+                            let exit_node = topo[exit_t];
+                            let exit_j = (j_entry + arm_len).min(l) as u32;
+                            // Insert sorted (exit_node may already be present from
+                            // a previous bubble in the same align() call).
+                            match scratch.lock_exit_j.binary_search_by_key(&exit_node, |&(idx, _)| idx) {
+                                Ok(pos) => scratch.lock_exit_j[pos].1 = exit_j.max(scratch.lock_exit_j[pos].1),
+                                Err(pos) => scratch.lock_exit_j.insert(pos, (exit_node, exit_j)),
                             }
                         }
                     }
@@ -1734,6 +1811,7 @@ impl PoaGraph {
             cached_spine: Vec::new(),
             spine_updated_at: 0,
             spine_interval: 1,
+            align_scratch: AlignScratch::new(),
         })
     }
 
@@ -1769,6 +1847,7 @@ impl PoaGraph {
             &self.cached_spine,
             read,
             &self.config,
+            &mut self.align_scratch,
         )?;
         let read_idx = self.n_reads as u32;
         add_to_graph(&mut self.nodes, &mut self.edge_reads, read, &ops, read_idx);
@@ -1886,7 +1965,7 @@ impl PoaGraph {
     ) -> Result<(Vec<AlignOp>, usize, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
         let spine = heaviest_path(&self.nodes, &topo, &rank_of);
-        let ops = align(&self.nodes, &topo, &rank_of, &spine, read, &self.config)?;
+        let ops = align(&self.nodes, &topo, &rank_of, &spine, read, &self.config, &mut AlignScratch::new())?;
         Ok((ops, 0, rank_of))
     }
 
@@ -1897,7 +1976,7 @@ impl PoaGraph {
     ) -> Result<(Vec<AlignOp>, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
         let spine = heaviest_path(&self.nodes, &topo, &rank_of);
-        let ops = align(&self.nodes, &topo, &rank_of, &spine, read, &self.config)?;
+        let ops = align(&self.nodes, &topo, &rank_of, &spine, read, &self.config, &mut AlignScratch::new())?;
         Ok((ops, rank_of))
     }
 

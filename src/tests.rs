@@ -2240,3 +2240,48 @@ fn stale_spine_same_consensus_as_fresh() {
         "consensus should match the dominant base sequence"
     );
 }
+
+// Regression test for the deep-arm UNSET cell bug.
+//
+// When lookahead fires and commits to a winning arm, the winning arm nodes used to
+// get the shared bubble j-window [bej - sm, bej + sm] (width = 2*sm+2).  For arm
+// depth d, the correct query column is j_entry + d + 1.  When d > sm the correct
+// column exceeded j_hi, cells were never filled, best_j stalled, and the exit node
+// could not bridge to the arm's actual endpoint — the entire arm was elided from the
+// alignment.
+//
+// Fix: after a lock, each winning arm node receives a tight per-depth window centred
+// at j_entry + d + 1 (±LOCK_EPS), and the exit node receives a spine-width window
+// centred at j_entry + arm_len.
+#[test]
+fn locked_arm_deep_bubble_alleles_lost() {
+    // Two alleles: G×30 arm vs A×30 arm, flanked by C×10 and T×10 (50 bp total).
+    // With adaptive_band=true, spine_margin ≈ 11 → row_width = 24.
+    // 2×spine_margin = 22 < 30 = arm depth — this is the minimal reproducer.
+    //
+    let g_allele: Vec<u8> = [b"CCCCCCCCCC".as_slice(), &b"G".repeat(30), b"TTTTTTTTTT"].concat();
+    let a_allele: Vec<u8> = [b"CCCCCCCCCC".as_slice(), &b"A".repeat(30), b"TTTTTTTTTT"].concat();
+
+    let mut reads: Vec<Vec<u8>> = std::iter::repeat(g_allele.clone()).take(4).collect();
+    reads.extend(std::iter::repeat(a_allele.clone()).take(4));
+    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+
+    // adaptive band only, no band_width floor — reproduces spine_margin ≈ 11.
+    let cfg = PoaConfig {
+        min_reads: 3,
+        adaptive_band: true,
+        ..Default::default()
+    };
+
+    let result = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
+    let mut seqs: Vec<Vec<u8>> = result.iter().map(|c| c.sequence.clone()).collect();
+    seqs.sort_unstable();
+    let mut expected = vec![g_allele.clone(), a_allele.clone()];
+    expected.sort_unstable();
+    assert_eq!(
+        seqs, expected,
+        "deep arm: allele recovery failed.\n  got:      {:?}\n  expected: {:?}",
+        seqs.iter().map(|s| String::from_utf8_lossy(s).to_string()).collect::<Vec<_>>(),
+        expected.iter().map(|s| String::from_utf8_lossy(s).to_string()).collect::<Vec<_>>(),
+    );
+}
