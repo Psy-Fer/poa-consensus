@@ -580,9 +580,12 @@ fn align(
     // Uses the same adaptive formula as main (b + f*L), floored at SPINE_MARGIN_MIN
     // only when band_width=0 and adaptive_band=false (unbanded / no guidance).
     let spine_margin: usize = if cfg.adaptive_band {
-        let w = cfg.adaptive_band_b
-            + (cfg.adaptive_band_f * l as f32).ceil() as usize;
-        let w = if cfg.band_width > 0 { w.max(cfg.band_width) } else { w };
+        let w = cfg.adaptive_band_b + (cfg.adaptive_band_f * l as f32).ceil() as usize;
+        let w = if cfg.band_width > 0 {
+            w.max(cfg.band_width)
+        } else {
+            w
+        };
         w.max(4)
     } else if cfg.band_width > 0 {
         cfg.band_width

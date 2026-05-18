@@ -27,12 +27,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
             let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             let mut peak = PEAK.load(Ordering::Relaxed);
             while live > peak {
-                match PEAK.compare_exchange_weak(
-                    peak,
-                    live,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
+                match PEAK.compare_exchange_weak(peak, live, Ordering::Relaxed, Ordering::Relaxed) {
                     Ok(_) => break,
                     Err(p) => peak = p,
                 }
@@ -59,7 +54,8 @@ fn reset_peak() {
 
 /// Peak heap increase above baseline since the last reset_peak() call (bytes).
 fn peak_alloc() -> usize {
-    PEAK.load(Ordering::SeqCst).saturating_sub(BASE.load(Ordering::SeqCst))
+    PEAK.load(Ordering::SeqCst)
+        .saturating_sub(BASE.load(Ordering::SeqCst))
 }
 
 // ─── Harness ─────────────────────────────────────────────────────────────────
@@ -231,7 +227,10 @@ fn workload_multi_allele() {
 #[test]
 fn speed_comparison() {
     println!("\n=== POA speed workloads (release, {REPS} reps each) ===\n");
-    println!("  {:<45} {:>14}   {:>12}", "workload", "time/rep", "peak alloc");
+    println!(
+        "  {:<45} {:>14}   {:>12}",
+        "workload", "time/rep", "peak alloc"
+    );
     println!("  {}", "-".repeat(77));
     time_workload("clean reads   (100r × 500bp, 5% err)", workload_clean_reads);
     time_workload("CAG×40        ( 50r × 120bp, 5% err)", workload_cag_repeat);
