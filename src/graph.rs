@@ -2059,8 +2059,11 @@ impl PoaGraph {
     /// Build one consensus per detected allele.
     ///
     /// Structural bubbles (arm span ≥ phasing_bubble_min_span) are phased first using
-    /// cross-bubble compatibility grouping. If no structural bubbles are found, falls
-    /// back to single-best SNP bubble partitioning for substitution haplotypes.
+    /// cross-bubble compatibility grouping. If no structural bubbles are found and the
+    /// alignment was banded, the graph is rebuilt with unbanded alignment so that large
+    /// allele-length differences create a visible Insert-arm bubble; structural phasing
+    /// then retries on the unbanded graph. If still no structural bubble, falls back to
+    /// single-best SNP bubble partitioning for substitution haplotypes.
     pub fn consensus_multi(&self) -> Result<Vec<Consensus>, PoaError> {
         if self.n_reads < self.config.min_reads {
             return Err(PoaError::InsufficientDepth {
@@ -2074,6 +2077,25 @@ impl PoaGraph {
         // Try structural bubble phasing first (length variants, SVs, large indels).
         let structural = find_structural_bubbles(&self.nodes, &topo, self.n_reads, &self.config);
 
+        // If no structural bubble was found and alignment was banded, the band may be too
+        // narrow to create a clean Insert-arm bubble for large allele-length differences.
+        // Rebuild the graph with unbanded alignment (reads include flanking → rotation is
+        // anchored) and recurse once. The config's band settings are zeroed so the recursive
+        // call does not loop.
+        if structural.is_empty()
+            && (self.config.band_width > 0 || self.config.adaptive_band)
+        {
+            let mut cfg2 = self.config.clone();
+            cfg2.band_width = 0;
+            cfg2.adaptive_band = false;
+            let seed = &self.reads[0];
+            let mut g2 = PoaGraph::new(seed, cfg2)?;
+            for read in self.reads.iter().skip(1) {
+                g2.add_read(read)?;
+            }
+            return g2.consensus_multi();
+        }
+
         let groups = if !structural.is_empty() {
             phasing_groups(
                 &self.edge_reads,
@@ -2082,27 +2104,29 @@ impl PoaGraph {
                 self.config.min_reads,
             )
         } else {
-            // Fall back to single-best SNP bubble partitioning.
+            // Unbanded alignment and still no structural bubble. Try SNP bubble
+            // partitioning for substitution haplotypes (same-length alleles).
             let snp_bubbles = find_bubbles(
                 &self.nodes,
                 &topo,
                 self.n_reads,
                 self.config.min_allele_freq,
             );
-            if snp_bubbles.is_empty() {
+            if !snp_bubbles.is_empty() {
+                let (entry, arm_starts) = snp_bubbles
+                    .iter()
+                    .max_by_key(|(entry, arms)| {
+                        arms.iter()
+                            .filter_map(|&arm| self.edge_reads.get(&(*entry, arm)))
+                            .map(|v| v.len())
+                            .min()
+                            .unwrap_or(0)
+                    })
+                    .unwrap();
+                partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads)
+            } else {
                 return Ok(vec![self.consensus()?]);
             }
-            let (entry, arm_starts) = snp_bubbles
-                .iter()
-                .max_by_key(|(entry, arms)| {
-                    arms.iter()
-                        .filter_map(|&arm| self.edge_reads.get(&(*entry, arm)))
-                        .map(|v| v.len())
-                        .min()
-                        .unwrap_or(0)
-                })
-                .unwrap();
-            partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads)
         };
 
         if groups.len() < 2 {

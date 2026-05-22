@@ -355,7 +355,7 @@ pub use graph::PoaGraph;
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
 pub use types::{Consensus, CoverageGap, GapKind, GraphStats, Strand};
 
-// ── Internal helper ───────────────────────────────────────────────────────────
+// ── Internal helpers ─────────────────────────────────────────────────────────
 
 fn build_graph(reads: &[&[u8]], seed_idx: usize, config: PoaConfig) -> Result<PoaGraph, PoaError> {
     let mut graph = PoaGraph::new(reads[seed_idx], config)?;
