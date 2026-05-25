@@ -114,6 +114,10 @@ pub struct GraphStats {
     pub single_support_fraction: f64,
     /// Mean per-column Shannon entropy (bits).
     pub mean_column_entropy: f64,
+    /// Span in bases of the longest arm across all bubbles that meet the
+    /// `min_allele_freq` threshold.  0 when no qualifying bubble exists.
+    /// Arms longer than 4096 nodes are capped at 4096.
+    pub longest_bubble_span: usize,
 }
 
 /// Output of a consensus extraction pass.

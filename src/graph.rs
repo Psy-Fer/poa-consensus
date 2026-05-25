@@ -1722,17 +1722,27 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
     let threshold = (n_reads as f64 * min_allele_freq).ceil() as i32;
     let mut bubble_count = 0usize;
     let mut max_bubble_depth = 0usize;
+    let mut longest_bubble_span = 0usize;
     for nd in nodes {
-        let mut qualifying: Vec<i32> = nd
+        let qualifying: Vec<(usize, i32)> = nd
             .out_edges
             .iter()
             .filter(|&&(_, w)| w >= threshold)
-            .map(|&(_, w)| w)
+            .map(|&(to, w)| (to, w))
             .collect();
         if qualifying.len() >= 2 {
             bubble_count += 1;
-            qualifying.sort_unstable_by(|a, b| b.cmp(a));
-            max_bubble_depth = max_bubble_depth.max(qualifying[1] as usize);
+            let mut weights: Vec<i32> = qualifying.iter().map(|&(_, w)| w).collect();
+            weights.sort_unstable_by(|a, b| b.cmp(a));
+            max_bubble_depth = max_bubble_depth.max(weights[1] as usize);
+            for &(arm_start, _) in &qualifying {
+                let span = if nodes[arm_start].in_edges.len() > 1 {
+                    0 // direct edge to exit: 0-length arm
+                } else {
+                    materialize_arm_len(nodes, arm_start, ARM_MAX_DEPTH)
+                };
+                longest_bubble_span = longest_bubble_span.max(span);
+            }
         }
     }
 
@@ -1762,6 +1772,7 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
         edge_weight_gini,
         single_support_fraction,
         mean_column_entropy,
+        longest_bubble_span,
     }
 }
 
