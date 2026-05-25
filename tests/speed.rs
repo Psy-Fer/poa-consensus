@@ -95,6 +95,33 @@ fn repeat_seq(unit: &[u8], count: usize) -> Vec<u8> {
     unit.repeat(count)
 }
 
+/// Build a random sequence of `len` bp that contains no occurrence of `unit`.
+/// Used for flanks so that unit-counting in the consensus is unambiguous.
+fn make_flank(len: usize, unit: &[u8], seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut seq: Vec<u8> = (0..len).map(|_| random_base(&mut s)).collect();
+    let k = unit.len();
+    let mut i = 0;
+    while i + k <= seq.len() {
+        if &seq[i..i + k] == unit {
+            let j = i + k - 1;
+            let orig = seq[j];
+            seq[j] = b"ACGT".iter().copied().find(|&b| b != orig).unwrap();
+            i += k;
+        } else {
+            i += 1;
+        }
+    }
+    seq
+}
+
+/// Assemble left_flank + repeat×count + right_flank into a single template.
+fn flanked_template(unit: &[u8], count: usize, flank: usize, lseed: u64, rseed: u64) -> Vec<u8> {
+    let left = make_flank(flank, unit, lseed);
+    let right = make_flank(flank, unit, rseed);
+    [left, unit.repeat(count), right].concat()
+}
+
 fn time_workload<F: Fn()>(label: &str, f: F) {
     f(); // warmup (also seeds allocator baseline)
     reset_peak();
@@ -222,6 +249,73 @@ fn workload_multi_allele() {
     let _ = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
 }
 
+// ─── Flanked repeat workloads ────────────────────────────────────────────────
+//
+// Same repeat as the bare variants above, but each read includes non-repetitive
+// flanking sequence on both sides.  The flanks give the minimizer anchor engine
+// unique k-mers to lock onto at the repeat boundaries.
+//
+// With 5% substitution error and k=15, ~46% of k-mers survive unmodified, giving
+// ≈ total_flank_bp × 0.46 / 10 anchors.  The density gate threshold is 15:
+//   100 bp/side (200 bp total) → ~9 anchors → gate rejects, no anchor benefit.
+//   250 bp/side (500 bp total) → ~23 anchors → gate passes, anchors fire.
+
+/// 50 reads × (100bp flank + CAG×40 + 100bp flank) — anchors below threshold.
+fn workload_cag_flanked_100() {
+    let template = flanked_template(b"CAG", 40, 100, 30_001, 40_001);
+    let cfg = PoaConfig {
+        min_reads: 3,
+        band_width: 50,
+        adaptive_band: true,
+        ..Default::default()
+    };
+    let reads: Vec<Vec<u8>> = (0..50).map(|i| mutate(&template, 0.05, 50_000 + i)).collect();
+    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+    let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
+}
+
+/// 50 reads × (250bp flank + CAG×40 + 250bp flank) — anchors above threshold.
+fn workload_cag_flanked_250() {
+    let template = flanked_template(b"CAG", 40, 250, 30_002, 40_002);
+    let cfg = PoaConfig {
+        min_reads: 3,
+        band_width: 50,
+        adaptive_band: true,
+        ..Default::default()
+    };
+    let reads: Vec<Vec<u8>> = (0..50).map(|i| mutate(&template, 0.05, 51_000 + i)).collect();
+    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+    let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
+}
+
+/// 50 reads × (100bp flank + AAGGG×30 + 100bp flank) — anchors below threshold.
+fn workload_aaggg_flanked_100() {
+    let template = flanked_template(b"AAGGG", 30, 100, 30_003, 40_003);
+    let cfg = PoaConfig {
+        min_reads: 3,
+        band_width: 50,
+        adaptive_band: true,
+        ..Default::default()
+    };
+    let reads: Vec<Vec<u8>> = (0..50).map(|i| mutate(&template, 0.05, 52_000 + i)).collect();
+    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+    let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
+}
+
+/// 50 reads × (250bp flank + AAGGG×30 + 250bp flank) — anchors above threshold.
+fn workload_aaggg_flanked_250() {
+    let template = flanked_template(b"AAGGG", 30, 250, 30_004, 40_004);
+    let cfg = PoaConfig {
+        min_reads: 3,
+        band_width: 50,
+        adaptive_band: true,
+        ..Default::default()
+    };
+    let reads: Vec<Vec<u8>> = (0..50).map(|i| mutate(&template, 0.05, 53_000 + i)).collect();
+    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+    let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -245,6 +339,25 @@ fn speed_comparison() {
     time_workload(
         "multi-allele  ( 20r × ~90bp, 5% err)",
         workload_multi_allele,
+    );
+    println!("  {}", "-".repeat(77));
+    println!("  Flanked repeat variants  (anchors inactive at 100bp/side, active at 250bp/side)");
+    println!("  {}", "-".repeat(77));
+    time_workload(
+        "CAG×40 +100bp flank (50r × 320bp, 5% err)",
+        workload_cag_flanked_100,
+    );
+    time_workload(
+        "CAG×40 +250bp flank (50r × 620bp, 5% err)",
+        workload_cag_flanked_250,
+    );
+    time_workload(
+        "AAGGG×30 +100bp flank (50r × 350bp, 5% err)",
+        workload_aaggg_flanked_100,
+    );
+    time_workload(
+        "AAGGG×30 +250bp flank (50r × 650bp, 5% err)",
+        workload_aaggg_flanked_250,
     );
     println!();
 }
