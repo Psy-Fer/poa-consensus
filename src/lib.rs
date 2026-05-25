@@ -335,6 +335,7 @@
 //! - Setting `gap_open = 0` recovers linear gap behaviour where only
 //!   `gap_extend` matters.
 
+pub mod analysis;
 pub mod config;
 pub mod error;
 pub mod flank;
