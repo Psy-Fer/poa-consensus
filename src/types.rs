@@ -58,6 +58,44 @@ impl CoverageGap {
     }
 }
 
+/// One bubble site in the POA graph: a node on the consensus path that has two
+/// or more outgoing arms each supported by at least `min_allele_freq` of reads.
+///
+/// The heaviest arm determines the consensus sequence.  Arms with fewer reads
+/// (but above the frequency threshold) are competing alleles or sequencing
+/// artefacts; callers use `arm_read_counts` and `arm_sequences` to decide which.
+///
+/// `arm_sequences` is empty for arms longer than the internal cap (`ARM_SEQUENCE_CAP`
+/// = 256 bp); use `arm_read_counts` to assess support for large structural variants.
+///
+/// # Example
+/// ```text
+/// // 10 reads: 7 took the CAG×3 arm, 3 took the CAG×4 arm.
+/// site.arm_read_counts  == [7, 3]
+/// site.arm_sequences    == [b"CAGCAGCAG", b"CAGCAGCAGCAG"]
+/// site.is_structural    == true   // length-changing
+///
+/// // The 3-read arm exceeds min_allele_freq=0.25 → consider re-running
+/// // with consensus_multi to separate the two alleles.
+/// ```
+#[derive(Debug, Clone)]
+pub struct BubbleSite {
+    /// Position in the consensus sequence (0-indexed) of the entry node just
+    /// before the bubble branches.  Use this to locate the site in the output.
+    pub consensus_pos: usize,
+    /// Number of reads that traversed each arm, in arm order.  The arm with the
+    /// highest count is the one chosen for the consensus sequence.
+    pub arm_read_counts: Vec<u32>,
+    /// Sequence of each arm (from the first arm node up to but not including the
+    /// exit/reconvergence node).  Empty `Vec` when the arm exceeds 256 bp or is
+    /// a direct edge to the exit (0-length deletion arm).
+    pub arm_sequences: Vec<Vec<u8>>,
+    /// `true` when at least one arm spans `≥ phasing_bubble_min_span` bases.
+    /// Structural bubbles are length-changing variants (indels, repeat-count
+    /// differences); non-structural bubbles are SNPs or short MNPs.
+    pub is_structural: bool,
+}
+
 /// Per-graph statistics computed in a single O(V+E) pass.
 #[derive(Debug, Clone, Default)]
 pub struct GraphStats {
@@ -96,6 +134,14 @@ pub struct Consensus {
     /// size known) or `Unknown` (no spanning read; size completely unknown,
     /// as produced by [`bridged_consensus`]).
     pub gaps: Vec<CoverageGap>,
+    /// Bubble sites on the consensus path where two or more arms each have
+    /// read support above `min_allele_freq`.  Empty when all forks are
+    /// single-arm (no competing allele above threshold).
+    ///
+    /// Each site corresponds to one branching node on the heaviest-path
+    /// consensus.  Inspect `arm_read_counts` and `arm_sequences` to decide
+    /// whether to re-run with [`PoaGraph::consensus_multi`].
+    pub bubble_sites: Vec<BubbleSite>,
 }
 
 impl Consensus {

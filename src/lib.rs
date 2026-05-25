@@ -353,7 +353,7 @@ pub use error::PoaError;
 pub use flank::extract_flanked_region;
 pub use graph::PoaGraph;
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
-pub use types::{Consensus, CoverageGap, GapKind, GraphStats, Strand};
+pub use types::{BubbleSite, Consensus, CoverageGap, GapKind, GraphStats, Strand};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -545,5 +545,6 @@ pub fn bridged_consensus(
         n_reads: left.n_reads + right.n_reads,
         graph_stats: left.graph_stats,
         gaps,
+        bubble_sites: vec![],
     })
 }
