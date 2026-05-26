@@ -22,6 +22,48 @@ BED format (for --bed):
 
 Coordinates below are hg38.  If your BAM is aligned to CHM13/T2T, pass
 --assembly chm13 and supply liftover coordinates via --bed.
+
+Known limitations and locus-specific findings (validated against HG002 HiFi):
+
+  Strand orientation
+    Clinical repeat units for DMPK, ATXN1, ATXN2, ATXN3, and RFC1 are defined
+    on the minus (coding) strand.  SAM/BAM stores reads in plus-strand
+    orientation, so the consensus produced by poa-consensus contains the reverse
+    complement of the clinical unit (e.g. CTG instead of CAG for DMPK).
+    count_units() searches both strands to handle this transparently.  Any
+    downstream tool that inspects the raw consensus bytes must do the same.
+
+  Interrupted repeats (FMR1, ATXN1)
+    FMR1 normal alleles contain AGG interruptions roughly every 9-12 CGG units.
+    The repeat count reported here is the longest uninterrupted CGG run (~9-12),
+    not the total CGG count (~30).  Similarly, ATXN1 normal alleles contain CAT
+    interruptions; the reported count (~14-15) is the longest uninterrupted CAG
+    run, not the total (~26-35).  This is correct behaviour: the longest
+    uninterrupted run is the clinically relevant stability predictor.
+
+  ATXN3 coordinates
+    The coordinates at chr14:92,071,992-92,072,120 match the ExpansionHunter
+    hg38 catalog, but the HG002 HiFi consensus does not show CTG repeats at
+    this location.  Verify with `samtools faidx hg38.fa chr14:92071993-92072120`
+    before trusting the ATXN3 repeat count.
+
+  RFC1 silent truncation (known bug 4 in CLAUDE.md)
+    The CTTTT plus-strand / AAAAG coding-strand 5-mer repeat causes the banded
+    aligner to converge to a wrong diagonal without approaching the band edge.
+    This produces a truncated consensus (~371 bp from an ~861 bp window) with no
+    error reported.  The flanking-anchor pre-processing step is the intended fix.
+    Until then, treat the RFC1 count as a lower bound.
+
+  ATXN2 spurious multi-allele at similar allele lengths
+    When both ATXN2 alleles have similar repeat counts (~22/22 CAG), ONT-level
+    noise bubbles can produce a spurious split (e.g. 8/21 instead of 22/22).
+    Use min_allele_freq >= 0.40 for ONT data to suppress this artefact.
+
+  ONT min_allele_freq sensitivity
+    At ONT error rates (>=4% substitution), the default min_allele_freq = 0.25
+    threshold fires on clean single-allele loci.  Raise to >= 0.40 for ONT.
+    At depth = 3, one error in one read = 33%, which already exceeds 0.25; the
+    effective minimum depth for clean ONT calls is >= 10 reads.
 """
 
 import argparse
