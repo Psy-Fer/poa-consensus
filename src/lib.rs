@@ -341,6 +341,7 @@ pub mod error;
 pub mod flank;
 pub mod graph;
 pub mod orient;
+pub mod seed;
 pub mod types;
 
 #[cfg(feature = "plot")]
@@ -354,6 +355,7 @@ pub use error::PoaError;
 pub use flank::extract_flanked_region;
 pub use graph::PoaGraph;
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
+pub use seed::{select_seed, SeedSelection};
 pub use types::{BubbleSite, Consensus, CoverageGap, GapKind, GraphStats, Strand};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
