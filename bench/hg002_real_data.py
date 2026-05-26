@@ -101,13 +101,15 @@ class Locus:
 # Control regions: non-repetitive exonic/coding regions used as sanity checks.
 HG38_LOCI: list[Locus] = [
     # ── Disease STR loci ──────────────────────────────────────────────────────
-    Locus("HTT",   "chr4",  3_074_877,   3_074_944,   "CAG",   pad=400, note="Huntington disease"),
-    Locus("FMR1",  "chrX",  147_912_048, 147_912_126, "CGG",   pad=400, note="Fragile X syndrome"),
-    Locus("DMPK",  "chr19", 46_272_986,  46_273_024,  "CTG",   pad=400, note="Myotonic dystrophy 1"),
-    Locus("RFC1",  "chr4",  39_348_425,  39_348_494,  "AAGGG", pad=400, note="CANVAS / RFC1 ataxia"),
-    Locus("ATXN3", "chr14", 92_071_968,  92_072_115,  "CAG",   pad=400, note="Spinocerebellar ataxia 3"),
-    Locus("ATXN2", "chr12", 112_036_756, 112_036_823, "CAG",   pad=400, note="Spinocerebellar ataxia 2"),
-    Locus("ATXN1", "chr6",  16_327_867,  16_327_954,  "CAG",   pad=400, note="Spinocerebellar ataxia 1"),
+    # Coordinates are 0-based half-open intervals matching the ExpansionHunter
+    # hg38 variant catalog (github.com/Illumina/ExpansionHunter).
+    Locus("HTT",   "chr4",  3_074_877,    3_074_944,    "CAG",   pad=400, note="Huntington disease"),
+    Locus("FMR1",  "chrX",  147_912_050,  147_912_110,  "CGG",   pad=400, note="Fragile X syndrome"),
+    Locus("DMPK",  "chr19", 45_770_203,   45_770_264,   "CTG",   pad=400, note="Myotonic dystrophy 1"),
+    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAGGG", pad=400, note="CANVAS / RFC1 ataxia"),
+    Locus("ATXN3", "chr14", 92_071_992,   92_072_120,   "CAG",   pad=400, note="Spinocerebellar ataxia 3"),
+    Locus("ATXN2", "chr12", 111_598_950,  111_599_019,  "CAG",   pad=400, note="Spinocerebellar ataxia 2"),
+    Locus("ATXN1", "chr6",  16_327_633,   16_327_723,   "CAG",   pad=400, note="Spinocerebellar ataxia 1"),
     # ── Non-repetitive controls ───────────────────────────────────────────────
     # These should yield a single clean consensus with no bubble sites and
     # depth tracking the local WGS coverage.  Any multi-allele result or
@@ -160,19 +162,24 @@ def detect_assembly(header: str) -> str:
     return "unknown"
 
 
-def detect_platform(header: str) -> str:
-    """Return 'ont', 'hifi', or 'unknown' from @RG PL tags."""
+def detect_platform(header: str, bam_path: Optional[Path] = None) -> str:
+    """Return 'ont', 'hifi', or 'unknown' from @RG tags and BAM filename."""
     for line in header.splitlines():
         if line.startswith("@RG"):
             fields = dict(f.split(":", 1) for f in line.split("\t")[1:] if ":" in f)
-            pl = fields.get("PL", "").upper()
-            pm = fields.get("PM", "").upper()
-            ds = fields.get("DS", "").upper()
-            combined = " ".join([pl, pm, ds])
+            # Concatenate all field values to catch any tag that indicates platform.
+            combined = " ".join(v.upper() for v in fields.values())
             if "ONT" in combined or "NANOPORE" in combined:
                 return "ont"
-            if any(k in combined for k in ("HIFI", "PACBIO", "SEQUEL", "SMRT", " CCS", "REVIO")):
+            if any(k in combined for k in ("HIFI", "PACBIO", "SEQUEL", "SMRT", "CCS", "REVIO")):
                 return "hifi"
+    # Fall back to filename heuristics.
+    if bam_path is not None:
+        name = bam_path.name.lower()
+        if "ont" in name or "nanopore" in name:
+            return "ont"
+        if any(k in name for k in ("hifi", "pb.", "_pb_", "pacbio", "ccs", "revio", "sequel")):
+            return "hifi"
     return "unknown"
 
 # ── Coordinate adjustment ─────────────────────────────────────────────────────
@@ -379,7 +386,7 @@ def main() -> None:
     header = bam_header(args.bam)
     use_chr   = detect_chr_prefix(header)
     assembly  = args.assembly if args.assembly != "auto" else detect_assembly(header)
-    platform  = args.platform if args.platform != "auto" else detect_platform(header)
+    platform  = args.platform if args.platform != "auto" else detect_platform(header, args.bam)
 
     # ── Loci selection ────────────────────────────────────────────────────────
     if args.bed:
