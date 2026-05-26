@@ -60,12 +60,12 @@ const MINI_EPS_BASE: usize = 3;
 /// so anchors are safely disabled when the spine is repetitive and only flank
 /// k-mers would match.
 const MINI_MIN_CHAIN: usize = 15;
-/// Minimum chain density (anchors per base × MINI_W) to trust the chain.
-/// In non-repetitive sequence, density ≈ 1.0 (one anchor per MINI_W bases).
-/// In repetitive sequence, error-induced coincidences produce a sparse chain
-/// (density << 0.5) that is dominated by wrong anchors and must be ignored.
-/// Threshold: chain_len * MINI_W * 2 >= read_len  (≡ density ≥ 0.5 / MINI_W).
-/// Equivalently: require chain_len >= read_len / (2 * MINI_W).
+// Minimum chain density (anchors per base × MINI_W) to trust the chain.
+// In non-repetitive sequence, density ≈ 1.0 (one anchor per MINI_W bases).
+// In repetitive sequence, error-induced coincidences produce a sparse chain
+// (density << 0.5) that is dominated by wrong anchors and must be ignored.
+// Threshold: chain_len * MINI_W * 2 >= read_len  (≡ density ≥ 0.5 / MINI_W).
+// Equivalently: require chain_len >= read_len / (2 * MINI_W).
 
 // ─── Align scratch ───────────────────────────────────────────────────────────
 
@@ -587,14 +587,18 @@ fn compute_minimizers(seq: &[u8], k: usize, w: usize) -> Vec<(u64, usize)> {
         return vec![];
     }
     let n_kmers = n - k + 1;
-    let mask = if k * 2 < 64 { (1u64 << (k * 2)) - 1 } else { u64::MAX };
+    let mask = if k * 2 < 64 {
+        (1u64 << (k * 2)) - 1
+    } else {
+        u64::MAX
+    };
 
     // Rolling 2-bit kmer hash; None at positions containing non-ACGT bases.
     let mut kmer_hashes: Vec<Option<u64>> = Vec::with_capacity(n_kmers);
     let mut hash: u64 = 0;
     let mut valid: usize = 0;
-    for i in 0..n {
-        match encode_base(seq[i]) {
+    for (i, &b) in seq.iter().enumerate() {
+        match encode_base(b) {
             Some(bits) => {
                 hash = ((hash << 2) | bits) & mask;
                 valid += 1;
@@ -617,11 +621,11 @@ fn compute_minimizers(seq: &[u8], k: usize, w: usize) -> Vec<(u64, usize)> {
     for start in 0..=(n_kmers - win) {
         let mut best_hash = u64::MAX;
         let mut best_pos = start;
-        for pos in start..(start + win) {
-            if let Some(h) = kmer_hashes[pos] {
-                if h < best_hash {
-                    best_hash = h;
-                    best_pos = pos;
+        for (off, entry) in kmer_hashes[start..start + win].iter().enumerate() {
+            if let Some(h) = entry {
+                if *h < best_hash {
+                    best_hash = *h;
+                    best_pos = start + off;
                 }
             }
         }
@@ -756,6 +760,7 @@ fn anchor_j_bounds(
 /// constrained by slide-lock windows.  Returns the original window unchanged
 /// when anchors provide no constraint or the intersection is empty (wrong
 /// anchor — correctness fallback to existing window).
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn anchor_refine_spine(
     j_lo: usize,
@@ -832,6 +837,7 @@ fn gsd(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn align(
     nodes: &[Node],
     topo: &[usize],
@@ -2498,9 +2504,7 @@ impl PoaGraph {
         // Rebuild the graph with unbanded alignment (reads include flanking → rotation is
         // anchored) and recurse once. The config's band settings are zeroed so the recursive
         // call does not loop.
-        if structural.is_empty()
-            && (self.config.band_width > 0 || self.config.adaptive_band)
-        {
+        if structural.is_empty() && (self.config.band_width > 0 || self.config.adaptive_band) {
             let mut cfg2 = self.config.clone();
             cfg2.band_width = 0;
             cfg2.adaptive_band = false;

@@ -91,7 +91,10 @@ pub fn select_seed(reads: &[&[u8]], selection: &SeedSelection) -> Result<usize, 
     match selection {
         SeedSelection::Explicit(idx) => {
             if *idx >= reads.len() {
-                Err(PoaError::SeedOutOfBounds { index: *idx, len: reads.len() })
+                Err(PoaError::SeedOutOfBounds {
+                    index: *idx,
+                    len: reads.len(),
+                })
             } else {
                 Ok(*idx)
             }
@@ -104,11 +107,21 @@ pub fn select_seed(reads: &[&[u8]], selection: &SeedSelection) -> Result<usize, 
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 fn shortest(reads: &[&[u8]]) -> usize {
-    reads.iter().enumerate().min_by_key(|(_, r)| r.len()).map(|(i, _)| i).unwrap()
+    reads
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, r)| r.len())
+        .map(|(i, _)| i)
+        .unwrap()
 }
 
 fn longest(reads: &[&[u8]]) -> usize {
-    reads.iter().enumerate().max_by_key(|(_, r)| r.len()).map(|(i, _)| i).unwrap()
+    reads
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, r)| r.len())
+        .map(|(i, _)| i)
+        .unwrap()
 }
 
 fn auto_select(reads: &[&[u8]]) -> Result<usize, PoaError> {
@@ -124,26 +137,34 @@ fn auto_select(reads: &[&[u8]]) -> Result<usize, PoaError> {
     // Global frequency tables: how many reads contribute each k-mer at each end.
     let mut left_freq: HashMap<u64, usize> = HashMap::new();
     let mut right_freq: HashMap<u64, usize> = HashMap::new();
-    for s in &left_sets  { for &h in s { *left_freq.entry(h).or_insert(0) += 1; } }
-    for s in &right_sets { for &h in s { *right_freq.entry(h).or_insert(0) += 1; } }
+    for s in &left_sets {
+        for &h in s {
+            *left_freq.entry(h).or_insert(0) += 1;
+        }
+    }
+    for s in &right_sets {
+        for &h in s {
+            *right_freq.entry(h).or_insert(0) += 1;
+        }
+    }
 
     // End-specific anchors: k-mers common at one end but rare at the other.
     // K-mers frequent at BOTH ends are interior repetitive sequence (e.g. the
     // repeat unit itself) and must be discarded — otherwise partial reads whose
     // interior happens to resemble the opposite flank look spuriously spanning.
     let is_left_anchor = |h: &u64| -> bool {
-        *left_freq.get(h).unwrap_or(&0) >= threshold
-            && *right_freq.get(h).unwrap_or(&0) < threshold
+        *left_freq.get(h).unwrap_or(&0) >= threshold && *right_freq.get(h).unwrap_or(&0) < threshold
     };
     let is_right_anchor = |h: &u64| -> bool {
-        *right_freq.get(h).unwrap_or(&0) >= threshold
-            && *left_freq.get(h).unwrap_or(&0) < threshold
+        *right_freq.get(h).unwrap_or(&0) >= threshold && *left_freq.get(h).unwrap_or(&0) < threshold
     };
 
-    let left_ok: Vec<bool> = left_sets.iter()
+    let left_ok: Vec<bool> = left_sets
+        .iter()
         .map(|s| s.iter().any(is_left_anchor))
         .collect();
-    let right_ok: Vec<bool> = right_sets.iter()
+    let right_ok: Vec<bool> = right_sets
+        .iter()
         .map(|s| s.iter().any(is_right_anchor))
         .collect();
 
@@ -160,7 +181,10 @@ fn auto_select(reads: &[&[u8]]) -> Result<usize, PoaError> {
     let left_only = (0..n).filter(|&i| left_ok[i] && !right_ok[i]).count();
     let right_only = (0..n).filter(|&i| !left_ok[i] && right_ok[i]).count();
     if left_only > 0 && right_only > 0 {
-        return Err(PoaError::NoSpanningReads { left_depth: left_only, right_depth: right_only });
+        return Err(PoaError::NoSpanningReads {
+            left_depth: left_only,
+            right_depth: right_only,
+        });
     }
 
     // Fallback: no cluster structure detected (reads too short, highly
@@ -198,11 +222,27 @@ fn kmers_of(seq: &[u8]) -> HashSet<u64> {
     let mut valid: usize = 0;
     for &b in seq {
         let bits = match b {
-            b'A' | b'a' => { valid += 1; 0u64 }
-            b'C' | b'c' => { valid += 1; 1 }
-            b'G' | b'g' => { valid += 1; 2 }
-            b'T' | b't' => { valid += 1; 3 }
-            _ => { valid = 0; h = 0; continue; }
+            b'A' | b'a' => {
+                valid += 1;
+                0u64
+            }
+            b'C' | b'c' => {
+                valid += 1;
+                1
+            }
+            b'G' | b'g' => {
+                valid += 1;
+                2
+            }
+            b'T' | b't' => {
+                valid += 1;
+                3
+            }
+            _ => {
+                valid = 0;
+                h = 0;
+                continue;
+            }
         };
         h = ((h << 2) | bits) & mask;
         if valid >= TERM_K {
@@ -244,8 +284,14 @@ mod tests {
     #[test]
     fn empty_input_errors() {
         let reads: &[&[u8]] = &[];
-        assert!(matches!(select_seed(reads, &SeedSelection::Auto), Err(PoaError::EmptyInput)));
-        assert!(matches!(select_seed(reads, &SeedSelection::Shortest), Err(PoaError::EmptyInput)));
+        assert!(matches!(
+            select_seed(reads, &SeedSelection::Auto),
+            Err(PoaError::EmptyInput)
+        ));
+        assert!(matches!(
+            select_seed(reads, &SeedSelection::Shortest),
+            Err(PoaError::EmptyInput)
+        ));
         assert!(matches!(
             select_seed(reads, &SeedSelection::Explicit(0)),
             Err(PoaError::EmptyInput)
@@ -256,9 +302,9 @@ mod tests {
 
     // 30-bp flanks: long enough to yield multiple 15-mers, short enough that
     // reads stay manageable.
-    const LEFT_FLANK: &[u8]  = b"ACGTACGTACGTACGTACGTACGTACGTAC"; // 30 bp
+    const LEFT_FLANK: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTAC"; // 30 bp
     const RIGHT_FLANK: &[u8] = b"TGCATGCATGCATGCATGCATGCATGCATG"; // 30 bp
-    const REPEAT: &[u8]      = b"CAT";                              // 3 bp unit
+    const REPEAT: &[u8] = b"CAT"; // 3 bp unit
 
     // Reads must be long enough that the TERM_LEN=50 window at each end does
     // not reach the opposite flank.  Required: read_len > 2 × TERM_LEN = 100 bp.
@@ -267,7 +313,9 @@ mod tests {
 
     fn make_spanning(n_repeat: usize) -> Vec<u8> {
         let mut v = LEFT_FLANK.to_vec();
-        for _ in 0..n_repeat { v.extend_from_slice(REPEAT); }
+        for _ in 0..n_repeat {
+            v.extend_from_slice(REPEAT);
+        }
         v.extend_from_slice(RIGHT_FLANK);
         v
     }
@@ -277,14 +325,18 @@ mod tests {
         // Need read_len > TERM_LEN + LEFT_FLANK_len = 50 + 30 = 80 bp, so
         // the left flank does not appear in the right terminal window.
         let mut v = LEFT_FLANK.to_vec();
-        for _ in 0..n_repeat { v.extend_from_slice(REPEAT); }
+        for _ in 0..n_repeat {
+            v.extend_from_slice(REPEAT);
+        }
         v
     }
 
     fn make_right_only(n_repeat: usize) -> Vec<u8> {
         // Left terminal = pure REPEAT, no LEFT_FLANK k-mers.
         let mut v: Vec<u8> = Vec::new();
-        for _ in 0..n_repeat { v.extend_from_slice(REPEAT); }
+        for _ in 0..n_repeat {
+            v.extend_from_slice(REPEAT);
+        }
         v.extend_from_slice(RIGHT_FLANK);
         v
     }
@@ -293,9 +345,9 @@ mod tests {
     fn auto_picks_shortest_spanning() {
         // Three spanning reads of different lengths; shortest should be selected.
         // All > 100 bp so the TERM_LEN windows do not overlap.
-        let r_short  = make_spanning(15); // 30+45+30 = 105 bp
+        let r_short = make_spanning(15); // 30+45+30 = 105 bp
         let r_medium = make_spanning(20); // 120 bp
-        let r_long   = make_spanning(25); // 135 bp
+        let r_long = make_spanning(25); // 135 bp
         // Place r_short at index 2 to verify index correctness.
         let reads: Vec<&[u8]> = vec![&r_medium, &r_long, &r_short];
         let idx = select_seed(&reads, &SeedSelection::Auto).unwrap();
@@ -307,7 +359,7 @@ mod tests {
         // Mix: left-only and right-only partials alongside two spanning reads.
         // Auto should select the shorter spanning read as seed.
         let s_short = make_spanning(15); // 105 bp — spanning, shortest
-        let s_long  = make_spanning(20); // 120 bp — spanning
+        let s_long = make_spanning(20); // 120 bp — spanning
         // 30 CAT units = 90 bp of repeat → total left_only = 30+90 = 120 bp > 80 ✓
         let left1 = make_left_only(30);
         let left2 = make_left_only(30);
@@ -323,16 +375,20 @@ mod tests {
         // Shortest spanning = s_short at index 0.
         let reads: Vec<&[u8]> = vec![&s_short, &s_long, &left1, &left2, &left3, &right1, &right2];
         let idx = select_seed(&reads, &SeedSelection::Auto).unwrap();
-        assert_eq!(reads[idx].len(), s_short.len(), "expected the shortest spanning read");
+        assert_eq!(
+            reads[idx].len(),
+            s_short.len(),
+            "expected the shortest spanning read"
+        );
     }
 
     #[test]
     fn auto_two_cluster_errors() {
         // All reads are either left-only or right-only, no spanning read.
         // Auto should return NoSpanningReads.
-        let left1  = make_left_only(30);
-        let left2  = make_left_only(30);
-        let left3  = make_left_only(30);
+        let left1 = make_left_only(30);
+        let left2 = make_left_only(30);
+        let left3 = make_left_only(30);
         let right1 = make_right_only(30);
         let right2 = make_right_only(30);
         let right3 = make_right_only(30);
@@ -340,7 +396,10 @@ mod tests {
         // n=6, threshold = max(2, floor(6×0.3)) = 2.
         let reads: Vec<&[u8]> = vec![&left1, &left2, &left3, &right1, &right2, &right3];
         match select_seed(&reads, &SeedSelection::Auto) {
-            Err(PoaError::NoSpanningReads { left_depth, right_depth }) => {
+            Err(PoaError::NoSpanningReads {
+                left_depth,
+                right_depth,
+            }) => {
                 assert_eq!(left_depth, 3);
                 assert_eq!(right_depth, 3);
             }

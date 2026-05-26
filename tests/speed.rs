@@ -269,7 +269,9 @@ fn workload_cag_flanked_100() {
         adaptive_band: true,
         ..Default::default()
     };
-    let reads: Vec<Vec<u8>> = (0..50).map(|i| mutate(&template, 0.05, 50_000 + i)).collect();
+    let reads: Vec<Vec<u8>> = (0..50)
+        .map(|i| mutate(&template, 0.05, 50_000 + i))
+        .collect();
     let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
     let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
 }
@@ -283,7 +285,9 @@ fn workload_cag_flanked_250() {
         adaptive_band: true,
         ..Default::default()
     };
-    let reads: Vec<Vec<u8>> = (0..50).map(|i| mutate(&template, 0.05, 51_000 + i)).collect();
+    let reads: Vec<Vec<u8>> = (0..50)
+        .map(|i| mutate(&template, 0.05, 51_000 + i))
+        .collect();
     let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
     let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
 }
@@ -297,7 +301,9 @@ fn workload_aaggg_flanked_100() {
         adaptive_band: true,
         ..Default::default()
     };
-    let reads: Vec<Vec<u8>> = (0..50).map(|i| mutate(&template, 0.05, 52_000 + i)).collect();
+    let reads: Vec<Vec<u8>> = (0..50)
+        .map(|i| mutate(&template, 0.05, 52_000 + i))
+        .collect();
     let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
     let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
 }
@@ -311,7 +317,9 @@ fn workload_aaggg_flanked_250() {
         adaptive_band: true,
         ..Default::default()
     };
-    let reads: Vec<Vec<u8>> = (0..50).map(|i| mutate(&template, 0.05, 53_000 + i)).collect();
+    let reads: Vec<Vec<u8>> = (0..50)
+        .map(|i| mutate(&template, 0.05, 53_000 + i))
+        .collect();
     let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
     let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
 }

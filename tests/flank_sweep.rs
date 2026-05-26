@@ -17,7 +17,7 @@ use poa_consensus::PoaConfig;
 use std::time::Instant;
 
 const TIME_REPS: u32 = 3; // timing reps (sigma=0 reads)
-const ACC_REPS: u32 = 5;  // accuracy reps (het sigma reads); median is reported
+const ACC_REPS: u32 = 5; // accuracy reps (het sigma reads); median is reported
 const N_READS: usize = 50;
 const SUB: f64 = 0.04;
 const INS: f64 = 0.01;
@@ -140,7 +140,9 @@ fn make_reads(
             let mut rs = base_seed.wrapping_add(i as u64 * 37 + 13);
             let count = if het_sigma > 0.0 {
                 let offset = (normal01(&mut rs) * het_sigma).round() as isize;
-                (modal_count as isize + offset).max(1).min(modal_count as isize * 3) as usize
+                (modal_count as isize + offset)
+                    .max(1)
+                    .min(modal_count as isize * 3) as usize
             } else {
                 modal_count
             };
@@ -151,7 +153,13 @@ fn make_reads(
                 .chain(right.iter())
                 .cloned()
                 .collect();
-            simulate(&template, sub, ins, del, base_seed.wrapping_add(i as u64 * 7 + 31))
+            simulate(
+                &template,
+                sub,
+                ins,
+                del,
+                base_seed.wrapping_add(i as u64 * 7 + 31),
+            )
         })
         .collect()
 }
@@ -172,8 +180,16 @@ fn time_cell(unit: &[u8], modal: usize, flank: usize, base_seed: u64) -> std::ti
     let c = cfg();
     let mut total = std::time::Duration::ZERO;
     for rep in 0..TIME_REPS {
-        let reads =
-            make_reads(unit, modal, flank, SUB, INS, DEL, 0.0, base_seed + rep as u64 * 1_000);
+        let reads = make_reads(
+            unit,
+            modal,
+            flank,
+            SUB,
+            INS,
+            DEL,
+            0.0,
+            base_seed + rep as u64 * 1_000,
+        );
         let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
         let t0 = Instant::now();
         let _ = poa_consensus::consensus(&refs, 0, &c).unwrap();
@@ -183,18 +199,18 @@ fn time_cell(unit: &[u8], modal: usize, flank: usize, base_seed: u64) -> std::ti
 }
 
 /// Median Δunits (consensus_count - modal) over `ACC_REPS` seeds.
-fn accuracy_cell(
-    unit: &[u8],
-    modal: usize,
-    flank: usize,
-    het_sigma: f64,
-    base_seed: u64,
-) -> isize {
+fn accuracy_cell(unit: &[u8], modal: usize, flank: usize, het_sigma: f64, base_seed: u64) -> isize {
     let c = cfg();
     let mut deltas: Vec<isize> = (0..ACC_REPS)
         .map(|rep| {
             let reads = make_reads(
-                unit, modal, flank, SUB, INS, DEL, het_sigma,
+                unit,
+                modal,
+                flank,
+                SUB,
+                INS,
+                DEL,
+                het_sigma,
                 base_seed + rep as u64 * 1_000,
             );
             let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
@@ -215,10 +231,26 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
-    Case { unit: b"CAG",   modal: 20,  label: "CAG×20  ( 60 bp repeat)" },
-    Case { unit: b"CAG",   modal: 40,  label: "CAG×40  (120 bp repeat)" },
-    Case { unit: b"CAG",   modal: 100, label: "CAG×100 (300 bp repeat)" },
-    Case { unit: b"AAGGG", modal: 30,  label: "AAGGG×30 (150 bp repeat)" },
+    Case {
+        unit: b"CAG",
+        modal: 20,
+        label: "CAG×20  ( 60 bp repeat)",
+    },
+    Case {
+        unit: b"CAG",
+        modal: 40,
+        label: "CAG×40  (120 bp repeat)",
+    },
+    Case {
+        unit: b"CAG",
+        modal: 100,
+        label: "CAG×100 (300 bp repeat)",
+    },
+    Case {
+        unit: b"AAGGG",
+        modal: 30,
+        label: "AAGGG×30 (150 bp repeat)",
+    },
 ];
 
 const FLANK_SIZES: &[usize] = &[0, 50, 100, 150, 200, 300];
@@ -253,8 +285,12 @@ fn flank_sweep() {
             .map(|&s| format!("  {:>4}", format!("σ={:.0}", s)))
             .collect();
         println!("  {:>10}  {:>8}{}", "flank/side", "time", sigma_headers);
-        println!("  {:>10}  {:>8}{}", "──────────", "────────",
-            HET_SIGMAS.iter().map(|_| "  ────").collect::<String>());
+        println!(
+            "  {:>10}  {:>8}{}",
+            "──────────",
+            "────────",
+            HET_SIGMAS.iter().map(|_| "  ────").collect::<String>()
+        );
 
         for (fi, &flank) in FLANK_SIZES.iter().enumerate() {
             let anchor_marker = if anchor_fires(flank) { "⚓" } else { "  " };
@@ -268,16 +304,16 @@ fn flank_sweep() {
                 .enumerate()
                 .map(|(si, &sig)| {
                     accuracy_cell(
-                        case.unit, case.modal, flank, sig,
+                        case.unit,
+                        case.modal,
+                        flank,
+                        sig,
                         cell_seed + si as u64 * 100_000,
                     )
                 })
                 .collect();
 
-            let delta_cols: String = deltas
-                .iter()
-                .map(|&d| format!("  {:>+4}", d))
-                .collect();
+            let delta_cols: String = deltas.iter().map(|&d| format!("  {:>+4}", d)).collect();
             println!(
                 "  {:>7} bp{}  {:>6.1?}{}   ({read_bp} bp/read)",
                 flank, anchor_marker, time, delta_cols,

@@ -53,11 +53,7 @@ fn erf(x: f64) -> f64 {
             + t * (-0.284_496_736
                 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     let r = 1.0 - poly * (-x * x).exp();
-    if x >= 0.0 {
-        r
-    } else {
-        -r
-    }
+    if x >= 0.0 { r } else { -r }
 }
 
 /// Standard normal CDF: P(Z ≤ x).
@@ -318,7 +314,7 @@ pub fn max_achievable_accuracy(n: usize, sigma_per_obs: f64) -> f64 {
 /// // 35% threshold: 30% does not meet it.
 /// assert!(has_competing_allele(&result, 0.35).is_none());
 /// ```
-pub fn has_competing_allele<'a>(consensus: &'a Consensus, min_freq: f64) -> Option<&'a BubbleSite> {
+pub fn has_competing_allele(consensus: &Consensus, min_freq: f64) -> Option<&BubbleSite> {
     if consensus.n_reads == 0 {
         return None;
     }
@@ -469,7 +465,11 @@ mod tests {
     use super::*;
     use crate::types::GraphStats;
 
-    fn make_consensus(coverage: Vec<u32>, n_reads: usize, bubble_sites: Vec<BubbleSite>) -> Consensus {
+    fn make_consensus(
+        coverage: Vec<u32>,
+        n_reads: usize,
+        bubble_sites: Vec<BubbleSite>,
+    ) -> Consensus {
         let n = coverage.len();
         Consensus {
             sequence: vec![b'A'; n],
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn accuracy_increases_with_depth() {
         let s = 1.37;
-        let a5  = max_achievable_accuracy(5,  s);
+        let a5 = max_achievable_accuracy(5, s);
         let a20 = max_achievable_accuracy(20, s);
         let a50 = max_achievable_accuracy(50, s);
         assert!(a5 < a20 && a20 < a50);
@@ -711,8 +711,8 @@ mod tests {
 
     #[test]
     fn returns_first_qualifying_site() {
-        let low_site = make_site(vec![9, 1]);     // 10% — below threshold
-        let high_site = make_site(vec![6, 4]);    // 40% — above threshold
+        let low_site = make_site(vec![9, 1]); // 10% — below threshold
+        let high_site = make_site(vec![6, 4]); // 40% — above threshold
         let c = make_consensus(vec![10; 4], 10, vec![low_site, high_site]);
         let found = has_competing_allele(&c, 0.25).unwrap();
         assert_eq!(found.arm_read_counts, vec![6, 4]);
@@ -752,7 +752,7 @@ mod tests {
         let mut cov = vec![10u32; 20];
         cov[0] = 1;
         cov[1] = 1;
-        cov[2] = 1;  // 3/20 = 15% below threshold
+        cov[2] = 1; // 3/20 = 15% below threshold
         let c = make_consensus(cov, 10, vec![]);
         let conf = consensus_confidence(&c, 0.25);
         assert!(conf.low_cov_fraction > 0.1);
