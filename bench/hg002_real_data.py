@@ -103,10 +103,18 @@ HG38_LOCI: list[Locus] = [
     # ── Disease STR loci ──────────────────────────────────────────────────────
     # Coordinates are 0-based half-open intervals matching the ExpansionHunter
     # hg38 variant catalog (github.com/Illumina/ExpansionHunter).
+    #
+    # The repeat unit below is the CLINICAL unit (defined on the coding strand).
+    # Genes on the minus strand (DMPK, ATXN1, ATXN2, ATXN3, RFC1) have their
+    # unit appear as the reverse complement in the reference plus strand.
+    # count_units() searches both strands automatically.
     Locus("HTT",   "chr4",  3_074_877,    3_074_944,    "CAG",   pad=400, note="Huntington disease"),
     Locus("FMR1",  "chrX",  147_912_050,  147_912_110,  "CGG",   pad=400, note="Fragile X syndrome"),
     Locus("DMPK",  "chr19", 45_770_203,   45_770_264,   "CTG",   pad=400, note="Myotonic dystrophy 1"),
-    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAGGG", pad=400, note="CANVAS / RFC1 ataxia"),
+    # RFC1: normal allele is AAAAG (on the minus/coding strand); disease allele is AAGGG.
+    # HG002 is healthy so we count AAAAG.  The revcomp fix in count_units also finds the
+    # plus-strand representation (CTТTТ) automatically.
+    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAAAG", pad=400, note="CANVAS / RFC1 ataxia (normal: AAAAG; disease: AAGGG)"),
     Locus("ATXN3", "chr14", 92_071_992,   92_072_120,   "CAG",   pad=400, note="Spinocerebellar ataxia 3"),
     Locus("ATXN2", "chr12", 111_598_950,  111_599_019,  "CAG",   pad=400, note="Spinocerebellar ataxia 2"),
     Locus("ATXN1", "chr6",  16_327_633,   16_327_723,   "CAG",   pad=400, note="Spinocerebellar ataxia 1"),
@@ -298,6 +306,12 @@ def run_poa(reads: list[bytes], flags: list[str], multi: bool,
 
 # ── Repeat unit counting ──────────────────────────────────────────────────────
 
+_COMP = bytes.maketrans(b"ACGTacgt", b"TGCAtgca")
+
+def _revcomp_unit(unit: str) -> str:
+    return unit.upper().encode().translate(_COMP)[::-1].decode()
+
+
 def count_units(seq: bytes, unit: str) -> int:
     """
     Find the longest contiguous run of `unit` within `seq` and return its count.
@@ -305,25 +319,36 @@ def count_units(seq: bytes, unit: str) -> int:
     The consensus includes flanking context, so dividing total length by unit
     length gives the wrong answer.  Instead, search for the longest run via regex,
     trying all rotational phases of the unit to handle phase ambiguity in the
-    consensus (e.g. CAG / AGC / GCA all represent the same trinucleotide repeat).
+    consensus (e.g. CAG / AGC / GCA all represent the same trinucleotide repeat),
+    AND trying the reverse-complement strand of the unit.
 
-    Example: for unit="CAG" and consensus
-        "...ACGTCAGCAGCAGCAGCAGACGT..."  →  5 (the run of 5 CAG units)
-    not 8 (which is what dividing total length 25 by 3 would give).
+    poa-consensus outputs the consensus in the seed read's orientation, which may
+    be the minus strand.  Searching both strands ensures correct counts regardless
+    of which strand the consensus comes out on.
+
+    Example: for unit="CAG" and consensus on the minus strand
+        "...ACGTCTGCTGCTGCTGCTGACGT..."  →  5 (CTG = revcomp of CAG)
     """
     if not unit or not seq:
         return 0
-    unit_b = unit.upper().encode()
-    n = len(unit_b)
+    n = len(unit)
+    unit_fwd = unit.upper()
+    unit_rc  = _revcomp_unit(unit)
+
     best = 0
-    # Try every rotational phase: CAG, AGC, GCA
-    for i in range(n):
-        rot = unit_b[i:] + unit_b[:i]
-        pat = re.compile(rb"(?:" + rot + rb")+", re.IGNORECASE)
-        for m in pat.finditer(seq):
-            count = len(m.group()) // n
-            if count > best:
-                best = count
+    seen: set[bytes] = set()
+    for strand_unit in (unit_fwd, unit_rc):
+        ub = strand_unit.encode()
+        for i in range(n):
+            rot = ub[i:] + ub[:i]
+            if rot in seen:
+                continue
+            seen.add(rot)
+            pat = re.compile(rb"(?:" + rot + rb")+", re.IGNORECASE)
+            for m in pat.finditer(seq):
+                count = len(m.group()) // n
+                if count > best:
+                    best = count
     return best
 
 # ── BED loader ────────────────────────────────────────────────────────────────
@@ -368,6 +393,8 @@ def main() -> None:
                     help="Disable multi-allele mode (report single consensus only)")
     ap.add_argument("--out", type=Path, metavar="FILE",
                     help="Write TSV results to this file in addition to stdout")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Print each consensus sequence after the summary row")
     args = ap.parse_args()
 
     # ── Sanity checks ─────────────────────────────────────────────────────────
@@ -498,6 +525,12 @@ def main() -> None:
 
         _print_row(col_w, locus.name, chrom, locus.start, locus.end,
                    locus.unit, depth, allele_str, repeat_str, elapsed)
+
+        if args.verbose and alleles:
+            for i, seq in enumerate(alleles):
+                label = f"allele {i+1}" if len(alleles) > 1 else "consensus"
+                preview = seq[:120].decode(errors="replace")
+                print(f"    [{label}] {preview}...")
 
         allele_bp = "; ".join(str(len(a)) for a in (alleles or []))
         repeat_ct = "; ".join(
