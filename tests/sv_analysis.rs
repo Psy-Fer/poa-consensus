@@ -113,10 +113,16 @@ fn normal_at_rich_hifi_error_no_spurious_sv() {
     let result = consensus(&refs, 0, &wide_cfg()).unwrap();
     let conf = consensus_confidence(&result, 0.25);
 
-    assert!(!conf.competing_allele, "HiFi error should not flag competing allele");
+    assert!(
+        !conf.competing_allele,
+        "HiFi error should not flag competing allele"
+    );
     assert!(!should_call_multiallele(&result, 0.25));
     let edit = levenshtein(truth, &result.sequence);
-    assert!(edit <= 2, "AT-rich HiFi consensus should closely match truth; edit={edit}");
+    assert!(
+        edit <= 2,
+        "AT-rich HiFi consensus should closely match truth; edit={edit}"
+    );
 }
 
 /// At ONT error rates (4% sub), individual positions receive errors in enough
@@ -142,7 +148,10 @@ fn normal_ont_error_spurious_bubbles_suppressed_by_higher_threshold() {
     );
     // Edit distance is still close to truth despite noise.
     let edit = levenshtein(truth, &result.sequence);
-    assert!(edit <= 4, "ONT consensus should be close to truth even with noise; edit={edit}");
+    assert!(
+        edit <= 4,
+        "ONT consensus should be close to truth even with noise; edit={edit}"
+    );
 }
 
 /// GC-rich non-repetitive template at HiFi error rates (0.1% sub).
@@ -160,7 +169,10 @@ fn normal_gc_rich_hifi_error_high_confidence() {
         !conf.is_low_confidence(),
         "HiFi GC-rich should be high confidence: {conf:?}"
     );
-    assert_eq!(result.sequence, truth, "near-zero-error reads should recover truth exactly");
+    assert_eq!(
+        result.sequence, truth,
+        "near-zero-error reads should recover truth exactly"
+    );
 }
 
 /// Mixed-composition template: distinct A/C/G/T blocks, no repetitive structure.
@@ -194,10 +206,16 @@ fn normal_long_sequence_hifi_full_coverage() {
     let result = consensus(&refs, 0, &wide_cfg()).unwrap();
     let conf = consensus_confidence(&result, 0.25);
 
-    assert!(!conf.has_gaps, "full-coverage reads should not produce gaps");
+    assert!(
+        !conf.has_gaps,
+        "full-coverage reads should not produce gaps"
+    );
     assert!(!conf.competing_allele);
     let edit = levenshtein(truth, &result.sequence);
-    assert!(edit <= 2, "HiFi long-read consensus should nearly match truth; edit={edit}");
+    assert!(
+        edit <= 2,
+        "HiFi long-read consensus should nearly match truth; edit={edit}"
+    );
 }
 
 /// Depth ramp: same sequence at 5, 10, 15, 20 reads.  `mean_cov` should scale
@@ -220,7 +238,10 @@ fn normal_coverage_monotonically_improves() {
             "mean_cov should be non-decreasing with depth; depth={depth}, mean_cov={:.1}",
             conf.mean_cov
         );
-        assert!(!conf.competing_allele, "no SV flag expected at depth={depth}");
+        assert!(
+            !conf.competing_allele,
+            "no SV flag expected at depth={depth}"
+        );
         prev_mean = conf.mean_cov;
     }
 }
@@ -804,7 +825,7 @@ fn instability_ci_wider_at_sv_locus_than_stable() {
 
     // SV locus: half the reads carry a 12 bp insertion → bimodal lengths.
     let sv_base: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGT"; // 32 bp
-    let sv_ins:  &[u8] = b"ACGTACGTACGTACGTCCCCCCCCCCCCACGTACGTACGTACGT"; // 44 bp
+    let sv_ins: &[u8] = b"ACGTACGTACGTACGTCCCCCCCCCCCCACGTACGTACGTACGT"; // 44 bp
     let mut sv_reads = simulate(sv_base, 10, 0.01, 0.002, 0.002, 9101);
     sv_reads.extend(simulate(sv_ins, 10, 0.01, 0.002, 0.002, 9102));
     let sv_lens: Vec<f64> = sv_reads.iter().map(|r| r.len() as f64).collect();
@@ -835,23 +856,23 @@ fn instability_max_acc_lower_at_sv_locus() {
     let stable_reads = simulate(tmpl, 15, 0.01, 0.005, 0.005, 9200);
     let stable_lens: Vec<f64> = stable_reads.iter().map(|r| r.len() as f64).collect();
     let sm = stable_lens.iter().sum::<f64>() / stable_lens.len() as f64;
-    let sv = stable_lens.iter().map(|&x| (x - sm).powi(2)).sum::<f64>()
-        / (stable_lens.len() - 1) as f64;
+    let sv =
+        stable_lens.iter().map(|&x| (x - sm).powi(2)).sum::<f64>() / (stable_lens.len() - 1) as f64;
     let max_acc_stable = max_achievable_accuracy(stable_reads.len(), sv.sqrt());
 
     // SV: bimodal lengths (32 bp + 12 bp) → large σ.
     let short: &[u8] = b"GCATGCATGCAT"; // 12 bp
-    let mut sv_reads = simulate(tmpl,  8, 0.01, 0.005, 0.005, 9201);
+    let mut sv_reads = simulate(tmpl, 8, 0.01, 0.005, 0.005, 9201);
     sv_reads.extend(simulate(short, 8, 0.01, 0.005, 0.005, 9202));
     let sv_lens: Vec<f64> = sv_reads.iter().map(|r| r.len() as f64).collect();
     let vm = sv_lens.iter().sum::<f64>() / sv_lens.len() as f64;
-    let vv = sv_lens.iter().map(|&x| (x - vm).powi(2)).sum::<f64>()
-        / (sv_lens.len() - 1) as f64;
+    let vv = sv_lens.iter().map(|&x| (x - vm).powi(2)).sum::<f64>() / (sv_lens.len() - 1) as f64;
     let max_acc_sv = max_achievable_accuracy(sv_reads.len(), vv.sqrt());
 
     println!(
         "max_acc: stable={max_acc_stable:.3} (σ={:.2}), sv={max_acc_sv:.3} (σ={:.2})",
-        sv.sqrt(), vv.sqrt()
+        sv.sqrt(),
+        vv.sqrt()
     );
     assert!(
         max_acc_stable > max_acc_sv,
@@ -866,11 +887,11 @@ fn instability_max_acc_lower_at_sv_locus() {
 /// track read counts exactly.
 #[test]
 fn sv_allele_fractions_match_depth_ratio() {
-    let full:    &[u8] = b"AAAACCCCCCCCCCCCTTTTTTTTTTTT"; // 28 bp
-    let deleted: &[u8] = b"AAAATTTTTTTTTTTT";              // 16 bp (12 C's deleted)
+    let full: &[u8] = b"AAAACCCCCCCCCCCCTTTTTTTTTTTT"; // 28 bp
+    let deleted: &[u8] = b"AAAATTTTTTTTTTTT"; // 16 bp (12 C's deleted)
 
-    let reads_full: Vec<Vec<u8>>  = vec![full.to_vec();    12];
-    let reads_del:  Vec<Vec<u8>>  = vec![deleted.to_vec();  4];
+    let reads_full: Vec<Vec<u8>> = vec![full.to_vec(); 12];
+    let reads_del: Vec<Vec<u8>> = vec![deleted.to_vec(); 4];
     let all: Vec<Vec<u8>> = reads_full.into_iter().chain(reads_del).collect();
     let refs: Vec<&[u8]> = all.iter().map(|r| r.as_slice()).collect();
 
@@ -885,10 +906,13 @@ fn sv_allele_fractions_match_depth_ratio() {
     if let Some(site) = has_competing_allele(&result, 0.20) {
         let fracs = allele_fractions(site);
         let sum: f64 = fracs.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9, "fractions must sum to 1.0; sum={sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "fractions must sum to 1.0; sum={sum}"
+        );
 
         let min_frac = fracs.iter().cloned().fold(f64::INFINITY, f64::min);
-        let expected  = 4.0 / 16.0; // 0.25
+        let expected = 4.0 / 16.0; // 0.25
         assert!(
             (min_frac - expected).abs() < 0.10,
             "minority arm should be ≈ 0.25 (4/16 reads); got {min_frac:.3}"
@@ -904,7 +928,7 @@ fn sv_allele_fractions_match_depth_ratio() {
 #[test]
 fn sv_minority_fraction_threshold_boundary() {
     let base: &[u8] = b"AAAAAACCCCCCTTTTTTAAAAAACCCCCC"; // 30 bp
-    let var:  &[u8] = b"AAAAAACCCCCCGGGGGGGGGGGGTTTTTTAAAAAACCCCCC"; // 42 bp (+12 bp G's)
+    let var: &[u8] = b"AAAAAACCCCCCGGGGGGGGGGGGTTTTTTAAAAAACCCCCC"; // 42 bp (+12 bp G's)
 
     // 15% minority (2 var + 11 base = 13 total): below 25% threshold.
     let under: Vec<Vec<u8>> = {
@@ -947,7 +971,7 @@ fn sv_multi_call_clears_competing_allele_flag() {
 
     // Balanced depth: 8 reads each (zero errors for clean bubble detection).
     let mut reads_a: Vec<Vec<u8>> = vec![allele_a.to_vec(); 8];
-    let reads_b: Vec<Vec<u8>>     = vec![allele_b.to_vec(); 8];
+    let reads_b: Vec<Vec<u8>> = vec![allele_b.to_vec(); 8];
     reads_a.extend(reads_b);
     // Seed = reads_a[0] (allele_a); allele_b reads INSERT the C-block.
     let refs: Vec<&[u8]> = reads_a.iter().map(|r| r.as_slice()).collect();
@@ -961,13 +985,19 @@ fn sv_multi_call_clears_competing_allele_flag() {
     );
 
     let alleles = consensus_multi(&refs, 0, &wide_cfg()).unwrap();
-    assert!(alleles.len() >= 2, "must recover ≥ 2 alleles; got {}", alleles.len());
+    assert!(
+        alleles.len() >= 2,
+        "must recover ≥ 2 alleles; got {}",
+        alleles.len()
+    );
 
     for (i, allele) in alleles.iter().enumerate() {
         let conf = consensus_confidence(allele, 0.25);
         println!(
             "allele {i}: len={}, ssf={:.3}, competing={}",
-            allele.sequence.len(), conf.single_support_fraction, conf.competing_allele
+            allele.sequence.len(),
+            conf.single_support_fraction,
+            conf.competing_allele
         );
         assert!(
             !conf.competing_allele,
@@ -980,8 +1010,8 @@ fn sv_multi_call_clears_competing_allele_flag() {
 /// so coverage is uniform.  Only gaps (non-overlapping reads) trigger low-cov.
 #[test]
 fn sv_structural_bubble_does_not_create_low_cov_region() {
-    let full:    &[u8] = b"GCGCGCGCGCGCGCAAAACCCCTTTTGCGCGCGCGCGCGC"; // 42 bp
-    let deleted: &[u8] = b"GCGCGCGCGCGCGCGCGCGCGCGCGCGC";              // 30 bp (12 bp deletion)
+    let full: &[u8] = b"GCGCGCGCGCGCGCAAAACCCCTTTTGCGCGCGCGCGCGC"; // 42 bp
+    let deleted: &[u8] = b"GCGCGCGCGCGCGCGCGCGCGCGCGCGC"; // 30 bp (12 bp deletion)
 
     let reads_f: Vec<Vec<u8>> = vec![full.to_vec(); 10];
     let reads_d: Vec<Vec<u8>> = vec![deleted.to_vec(); 4];
