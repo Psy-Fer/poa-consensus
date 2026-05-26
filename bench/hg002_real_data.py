@@ -33,6 +33,52 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# ── CIGAR helper ──────────────────────────────────────────────────────────────
+
+_CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
+
+
+def _cigar_clip(ref_start: int, cigar: str, target_start: int, target_end: int) -> tuple[int, int]:
+    """
+    Map genomic region [target_start, target_end) to read coordinates (rd_s, rd_e).
+    Returns (-1, -1) if the read does not overlap the target.
+
+    Soft-clipped bases advance the read pointer but not the reference pointer, so
+    they are naturally excluded from the clipped output.  Insertions that fall
+    entirely within [target_start, target_end) are included so the clipped read
+    retains any indels present in that region.
+    """
+    ref = ref_start
+    rd  = 0
+    rd_s = -1
+    rd_e = -1
+
+    for m in _CIGAR_RE.finditer(cigar):
+        n, op = int(m.group(1)), m.group(2)
+        if op in ('M', '=', 'X'):
+            ovlp_s = max(ref, target_start)
+            ovlp_e = min(ref + n, target_end)
+            if ovlp_s < ovlp_e:
+                if rd_s < 0:
+                    rd_s = rd + (ovlp_s - ref)
+                rd_e = rd + (ovlp_e - ref)
+            ref += n
+            rd  += n
+        elif op == 'I':
+            # Include an insertion only if we are past the start and still inside
+            # the target (ref hasn't advanced for I, so use strict < target_end).
+            if rd_s >= 0 and ref > target_start and ref < target_end:
+                rd_e = rd + n
+            rd += n
+        elif op in ('D', 'N'):
+            ref += n
+        elif op == 'S':
+            rd += n
+        # H / P: neither pointer advances
+
+    return rd_s, rd_e
+
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 POA_BIN = Path(__file__).parent.parent / "target/release/poa-consensus"
@@ -125,7 +171,7 @@ def detect_platform(header: str) -> str:
             combined = " ".join([pl, pm, ds])
             if "ONT" in combined or "NANOPORE" in combined:
                 return "ont"
-            if "HIFI" in combined or "PACBIO" in combined or "SEQUEL" in combined:
+            if any(k in combined for k in ("HIFI", "PACBIO", "SEQUEL", "SMRT", " CCS", "REVIO")):
                 return "hifi"
     return "unknown"
 
@@ -152,45 +198,59 @@ def poa_flags(platform: str) -> list[str]:
 
 def extract_reads(bam: Path, chrom: str, start: int, end: int, pad: int) -> list[bytes]:
     """
-    Return sequences of all non-supplementary reads overlapping the padded region.
-    Reads shorter than (end - start) are discarded as non-spanning.
+    Return read sequences trimmed to [start-pad, end+pad] in genomic coordinates.
+
+    Full WGS reads are 10–20 kb; poa-consensus is designed for 50–2000 bp STR
+    reads.  Passing full reads causes the banded DP to fail on the large graph.
+    CIGAR-based clipping reduces each read to just the padded region (~800–1500 bp
+    for STR loci), which is the input size poa-consensus is tuned for.
+
+    Reads whose trimmed length is shorter than the core (start, end) region are
+    dropped as non-spanning.
     """
-    region_len = end - start
+    core_len     = end - start
     padded_start = max(0, start - pad)
     padded_end   = end + pad
-    region = f"{chrom}:{padded_start + 1}-{padded_end}"  # samtools 1-based
+    region = f"{chrom}:{padded_start + 1}-{padded_end}"  # samtools is 1-based
 
-    # samtools view: exclude supplementary (-F 2048) and unmapped (-F 4)
-    cmd_view = [
-        "samtools", "view", "-F", "2052",
-        str(bam), region,
-    ]
+    # -F 2308: exclude unmapped (4) + secondary (256) + supplementary (2048)
+    cmd = ["samtools", "view", "-F", "2308", str(bam), region]
     try:
-        view = subprocess.run(cmd_view, capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
+        view = subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError:
         return []
 
     if not view.stdout:
         return []
 
-    # Parse the SAM output and filter by read length.
     reads = []
     for line in view.stdout.splitlines():
         fields = line.split(b"\t")
         if len(fields) < 10:
             continue
-        seq = fields[9]
-        if seq == b"*":
+        try:
+            pos0  = int(fields[3]) - 1          # SAM POS is 1-based
+            cigar = fields[5].decode()
+            seq   = fields[9]
+        except (ValueError, IndexError):
             continue
-        # Keep reads that are at least as long as the core region.
-        if len(seq) >= region_len:
-            reads.append(seq)
+        if seq == b"*" or cigar == "*":
+            continue
+
+        rd_s, rd_e = _cigar_clip(pos0, cigar, padded_start, padded_end)
+        if rd_s < 0 or rd_e <= rd_s:
+            continue
+
+        trimmed = seq[rd_s:rd_e]
+        if len(trimmed) >= core_len:
+            reads.append(trimmed)
 
     return reads
 
 # ── poa-consensus invocation ──────────────────────────────────────────────────
 
-def run_poa(reads: list[bytes], flags: list[str], multi: bool) -> Optional[list[bytes]]:
+def run_poa(reads: list[bytes], flags: list[str], multi: bool,
+            verbose: bool = False) -> Optional[list[bytes]]:
     """
     Run poa-consensus on `reads` (as FASTA piped to stdin).
     Returns list of consensus sequences, or None on failure.
@@ -207,8 +267,12 @@ def run_poa(reads: list[bytes], flags: list[str], multi: bool) -> Optional[list[
     try:
         r = subprocess.run(cmd, input=fasta, capture_output=True, timeout=60)
     except subprocess.TimeoutExpired:
+        print("  [timeout]", file=sys.stderr)
         return None
     if r.returncode != 0:
+        if r.stderr:
+            msg = r.stderr.decode(errors="replace").strip()
+            print(f"  [poa error: {msg}]", file=sys.stderr)
         return None
 
     # Parse FASTA output: collect all sequences.
