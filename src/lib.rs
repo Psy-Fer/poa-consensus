@@ -350,6 +350,11 @@ pub mod plot;
 #[cfg(test)]
 mod tests;
 
+pub use analysis::{
+    DiagnoseConfig, ConsensusWarnings, LowDepthWarning,
+    InteriorSupportWarning, StructuralCompetingSummary,
+    diagnose,
+};
 pub use config::{AlignmentMode, ConsensusMode, PoaConfig};
 pub use error::PoaError;
 pub use flank::extract_flanked_region;

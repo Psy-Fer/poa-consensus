@@ -458,6 +458,308 @@ pub fn consensus_confidence(consensus: &Consensus, min_allele_freq: f64) -> Cons
     }
 }
 
+// ─── Actionable diagnostics ───────────────────────────────────────────────────
+
+/// Configuration for [`diagnose`].
+///
+/// All thresholds have been chosen from empirical STR benchmarking and match the
+/// CLI defaults.  Override individual fields for domain-specific use cases.
+#[derive(Debug, Clone)]
+pub struct DiagnoseConfig {
+    /// Read count below which a depth warning is emitted (default: 10).
+    pub depth_warn_threshold: usize,
+    /// Read count below which the depth warning is marked critical (default: 5).
+    pub depth_critical_threshold: usize,
+    /// Weight-fraction below which an interior-support warning fires (default: 0.15).
+    ///
+    /// In repeat regions reads frequently bypass specific nodes via deletions, so
+    /// only extreme drops (< ~1-2 reads out of n) are flagged.
+    pub interior_support_threshold: f32,
+    /// Skip this fraction of the consensus from each end when checking interior
+    /// support (default: 0.20 — check the middle 60%).
+    ///
+    /// Boundary positions routinely have lower support from semi-global reads that
+    /// start or end partway through the extracted window.
+    pub boundary_margin: f32,
+    /// When `true` the consensus came from a per-allele partition in multi-allele
+    /// mode.  Uses `depth_allele_threshold` for depth checks and suppresses the
+    /// competing-allele note (the caller is already in multi mode).
+    pub is_allele_partition: bool,
+    /// Depth threshold used when `is_allele_partition = true` (default: 15).
+    ///
+    /// Minority alleles need more reads than single-allele mode because the
+    /// boundary-trim `min_cov` floor is computed from the per-partition count;
+    /// with < 15 reads, terminal units can be clipped.
+    pub depth_allele_threshold: usize,
+}
+
+impl Default for DiagnoseConfig {
+    fn default() -> Self {
+        Self {
+            depth_warn_threshold: 10,
+            depth_critical_threshold: 5,
+            interior_support_threshold: 0.15,
+            boundary_margin: 0.20,
+            is_allele_partition: false,
+            depth_allele_threshold: 15,
+        }
+    }
+}
+
+/// A depth-below-threshold warning.
+#[derive(Debug, Clone)]
+pub struct LowDepthWarning {
+    /// Actual read count used to build this consensus.
+    pub n_reads: usize,
+    /// The threshold that was not met.
+    pub recommended_min: usize,
+    /// `true` when `n_reads < depth_critical_threshold` (default < 5);
+    /// the consensus is likely wrong, not just uncertain.
+    pub is_critical: bool,
+}
+
+/// An interior position with near-zero path-weight support.
+#[derive(Debug, Clone)]
+pub struct InteriorSupportWarning {
+    /// 0-indexed position in the consensus sequence.
+    pub position: usize,
+    /// `path_weights[position] / n_reads` at the flagged position.
+    pub fraction: f32,
+}
+
+/// Summary of structural (length-changing) bubble sites that indicate a second
+/// allele was silently collapsed onto the heaviest path.
+#[derive(Debug, Clone)]
+pub struct StructuralCompetingSummary {
+    /// Number of bubble sites that are structural and above `min_allele_freq`.
+    pub site_count: usize,
+    /// Minority arm read count across all structural sites (the weakest arm).
+    pub min_arm_reads: u32,
+}
+
+/// Actionable diagnostic warnings for a [`Consensus`].
+///
+/// Produced by [`diagnose`].  Fields are `None` / `false` / empty when the
+/// corresponding signal is absent.  All heavy data stays in the source
+/// [`Consensus`]; this struct holds only the derived summary.
+///
+/// Use [`ConsensusWarnings::is_clean`] for a single go/no-go check, or inspect
+/// individual fields for programmatic handling in an application.
+///
+/// # Example
+/// ```
+/// use poa_consensus::{consensus, PoaConfig};
+/// use poa_consensus::analysis::{diagnose, DiagnoseConfig};
+///
+/// let reads: Vec<&[u8]> = vec![b"CAGCAG"; 10];
+/// let cfg = PoaConfig::default();
+/// let result = consensus(&reads, 0, &cfg).unwrap();
+/// let w = diagnose(&result, &DiagnoseConfig::default());
+/// assert!(w.is_clean());
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct ConsensusWarnings {
+    /// Set when read depth is below the configured threshold.
+    pub low_depth: Option<LowDepthWarning>,
+    /// `true` when `Consensus::gaps` is non-empty.
+    /// Inspect `Consensus::gaps` directly for location and size.
+    pub has_coverage_gaps: bool,
+    /// The worst interior position by path-weight fraction, if below the
+    /// threshold.  `None` when the interior is adequately supported.
+    pub interior_low_support: Option<InteriorSupportWarning>,
+    /// Structural competing-allele sites, only populated in single-allele mode
+    /// (`DiagnoseConfig::is_allele_partition = false`).
+    /// Inspect `Consensus::bubble_sites` for the full site data.
+    pub structural_competing: Option<StructuralCompetingSummary>,
+}
+
+impl ConsensusWarnings {
+    /// `true` when no warning or note is set.
+    pub fn is_clean(&self) -> bool {
+        self.low_depth.is_none()
+            && !self.has_coverage_gaps
+            && self.interior_low_support.is_none()
+            && self.structural_competing.is_none()
+    }
+
+    /// Format as human-readable lines suitable for printing to stderr.
+    ///
+    /// Returns pairs of `(is_warning, text)`:
+    /// - `true`  → "warning" level (something may be wrong with the data)
+    /// - `false` → "note" level (informational; action is optional)
+    ///
+    /// `label` is prepended to each message (e.g. `"consensus"` or `"allele 2/3"`).
+    ///
+    /// # Example
+    /// ```
+    /// use poa_consensus::{consensus, PoaConfig};
+    /// use poa_consensus::analysis::{diagnose, DiagnoseConfig};
+    ///
+    /// let reads: &[&[u8]] = &[b"ACGT", b"ACGT", b"ACGT"];
+    /// let result = consensus(reads, 0, &PoaConfig { min_reads: 2, ..Default::default() }).unwrap();
+    /// let w = diagnose(&result, &DiagnoseConfig::default());
+    /// for (is_warning, msg) in w.messages("consensus") {
+    ///     let level = if is_warning { "warning" } else { "note" };
+    ///     eprintln!("poa-consensus: {level}: {msg}");
+    /// }
+    /// ```
+    pub fn messages(&self, label: &str) -> Vec<(bool, String)> {
+        let mut out: Vec<(bool, String)> = Vec::new();
+
+        if let Some(ref d) = self.low_depth {
+            let body = if d.is_critical {
+                format!(
+                    "only {} read(s) — consensus is likely unreliable; \
+                     recommend ≥ {} for accurate results",
+                    d.n_reads, d.recommended_min
+                )
+            } else {
+                format!(
+                    "only {} reads — results may be unreliable; \
+                     recommend ≥ {}",
+                    d.n_reads, d.recommended_min
+                )
+            };
+            out.push((true, format!("{label}: {body}")));
+        }
+
+        if self.has_coverage_gaps {
+            out.push((
+                true,
+                format!("{label}: coverage gap(s) detected — reads do not span the full locus"),
+            ));
+        }
+
+        if let Some(ref s) = self.interior_low_support {
+            out.push((
+                true,
+                format!(
+                    "{label}: near-zero read support ({:.0}%) at interior position {} — \
+                     consensus there is built from very few reads and may be unreliable",
+                    s.fraction * 100.0,
+                    s.position
+                ),
+            ));
+        }
+
+        if let Some(ref sc) = self.structural_competing {
+            out.push((
+                false,
+                format!(
+                    "{label}: {} structural variant site(s) above frequency threshold \
+                     (minority arm: {} read(s)) — if the locus is heterozygous, \
+                     re-run with --multi",
+                    sc.site_count, sc.min_arm_reads
+                ),
+            ));
+        }
+
+        out
+    }
+}
+
+/// Compute actionable diagnostic warnings for a [`Consensus`].
+///
+/// Checks four independent signals:
+///
+/// 1. **Low depth** — `n_reads` below `DiagnoseConfig::depth_warn_threshold`
+///    (or `depth_allele_threshold` in allele-partition mode).
+/// 2. **Coverage gaps** — `Consensus::gaps` is non-empty.
+/// 3. **Near-zero interior support** — any position in the middle
+///    `1 - 2 × boundary_margin` of the consensus has a path-weight fraction
+///    below `interior_support_threshold`.
+/// 4. **Structural competing alleles** — structural bubble sites above
+///    `min_allele_freq` (only in single-allele mode).
+///
+/// No signal overlaps with another; each `Some` or `true` field in the
+/// returned [`ConsensusWarnings`] is independently meaningful.
+///
+/// # Examples
+/// ```
+/// use poa_consensus::{consensus, PoaConfig};
+/// use poa_consensus::analysis::{diagnose, DiagnoseConfig};
+///
+/// let reads: Vec<&[u8]> = vec![b"CAGCAG"; 10];
+/// let cfg = PoaConfig::default();
+/// let result = consensus(&reads, 0, &cfg).unwrap();
+/// let w = diagnose(&result, &DiagnoseConfig::default());
+/// assert!(w.is_clean());
+/// ```
+pub fn diagnose(c: &Consensus, config: &DiagnoseConfig) -> ConsensusWarnings {
+    // ── Depth ────────────────────────────────────────────────────────────────
+    let depth_threshold = if config.is_allele_partition {
+        config.depth_allele_threshold
+    } else {
+        config.depth_warn_threshold
+    };
+    let low_depth = if c.n_reads < depth_threshold {
+        Some(LowDepthWarning {
+            n_reads: c.n_reads,
+            recommended_min: depth_threshold,
+            is_critical: c.n_reads < config.depth_critical_threshold,
+        })
+    } else {
+        None
+    };
+
+    // ── Coverage gaps ─────────────────────────────────────────────────────────
+    let has_coverage_gaps = !c.gaps.is_empty();
+
+    // ── Near-zero interior support ────────────────────────────────────────────
+    let fracs = c.weight_fraction();
+    let flen = fracs.len();
+    let interior_low_support = if flen >= 5 {
+        let lo = ((flen as f32 * config.boundary_margin) as usize).min(flen - 1);
+        let hi = ((flen as f32 * (1.0 - config.boundary_margin)) as usize)
+            .min(flen)
+            .max(lo + 1);
+        fracs[lo..hi]
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .and_then(|(i, &f)| {
+                if f < config.interior_support_threshold {
+                    Some(InteriorSupportWarning {
+                        position: i + lo,
+                        fraction: f,
+                    })
+                } else {
+                    None
+                }
+            })
+    } else {
+        None
+    };
+
+    // ── Structural competing alleles (single-allele mode only) ─────────────────
+    let structural_competing = if !config.is_allele_partition {
+        let structural: Vec<_> = c.bubble_sites.iter().filter(|b| b.is_structural).collect();
+        if structural.is_empty() {
+            None
+        } else {
+            let min_arm_reads = structural
+                .iter()
+                .flat_map(|b| b.arm_read_counts.iter().copied())
+                .filter(|&w| w > 0)
+                .min()
+                .unwrap_or(0);
+            Some(StructuralCompetingSummary {
+                site_count: structural.len(),
+                min_arm_reads,
+            })
+        }
+    } else {
+        None
+    };
+
+    ConsensusWarnings {
+        low_depth,
+        has_coverage_gaps,
+        interior_low_support,
+        structural_competing,
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

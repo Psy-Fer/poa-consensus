@@ -3,7 +3,9 @@ use std::process;
 
 use clap::Parser;
 
-use poa_consensus::{AlignmentMode, PoaConfig, auto_orient};
+use poa_consensus::{
+    AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, auto_orient, diagnose,
+};
 
 /// Build a consensus sequence from FASTA or FASTQ reads using Partial Order
 /// Alignment.
@@ -43,6 +45,12 @@ struct Args {
     /// not all span the full locus).
     #[arg(long)]
     semi_global: bool,
+
+    /// Suppress all warnings and notes on stderr.  The consensus sequence is
+    /// still written to stdout.  Errors that prevent consensus building are
+    /// always printed regardless of this flag.
+    #[arg(short = 'q', long)]
+    quiet: bool,
 }
 
 fn main() {
@@ -128,13 +136,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let n = reads.len();
 
     if args.multi {
-        let alleles = poa_consensus::consensus_multi(&slices, seed_idx, &config)?;
+        let alleles = poa_consensus::consensus_multi(&slices, seed_idx, &config)
+            .map_err(|e| { explain_error(&e, n); e })?;
         let total = alleles.len();
+        let allele_cfg = DiagnoseConfig { is_allele_partition: true, ..DiagnoseConfig::default() };
         for (i, allele) in alleles.iter().enumerate() {
+            if !args.quiet {
+                let label = format!("allele {}/{}", i + 1, total);
+                emit_warnings(&diagnose(allele, &allele_cfg), &label);
+            }
+            // allele.n_reads is the per-partition read count, not the total.
+            // Callers use this to assess whether a minority allele has adequate depth.
             writeln!(
                 out,
-                ">allele_{} reads={n} seed={seed_idx} band={band_desc} allele={}/{}",
+                ">allele_{} reads={} total_reads={n} seed={seed_idx} band={band_desc} allele={}/{}",
                 i + 1,
+                allele.n_reads,
                 i + 1,
                 total
             )?;
@@ -142,13 +159,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(out)?;
         }
     } else {
-        let result = poa_consensus::consensus(&slices, seed_idx, &config)?;
+        let result = poa_consensus::consensus(&slices, seed_idx, &config)
+            .map_err(|e| { explain_error(&e, n); e })?;
+        if !args.quiet {
+            emit_warnings(&diagnose(&result, &DiagnoseConfig::default()), "consensus");
+        }
         writeln!(out, ">consensus reads={n} seed={seed_idx} band={band_desc}")?;
         out.write_all(&result.sequence)?;
         writeln!(out)?;
     }
 
     Ok(())
+}
+
+// ── Diagnostic helpers ────────────────────────────────────────────────────────
+
+/// Emit actionable hints to stderr when consensus building fails.
+fn explain_error(e: &PoaError, n_reads: usize) {
+    match e {
+        PoaError::InsufficientDepth { got, min } => {
+            eprintln!(
+                "poa-consensus: error: only {got} read(s) provided, minimum is {min}"
+            );
+            if *got > 0 {
+                eprintln!(
+                    "  hint: use --min-reads {got} to lower the floor (accuracy will \
+                     suffer at low depth)"
+                );
+            }
+        }
+        PoaError::BandTooNarrow { configured, required } => {
+            eprintln!(
+                "poa-consensus: error: band width {configured} is too narrow \
+                 (need ≥ {required} for this read set)"
+            );
+            eprintln!("  hint: try --adaptive-band, or --band-width {required}");
+        }
+        PoaError::NoSpanningReads { left_depth, right_depth } => {
+            eprintln!(
+                "poa-consensus: error: no read spans the full locus \
+                 ({left_depth} left-only, {right_depth} right-only reads)"
+            );
+            eprintln!(
+                "  hint: if reads are split into two non-overlapping groups, \
+                 use bridged_consensus() to assemble each side separately"
+            );
+        }
+        _ => {} // Display impl covers the remaining variants
+    }
+    let _ = n_reads; // reserved for future per-depth guidance
+}
+
+/// Format and print each message from a [`ConsensusWarnings`] to stderr.
+fn emit_warnings(warnings: &poa_consensus::ConsensusWarnings, label: &str) {
+    for (is_warning, msg) in warnings.messages(label) {
+        let level = if is_warning { "warning" } else { "note" };
+        eprintln!("poa-consensus: {level}: {msg}");
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
