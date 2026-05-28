@@ -351,9 +351,8 @@ pub mod plot;
 mod tests;
 
 pub use analysis::{
-    DiagnoseConfig, ConsensusWarnings, LowDepthWarning,
-    InteriorSupportWarning, StructuralCompetingSummary,
-    diagnose,
+    ConsensusWarnings, DiagnoseConfig, InteriorSupportWarning, LowDepthWarning,
+    StructuralCompetingSummary, diagnose,
 };
 pub use config::{AlignmentMode, ConsensusMode, PoaConfig};
 pub use error::PoaError;
