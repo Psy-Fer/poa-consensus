@@ -1,14 +1,14 @@
 # poa-consensus
 
-**This repo is currently under active development with parts of the core algorithms changing as I test various methods**
-
-Please wait for a release before "trusting" anything from this repo.
-
----
+[![CI](https://github.com/Psy-Fer/poa-consensus/actions/workflows/ci.yml/badge.svg)](https://github.com/Psy-Fer/poa-consensus/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/poa-consensus.svg)](https://crates.io/crates/poa-consensus)
+[![docs.rs](https://docs.rs/poa-consensus/badge.svg)](https://docs.rs/poa-consensus)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
 A pure-Rust banded Partial Order Alignment (POA) library for building consensus sequences from a set of reads.
 
-POA aligns reads into a directed acyclic graph (DAG) using affine-gap dynamic programming (separate scoring for gap open and gap extension) and extracts consensus by following the heaviest (most-supported) path. Insertions and deletions create branches resolved by read support.
+POA aligns reads into a directed acyclic graph (DAG) using affine-gap dynamic programming and extracts consensus by following the heaviest (most-supported) path. Insertions and deletions create branches resolved by read support.
 
 **Target use cases:** short tandem repeat (STR) loci, amplicon consensus, structural variants, per-locus nanopore or HiFi read sets (50 bp to ~20 kb with banded DP). Can be paired with [`bedpull`](https://github.com/Psy-Fer/bedpull) for building a consensus of extracted sequences.
 
@@ -24,7 +24,7 @@ poa-consensus = "0.1"
 ### Functional API
 
 ```rust
-use poa_consensus::{consensus, consensus_multi, PoaConfig};
+use poa_consensus::{consensus, consensus_multi, consensus_adaptive, PoaConfig};
 
 let reads: Vec<&[u8]> = vec![
     b"CATCATCAT",
@@ -39,6 +39,11 @@ println!("{}", String::from_utf8_lossy(&result.sequence));
 
 // Multi-allele: returns one Consensus per detected allele.
 let alleles = consensus_multi(&reads, 0, &PoaConfig::default())?;
+
+// Adaptive two-pass: inspects graph statistics after pass 1 and automatically
+// chooses multi-allele split, noise tightening, or semi-global switch for pass 2.
+// Always returns a Vec<Consensus> (one element for single-allele outcomes).
+let alleles = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
 ```
 
 ### Stateful API
@@ -57,17 +62,18 @@ let stats     = graph.stats();
 println!("bubbles: {}", stats.bubble_count);
 ```
 
-The stateful API lets you inspect graph state between reads and reuse pre-allocated buffers across calls which is important for high-throughput per-locus pipelines.
+The stateful API lets you inspect graph state between reads and reuse pre-allocated buffers across calls, which is important for high-throughput per-locus pipelines.
 
-### Two-pass adaptive mode
+### Seed selection
 
 ```rust
-use poa_consensus::{consensus_adaptive, PoaConfig};
+use poa_consensus::{select_seed, SeedSelection};
 
-// Pass 1 builds the graph and computes GraphStats.
-// Pass 2 is chosen automatically: multi-allele split, noise tightening,
-// or semi-global switch, depending on what the stats reveal.
-let alleles = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
+// Automatically find the shortest fully-spanning read using terminal k-mer anchors.
+// Falls back to longest read when no cluster structure is detected.
+// Returns Err(NoSpanningReads) when reads split into two non-overlapping groups.
+let seed_idx = select_seed(&reads, &SeedSelection::Auto)?;
+let result = consensus(&reads, seed_idx, &PoaConfig::default())?;
 ```
 
 ### Orientation utilities
@@ -76,9 +82,26 @@ let alleles = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
 use poa_consensus::{auto_orient, reverse_complement};
 
 // Orient all reads to match the strand of reads[seed_idx] before POA.
-// Uses kmer matching
 let oriented = auto_orient(&reads, seed_idx);
 ```
+
+### Diagnostics
+
+```rust
+use poa_consensus::{diagnose, DiagnoseConfig};
+
+let result = consensus(&reads, 0, &PoaConfig::default())?;
+let warnings = diagnose(&result, &DiagnoseConfig::default());
+
+if !warnings.is_clean() {
+    for (is_warning, msg) in warnings.messages("consensus") {
+        let level = if is_warning { "warning" } else { "note" };
+        eprintln!("{level}: {msg}");
+    }
+}
+```
+
+`diagnose` checks four independent signals: read depth, coverage gaps, near-zero interior support, and structural competing alleles. All signals are also available as structured fields on `ConsensusWarnings` for programmatic handling.
 
 ## CLI
 
@@ -87,8 +110,10 @@ cargo install poa-consensus --features cli
 ```
 
 ```
-poa-consensus reads.fa          # FASTA or FASTQ, auto-detected
-poa-consensus reads.fa --multi  # multi-allele mode
+poa-consensus reads.fa                    # FASTA or FASTQ, auto-detected
+poa-consensus reads.fa --multi            # multi-allele mode
+poa-consensus reads.fa --adaptive-band    # recommended for reads > 1 kb
+poa-consensus reads.fa --quiet            # suppress warnings; errors always printed
 ```
 
 ## Feature flags
@@ -100,9 +125,9 @@ poa-consensus reads.fa --multi  # multi-allele mode
 
 Default build: library only, zero external dependencies.
 
-## LLM disclosure
+## AI disclosure
 
-An LLM was used in the creation of this library. I was building bladerunner, and STR detector/genotyper and found the limitations of other POA crates, so after prototyping one inside bladerunner, I spun it out into this crate. Claude was used to help speed that along.
+This library was developed with AI assistance (Claude). Architecture decisions, testing, validation, and algorithm designs, are the author's own. AI tooling served as an accelerator over existing skill. The library originated from prototyping a POA implementation inside [`bladerunner`](https://github.com/Psy-Fer/bladerunner), a nanopore STR detector and genotyper, and was spun out as a standalone crate when existing POA crates did not meet the throughput and API requirements of that use case.
 
 ## License
 
