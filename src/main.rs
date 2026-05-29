@@ -134,10 +134,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let n = reads.len();
 
     if args.multi {
-        let alleles = poa_consensus::consensus_multi(&slices, seed_idx, &config).map_err(|e| {
-            explain_error(&e, n);
-            e
-        })?;
+        let alleles = poa_consensus::consensus_multi(&slices, seed_idx, &config)
+            .inspect_err(|e| explain_error(e, n))?;
         let total = alleles.len();
         let allele_cfg = DiagnoseConfig {
             is_allele_partition: true,
@@ -162,10 +160,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(out)?;
         }
     } else {
-        let result = poa_consensus::consensus(&slices, seed_idx, &config).map_err(|e| {
-            explain_error(&e, n);
-            e
-        })?;
+        let result = poa_consensus::consensus(&slices, seed_idx, &config)
+            .inspect_err(|e| explain_error(e, n))?;
         if !args.quiet {
             emit_warnings(&diagnose(&result, &DiagnoseConfig::default()), "consensus");
         }
