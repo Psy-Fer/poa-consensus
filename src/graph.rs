@@ -1,6 +1,6 @@
 use crate::config::{AlignmentMode, ConsensusMode, PoaConfig};
 use crate::error::PoaError;
-use crate::types::{Consensus, CoverageGap, GapKind, GraphStats};
+use crate::types::{BubbleSite, Consensus, CoverageGap, GapKind, GraphStats};
 use std::collections::HashMap;
 
 #[cfg(test)]
@@ -39,6 +39,33 @@ const UNSET: i32 = i32::MIN / 2;
 /// Half-width of the per-node j-window given to a locked winning arm node.
 /// Wide enough to absorb ~5 cumulative indels at 5% ONT error rate.
 const LOCK_EPS: usize = 5;
+
+// ─── Minimizer anchoring constants ───────────────────────────────────────────
+
+/// k-mer length for spine/read minimizer seeding.
+const MINI_K: usize = 15;
+/// Minimizer window width: select the minimum-hash k-mer from each window of
+/// this many consecutive k-mers.  Density ≈ 1/MINI_W anchors per base.
+const MINI_W: usize = 10;
+/// Minimum per-anchor j-window half-width (absorbs indel errors near anchors).
+/// Covers ~3 cumulative indels; keeps the correct j inside the intersection when
+/// the spine and read have small local alignment offsets at the anchor position.
+const MINI_EPS_BASE: usize = 3;
+/// Minimum anchor chain length required before applying any anchor refinement.
+/// Chosen to be above the expected number of error-induced wrong anchors in a
+/// repetitive read (~1-3 for typical ONT depths), but below the expected number
+/// of correct anchors in a non-repetitive read (≈read_len × 0.46 / MINI_W for
+/// 5% error / k=15; ~23 for a 500bp read).  Flank-only reads (200bp of flank
+/// from 100bp ANCHOR_PAD × 2) yield ≈9 flank anchors — below this threshold,
+/// so anchors are safely disabled when the spine is repetitive and only flank
+/// k-mers would match.
+const MINI_MIN_CHAIN: usize = 15;
+// Minimum chain density (anchors per base × MINI_W) to trust the chain.
+// In non-repetitive sequence, density ≈ 1.0 (one anchor per MINI_W bases).
+// In repetitive sequence, error-induced coincidences produce a sparse chain
+// (density << 0.5) that is dominated by wrong anchors and must be ignored.
+// Threshold: chain_len * MINI_W * 2 >= read_len  (≡ density ≥ 0.5 / MINI_W).
+// Equivalently: require chain_len >= read_len / (2 * MINI_W).
 
 // ─── Align scratch ───────────────────────────────────────────────────────────
 
@@ -124,6 +151,11 @@ pub struct PoaGraph {
     spine_interval: usize,
     /// Reusable scratch for lock-window tables; avoids per-call heap allocation.
     align_scratch: AlignScratch,
+    /// Minimizer index over the cached spine sequence; rebuilt whenever
+    /// `cached_spine` is refreshed.  Maps k-mer hash → spine rank (index into
+    /// `cached_spine`).  Only hashes that appear exactly once in the spine are
+    /// stored — duplicate k-mers cannot serve as unambiguous anchors.
+    spine_mers: HashMap<u64, u32>,
 }
 
 // ─── DP cell ─────────────────────────────────────────────────────────────────
@@ -532,6 +564,228 @@ fn slide_lock(
     }
 }
 
+// ─── Minimizer anchoring ─────────────────────────────────────────────────────
+
+#[inline]
+fn encode_base(b: u8) -> Option<u64> {
+    match b {
+        b'A' | b'a' => Some(0),
+        b'C' | b'c' => Some(1),
+        b'G' | b'g' => Some(2),
+        b'T' | b't' => Some(3),
+        _ => None,
+    }
+}
+
+/// Compute minimizers for `seq`: for each sliding window of `w` consecutive
+/// k-mers, select the (hash, start-position) pair with the minimum hash.
+/// Returns deduplicated (hash, seq_position) pairs in order of appearance.
+/// K-mers containing non-ACGT bases are skipped (treated as invalid).
+fn compute_minimizers(seq: &[u8], k: usize, w: usize) -> Vec<(u64, usize)> {
+    let n = seq.len();
+    if n < k {
+        return vec![];
+    }
+    let n_kmers = n - k + 1;
+    let mask = if k * 2 < 64 {
+        (1u64 << (k * 2)) - 1
+    } else {
+        u64::MAX
+    };
+
+    // Rolling 2-bit kmer hash; None at positions containing non-ACGT bases.
+    let mut kmer_hashes: Vec<Option<u64>> = Vec::with_capacity(n_kmers);
+    let mut hash: u64 = 0;
+    let mut valid: usize = 0;
+    for (i, &b) in seq.iter().enumerate() {
+        match encode_base(b) {
+            Some(bits) => {
+                hash = ((hash << 2) | bits) & mask;
+                valid += 1;
+            }
+            None => {
+                hash = 0;
+                valid = 0;
+            }
+        }
+        if i + 1 >= k {
+            kmer_hashes.push(if valid >= k { Some(hash) } else { None });
+        }
+    }
+
+    // Slide a window of w k-mer positions; pick the minimum-hash position.
+    // win = w.min(n_kmers) ensures the loop is safe when the sequence is short.
+    let win = w.min(n_kmers);
+    let mut result: Vec<(u64, usize)> = Vec::new();
+    let mut last: Option<(u64, usize)> = None;
+    for start in 0..=(n_kmers - win) {
+        let mut best_hash = u64::MAX;
+        let mut best_pos = start;
+        for (off, entry) in kmer_hashes[start..start + win].iter().enumerate() {
+            if let Some(h) = entry {
+                if *h < best_hash {
+                    best_hash = *h;
+                    best_pos = start + off;
+                }
+            }
+        }
+        if best_hash == u64::MAX {
+            continue;
+        }
+        let entry = (best_hash, best_pos);
+        if last != Some(entry) {
+            last = Some(entry);
+            result.push(entry);
+        }
+    }
+    result
+}
+
+/// Build the minimizer index for the cached spine.
+/// Maps k-mer hash → spine rank (index in `spine`).
+/// Only k-mers that appear exactly once in the spine are kept.
+fn build_spine_mers(spine: &[(usize, u8, i32)], k: usize, w: usize) -> HashMap<u64, u32> {
+    let spine_seq: Vec<u8> = spine.iter().map(|&(_, b, _)| b).collect();
+    let mers = compute_minimizers(&spine_seq, k, w);
+    // Count occurrences and record the first-seen spine rank per hash.
+    let mut counts: HashMap<u64, (u32, u32)> = HashMap::new();
+    for (hash, pos) in mers {
+        let e = counts.entry(hash).or_insert((0, pos as u32));
+        e.0 += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|(_, (c, _))| *c == 1)
+        .map(|(h, (_, p))| (h, p))
+        .collect()
+}
+
+/// Return the indices into `vals` that form the longest strictly increasing
+/// subsequence.  O(n log n) patience-sort with predecessor backtracking.
+fn lis_indices(vals: &[usize]) -> Vec<usize> {
+    let n = vals.len();
+    if n == 0 {
+        return vec![];
+    }
+    let mut tails: Vec<usize> = Vec::new();
+    let mut tail_idx: Vec<usize> = Vec::new();
+    let mut pred: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        let v = vals[i];
+        let p = tails.partition_point(|&t| t < v);
+        if p == tails.len() {
+            tails.push(v);
+            tail_idx.push(i);
+        } else {
+            tails[p] = v;
+            tail_idx[p] = i;
+        }
+        pred[i] = if p > 0 { Some(tail_idx[p - 1]) } else { None };
+    }
+    let lis_len = tails.len();
+    let mut chain = Vec::with_capacity(lis_len);
+    let mut cur = Some(tail_idx[lis_len - 1]);
+    while let Some(i) = cur {
+        chain.push(i);
+        cur = pred[i];
+    }
+    chain.reverse();
+    chain
+}
+
+/// Build the colinear anchor chain for one read against the current spine.
+///
+/// Matches each read minimizer against `spine_mers` to produce candidate
+/// `(read_pos, topo_rank)` pairs, then runs LIS to keep the longest
+/// monotonically-increasing sub-sequence (guaranteeing colinearity).
+/// Returns the chain sorted by topo_rank.
+fn build_anchor_chain(
+    read_mers: &[(u64, usize)],
+    spine_mers: &HashMap<u64, u32>,
+    spine: &[(usize, u8, i32)],
+    rank_of: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut candidates: Vec<(usize, usize)> = read_mers
+        .iter()
+        .filter_map(|&(hash, read_pos)| {
+            spine_mers.get(&hash).map(|&sr| {
+                let node_idx = spine[sr as usize].0;
+                (read_pos, rank_of[node_idx])
+            })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return vec![];
+    }
+    // Sort by topo_rank; LIS on read_pos then gives a colinear monotone chain.
+    candidates.sort_unstable_by_key(|&(_, t)| t);
+    let read_positions: Vec<usize> = candidates.iter().map(|&(r, _)| r).collect();
+    let idxs = lis_indices(&read_positions);
+    idxs.iter().map(|&i| candidates[i]).collect()
+}
+
+/// Compute the anchor-derived j-window for topo row `t`.
+///
+/// Returns `Some((lo, hi))` only when `t` is the exact topo rank of an anchor.
+/// Interpolation between anchors is intentionally omitted: in repetitive
+/// sequence, error k-mers at different repeat positions can produce coincident
+/// k-mer hashes (same error type, same cycle position → identical k-mer), which
+/// would create wrong anchors that are colinear with the correct flank anchors
+/// and survive the LIS filter.  An exact-match-only policy is safe because a
+/// wrong anchor centered far from the correct j produces an empty intersection
+/// with the existing window → the existing window is used unchanged.
+fn anchor_j_bounds(
+    t: usize,
+    anchors: &[(usize, usize)], // (read_pos, topo_rank), sorted by topo_rank
+    l: usize,
+) -> Option<(usize, usize)> {
+    if anchors.is_empty() {
+        return None;
+    }
+    // Binary search for an exact topo_rank match.
+    let pos = anchors.partition_point(|&(_, at)| at <= t);
+    if pos > 0 && anchors[pos - 1].1 == t {
+        let r = anchors[pos - 1].0;
+        let lo = r.saturating_sub(MINI_EPS_BASE).max(1);
+        let hi = (r + MINI_EPS_BASE).min(l);
+        Some((lo, hi))
+    } else {
+        None
+    }
+}
+
+/// Intersect `(j_lo, j_hi)` with the anchor-derived window for topo row `t`.
+///
+/// Only applied to spine nodes that are outside bubble regions and not already
+/// constrained by slide-lock windows.  Returns the original window unchanged
+/// when anchors provide no constraint or the intersection is empty (wrong
+/// anchor — correctness fallback to existing window).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn anchor_refine_spine(
+    j_lo: usize,
+    j_hi: usize,
+    t: usize,
+    anchors: &[(usize, usize)],
+    l: usize,
+    is_source: bool,
+    is_spine: bool,
+    in_bubble: bool,
+    is_locked: bool,
+) -> (usize, usize) {
+    if anchors.is_empty() || is_source || !is_spine || in_bubble || is_locked {
+        return (j_lo, j_hi);
+    }
+    match anchor_j_bounds(t, anchors, l) {
+        Some((alo, ahi)) => {
+            let nlo = j_lo.max(alo);
+            let nhi = j_hi.min(ahi);
+            if nlo <= nhi { (nlo, nhi) } else { (j_lo, j_hi) }
+        }
+        None => (j_lo, j_hi),
+    }
+}
+
 // ─── Bubble-aware DP alignment ────────────────────────────────────────────────
 
 /// Half-width of the DP band applied to spine (non-bubble) nodes.
@@ -583,6 +837,7 @@ fn gsd(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn align(
     nodes: &[Node],
     topo: &[usize],
@@ -591,6 +846,7 @@ fn align(
     query: &[u8],
     cfg: &PoaConfig,
     scratch: &mut AlignScratch,
+    anchors: &[(usize, usize)], // (read_pos, topo_rank) colinear chain from minimizer seeding
 ) -> Result<Vec<AlignOp>, PoaError> {
     scratch.clear();
     let n = topo.len();
@@ -724,6 +980,21 @@ fn align(
         };
         // Clamp hi to the banded row width.
         let j_hi = j_hi.min(j_lo + row_width - 1);
+        // Narrow with minimizer anchor constraint for spine nodes that are
+        // outside bubble regions and not already pinned by slide-lock windows.
+        // Never widens the window; falls back to (j_lo, j_hi) when the anchor
+        // constraint is absent or would produce an empty interval.
+        let (j_lo, j_hi) = anchor_refine_spine(
+            j_lo,
+            j_hi,
+            t,
+            anchors,
+            l,
+            is_source,
+            on_spine[node_idx],
+            bubble_ranges[t].is_some(),
+            scratch.get_node_j(node_idx).is_some() || scratch.get_exit_j(node_idx).is_some(),
+        );
         j_lo_arr[t] = j_lo;
         j_hi_arr[t] = j_hi;
 
@@ -1457,17 +1728,27 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
     let threshold = (n_reads as f64 * min_allele_freq).ceil() as i32;
     let mut bubble_count = 0usize;
     let mut max_bubble_depth = 0usize;
+    let mut longest_bubble_span = 0usize;
     for nd in nodes {
-        let mut qualifying: Vec<i32> = nd
+        let qualifying: Vec<(usize, i32)> = nd
             .out_edges
             .iter()
             .filter(|&&(_, w)| w >= threshold)
-            .map(|&(_, w)| w)
+            .map(|&(to, w)| (to, w))
             .collect();
         if qualifying.len() >= 2 {
             bubble_count += 1;
-            qualifying.sort_unstable_by(|a, b| b.cmp(a));
-            max_bubble_depth = max_bubble_depth.max(qualifying[1] as usize);
+            let mut weights: Vec<i32> = qualifying.iter().map(|&(_, w)| w).collect();
+            weights.sort_unstable_by(|a, b| b.cmp(a));
+            max_bubble_depth = max_bubble_depth.max(weights[1] as usize);
+            for &(arm_start, _) in &qualifying {
+                let span = if nodes[arm_start].in_edges.len() > 1 {
+                    0 // direct edge to exit: 0-length arm
+                } else {
+                    materialize_arm_len(nodes, arm_start, ARM_MAX_DEPTH)
+                };
+                longest_bubble_span = longest_bubble_span.max(span);
+            }
         }
     }
 
@@ -1497,6 +1778,7 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
         edge_weight_gini,
         single_support_fraction,
         mean_column_entropy,
+        longest_bubble_span,
     }
 }
 
@@ -1615,6 +1897,102 @@ fn find_structural_bubbles(
             } else {
                 None
             }
+        })
+        .collect()
+}
+
+// ─── Bubble site extraction ───────────────────────────────────────────────────
+
+/// Maximum arm sequence length captured in [`BubbleSite::arm_sequences`].
+/// Arms longer than this return an empty `Vec`; callers use `arm_read_counts`
+/// to assess support for large structural variants.
+const ARM_SEQUENCE_CAP: usize = 256;
+
+/// Collect the base sequence of one bubble arm from `start` up to (but not
+/// including) the exit/reconvergence node.
+///
+/// Returns an empty `Vec` when:
+/// - `start` is itself the exit (multiple in-edges → 0-length deletion arm).
+/// - The arm exceeds `ARM_SEQUENCE_CAP` nodes.
+/// - The arm has an internal branch (nested bubble).
+fn arm_sequence(nodes: &[Node], start: usize) -> Vec<u8> {
+    if nodes[start].in_edges.len() > 1 {
+        return vec![];
+    }
+    let mut seq = Vec::new();
+    let mut cur = start;
+    loop {
+        if seq.len() >= ARM_SEQUENCE_CAP {
+            return vec![];
+        }
+        seq.push(nodes[cur].base);
+        match nodes[cur].out_edges.as_slice() {
+            [(next, _)] => {
+                if nodes[*next].in_edges.len() > 1 {
+                    break; // next is the exit node
+                }
+                cur = *next;
+            }
+            _ => break, // dead end or internal branch; return what we have
+        }
+    }
+    seq
+}
+
+/// Build the [`BubbleSite`] list for a consensus path.
+///
+/// Scans the graph for nodes with two or more outgoing arms each meeting the
+/// `min_allele_freq` threshold.  Only nodes that appear on `filtered` (the
+/// trimmed consensus path) are included; off-path bubble entries are skipped.
+fn collect_bubble_sites(
+    nodes: &[Node],
+    topo: &[usize],
+    filtered: &[(usize, u8, i32)],
+    edge_reads: &HashMap<(usize, usize), Vec<u32>>,
+    min_allele_freq: f64,
+    n_reads: usize,
+    phasing_bubble_min_span: usize,
+) -> Vec<BubbleSite> {
+    let path_pos: HashMap<usize, usize> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, &(node_idx, _, _))| (node_idx, i))
+        .collect();
+
+    find_bubbles(nodes, topo, n_reads, min_allele_freq)
+        .into_iter()
+        .filter_map(|(entry_node, arm_starts)| {
+            let consensus_pos = *path_pos.get(&entry_node)?;
+
+            let arm_read_counts: Vec<u32> = arm_starts
+                .iter()
+                .map(|&a| {
+                    edge_reads
+                        .get(&(entry_node, a))
+                        .map_or(0, |v| v.len() as u32)
+                })
+                .collect();
+
+            // Mirror the guard in find_structural_bubbles: a 0-length arm
+            // (arm_start == exit) is not structural regardless of what follows.
+            let is_structural = arm_starts.iter().any(|&a| {
+                let len = if nodes[a].in_edges.len() > 1 {
+                    0
+                } else {
+                    materialize_arm_len(nodes, a, phasing_bubble_min_span)
+                };
+                len >= phasing_bubble_min_span
+            });
+
+            let arm_sequences: Vec<Vec<u8>> =
+                arm_starts.iter().map(|&a| arm_sequence(nodes, a)).collect();
+
+            Some(BubbleSite {
+                consensus_pos,
+                arm_read_counts,
+                arm_sequences,
+                is_structural,
+            })
         })
         .collect()
 }
@@ -1821,6 +2199,7 @@ impl PoaGraph {
             spine_updated_at: 0,
             spine_interval: 1,
             align_scratch: AlignScratch::new(),
+            spine_mers: HashMap::new(),
         })
     }
 
@@ -1842,12 +2221,41 @@ impl PoaGraph {
             let diff = spine_diff(&self.cached_spine, &new_spine);
             self.cached_spine = new_spine;
             self.spine_updated_at = self.n_reads;
+            // Rebuild spine minimizer index whenever the spine is refreshed.
+            self.spine_mers = build_spine_mers(&self.cached_spine, MINI_K, MINI_W);
             if diff <= SPINE_STABLE_THRESHOLD {
                 self.spine_interval = (self.spine_interval * 2).min(SPINE_MAX_INTERVAL);
             } else {
                 self.spine_interval = 1;
             }
         }
+
+        // Build minimizer anchor chain: match read k-mers against unique spine
+        // k-mers, then retain the longest colinear hit chain via LIS.  The chain
+        // constrains the per-row j-window inside align(), narrowing the DP band
+        // on spine nodes at exact anchor positions.
+        //
+        // Density gate: in repetitive sequence (CAG, GAA, AAGGG repeats), error-
+        // induced unique k-mers in the spine can match error k-mers in a read at
+        // a different repeat unit but the same cycle phase, creating wrong anchors
+        // with plausible (read_pos, topo_rank) pairs that survive LIS colinearity
+        // filtering.  These wrong anchors narrow the j-window and may exclude the
+        // correct j position, causing repeat unit loss.
+        //
+        // A fixed minimum threshold (MINI_MIN_CHAIN) separates the two regimes:
+        // in repetitive sequence, expected wrong anchor count ≈ n_err² / (n_units
+        // × n_sub_types) ≈ 1-3 for typical ONT depths — well below the threshold.
+        // In non-repetitive sequence, ~46% of k-mers survive unmodified at 5%
+        // error rate, giving ≈read_len × 0.46 / MINI_W correct anchors — well
+        // above the threshold for reads ≥ 200 bp.
+        let read_mers = compute_minimizers(read, MINI_K, MINI_W);
+        let raw_anchors =
+            build_anchor_chain(&read_mers, &self.spine_mers, &self.cached_spine, &rank_of);
+        let anchors: Vec<(usize, usize)> = if raw_anchors.len() >= MINI_MIN_CHAIN {
+            raw_anchors
+        } else {
+            vec![]
+        };
 
         let ops = align(
             &self.nodes,
@@ -1857,6 +2265,7 @@ impl PoaGraph {
             read,
             &self.config,
             &mut self.align_scratch,
+            &anchors,
         )?;
         let read_idx = self.n_reads as u32;
         add_to_graph(&mut self.nodes, &mut self.edge_reads, read, &ops, read_idx);
@@ -1886,6 +2295,7 @@ impl PoaGraph {
                 n_reads: 1,
                 graph_stats,
                 gaps: vec![],
+                bubble_sites: vec![],
             });
         }
 
@@ -1931,6 +2341,15 @@ impl PoaGraph {
 
         let graph_stats = compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
         let gaps = detect_coverage_gaps(&coverage);
+        let bubble_sites = collect_bubble_sites(
+            &self.nodes,
+            &topo,
+            &filtered,
+            &self.edge_reads,
+            self.config.min_allele_freq,
+            self.n_reads,
+            self.config.phasing_bubble_min_span,
+        );
 
         Ok(Consensus {
             sequence,
@@ -1939,6 +2358,7 @@ impl PoaGraph {
             n_reads: self.n_reads,
             graph_stats,
             gaps,
+            bubble_sites,
         })
     }
 
@@ -1982,6 +2402,7 @@ impl PoaGraph {
             read,
             &self.config,
             &mut AlignScratch::new(),
+            &[],
         )?;
         Ok((ops, 0, rank_of))
     }
@@ -2001,6 +2422,7 @@ impl PoaGraph {
             read,
             &self.config,
             &mut AlignScratch::new(),
+            &[],
         )?;
         Ok((ops, rank_of))
     }
@@ -2059,8 +2481,11 @@ impl PoaGraph {
     /// Build one consensus per detected allele.
     ///
     /// Structural bubbles (arm span ≥ phasing_bubble_min_span) are phased first using
-    /// cross-bubble compatibility grouping. If no structural bubbles are found, falls
-    /// back to single-best SNP bubble partitioning for substitution haplotypes.
+    /// cross-bubble compatibility grouping. If no structural bubbles are found and the
+    /// alignment was banded, the graph is rebuilt with unbanded alignment so that large
+    /// allele-length differences create a visible Insert-arm bubble; structural phasing
+    /// then retries on the unbanded graph. If still no structural bubble, falls back to
+    /// single-best SNP bubble partitioning for substitution haplotypes.
     pub fn consensus_multi(&self) -> Result<Vec<Consensus>, PoaError> {
         if self.n_reads < self.config.min_reads {
             return Err(PoaError::InsufficientDepth {
@@ -2074,6 +2499,23 @@ impl PoaGraph {
         // Try structural bubble phasing first (length variants, SVs, large indels).
         let structural = find_structural_bubbles(&self.nodes, &topo, self.n_reads, &self.config);
 
+        // If no structural bubble was found and alignment was banded, the band may be too
+        // narrow to create a clean Insert-arm bubble for large allele-length differences.
+        // Rebuild the graph with unbanded alignment (reads include flanking → rotation is
+        // anchored) and recurse once. The config's band settings are zeroed so the recursive
+        // call does not loop.
+        if structural.is_empty() && (self.config.band_width > 0 || self.config.adaptive_band) {
+            let mut cfg2 = self.config.clone();
+            cfg2.band_width = 0;
+            cfg2.adaptive_band = false;
+            let seed = &self.reads[0];
+            let mut g2 = PoaGraph::new(seed, cfg2)?;
+            for read in self.reads.iter().skip(1) {
+                g2.add_read(read)?;
+            }
+            return g2.consensus_multi();
+        }
+
         let groups = if !structural.is_empty() {
             phasing_groups(
                 &self.edge_reads,
@@ -2082,27 +2524,29 @@ impl PoaGraph {
                 self.config.min_reads,
             )
         } else {
-            // Fall back to single-best SNP bubble partitioning.
+            // Unbanded alignment and still no structural bubble. Try SNP bubble
+            // partitioning for substitution haplotypes (same-length alleles).
             let snp_bubbles = find_bubbles(
                 &self.nodes,
                 &topo,
                 self.n_reads,
                 self.config.min_allele_freq,
             );
-            if snp_bubbles.is_empty() {
+            if !snp_bubbles.is_empty() {
+                let (entry, arm_starts) = snp_bubbles
+                    .iter()
+                    .max_by_key(|(entry, arms)| {
+                        arms.iter()
+                            .filter_map(|&arm| self.edge_reads.get(&(*entry, arm)))
+                            .map(|v| v.len())
+                            .min()
+                            .unwrap_or(0)
+                    })
+                    .unwrap();
+                partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads)
+            } else {
                 return Ok(vec![self.consensus()?]);
             }
-            let (entry, arm_starts) = snp_bubbles
-                .iter()
-                .max_by_key(|(entry, arms)| {
-                    arms.iter()
-                        .filter_map(|&arm| self.edge_reads.get(&(*entry, arm)))
-                        .map(|v| v.len())
-                        .min()
-                        .unwrap_or(0)
-                })
-                .unwrap();
-            partition_reads_by_bubble(&self.edge_reads, *entry, arm_starts, self.n_reads)
         };
 
         if groups.len() < 2 {

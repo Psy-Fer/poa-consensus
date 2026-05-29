@@ -335,11 +335,13 @@
 //! - Setting `gap_open = 0` recovers linear gap behaviour where only
 //!   `gap_extend` matters.
 
+pub mod analysis;
 pub mod config;
 pub mod error;
 pub mod flank;
 pub mod graph;
 pub mod orient;
+pub mod seed;
 pub mod types;
 
 #[cfg(feature = "plot")]
@@ -348,14 +350,19 @@ pub mod plot;
 #[cfg(test)]
 mod tests;
 
+pub use analysis::{
+    ConsensusWarnings, DiagnoseConfig, InteriorSupportWarning, LowDepthWarning,
+    StructuralCompetingSummary, diagnose,
+};
 pub use config::{AlignmentMode, ConsensusMode, PoaConfig};
 pub use error::PoaError;
 pub use flank::extract_flanked_region;
 pub use graph::PoaGraph;
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
-pub use types::{Consensus, CoverageGap, GapKind, GraphStats, Strand};
+pub use seed::{SeedSelection, select_seed};
+pub use types::{BubbleSite, Consensus, CoverageGap, GapKind, GraphStats, Strand};
 
-// ── Internal helper ───────────────────────────────────────────────────────────
+// ── Internal helpers ─────────────────────────────────────────────────────────
 
 fn build_graph(reads: &[&[u8]], seed_idx: usize, config: PoaConfig) -> Result<PoaGraph, PoaError> {
     let mut graph = PoaGraph::new(reads[seed_idx], config)?;
@@ -545,5 +552,6 @@ pub fn bridged_consensus(
         n_reads: left.n_reads + right.n_reads,
         graph_stats: left.graph_stats,
         gaps,
+        bubble_sites: vec![],
     })
 }

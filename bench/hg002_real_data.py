@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""
+HG002 real-data validation for poa-consensus.
+
+Extracts reads from a BAM at known disease STR loci, runs poa-consensus with
+platform-appropriate settings, and reports consensus allele lengths and
+inferred repeat counts.
+
+Usage:
+    python bench/hg002_real_data.py HG002.bam
+    python bench/hg002_real_data.py HG002.bam --locus HTT RFC1 DMPK
+    python bench/hg002_real_data.py HG002.bam --bed my_loci.bed
+    python bench/hg002_real_data.py HG002.bam --out results/hg002.tsv
+
+Requires on PATH:  samtools
+Requires in repo:  target/release/poa-consensus
+                   (cargo build --release --features cli)
+
+BED format (for --bed):
+    chrom  start  end  name  unit  [note]
+    chr4   3074877  3074944  HTT  CAG  Huntington disease
+
+Coordinates below are hg38.  If your BAM is aligned to CHM13/T2T, pass
+--assembly chm13 and supply liftover coordinates via --bed.
+
+Known limitations and locus-specific findings (validated against HG002 HiFi):
+
+  Strand orientation
+    Clinical repeat units for DMPK, ATXN1, ATXN2, ATXN3, and RFC1 are defined
+    on the minus (coding) strand.  SAM/BAM stores reads in plus-strand
+    orientation, so the consensus produced by poa-consensus contains the reverse
+    complement of the clinical unit (e.g. CTG instead of CAG for DMPK).
+    count_units() searches both strands to handle this transparently.  Any
+    downstream tool that inspects the raw consensus bytes must do the same.
+
+  Interrupted repeats (FMR1, ATXN1)
+    FMR1 normal alleles contain AGG interruptions roughly every 9-12 CGG units.
+    The repeat count reported here is the longest uninterrupted CGG run (~9-12),
+    not the total CGG count (~30).  Similarly, ATXN1 normal alleles contain CAT
+    interruptions; the reported count (~14-15) is the longest uninterrupted CAG
+    run, not the total (~26-35).  This is correct behaviour: the longest
+    uninterrupted run is the clinically relevant stability predictor.
+
+  ATXN3 coordinates
+    The coordinates at chr14:92,071,992-92,072,120 match the ExpansionHunter
+    hg38 catalog, but the HG002 HiFi consensus does not show CTG repeats at
+    this location.  Verify with `samtools faidx hg38.fa chr14:92071993-92072120`
+    before trusting the ATXN3 repeat count.
+
+  RFC1 silent truncation (known bug 4 in CLAUDE.md)
+    The CTTTT plus-strand / AAAAG coding-strand 5-mer repeat causes the banded
+    aligner to converge to a wrong diagonal without approaching the band edge.
+    This produces a truncated consensus (~371 bp from an ~861 bp window) with no
+    error reported.  The flanking-anchor pre-processing step is the intended fix.
+    Until then, treat the RFC1 count as a lower bound.
+
+  ATXN2 spurious multi-allele at similar allele lengths
+    When both ATXN2 alleles have similar repeat counts (~22/22 CAG), ONT-level
+    noise bubbles can produce a spurious split (e.g. 8/21 instead of 22/22).
+    Use min_allele_freq >= 0.40 for ONT data to suppress this artefact.
+
+  ONT min_allele_freq sensitivity
+    At ONT error rates (>=4% substitution), the default min_allele_freq = 0.25
+    threshold fires on clean single-allele loci.  Raise to >= 0.40 for ONT.
+    At depth = 3, one error in one read = 33%, which already exceeds 0.25; the
+    effective minimum depth for clean ONT calls is >= 10 reads.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+# ── CIGAR helper ──────────────────────────────────────────────────────────────
+
+_CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
+
+
+def _cigar_clip(ref_start: int, cigar: str, target_start: int, target_end: int) -> tuple[int, int]:
+    """
+    Map genomic region [target_start, target_end) to read coordinates (rd_s, rd_e).
+    Returns (-1, -1) if the read does not overlap the target.
+
+    Soft-clipped bases advance the read pointer but not the reference pointer, so
+    they are naturally excluded from the clipped output.  Insertions that fall
+    entirely within [target_start, target_end) are included so the clipped read
+    retains any indels present in that region.
+    """
+    ref = ref_start
+    rd  = 0
+    rd_s = -1
+    rd_e = -1
+
+    for m in _CIGAR_RE.finditer(cigar):
+        n, op = int(m.group(1)), m.group(2)
+        if op in ('M', '=', 'X'):
+            ovlp_s = max(ref, target_start)
+            ovlp_e = min(ref + n, target_end)
+            if ovlp_s < ovlp_e:
+                if rd_s < 0:
+                    rd_s = rd + (ovlp_s - ref)
+                rd_e = rd + (ovlp_e - ref)
+            ref += n
+            rd  += n
+        elif op == 'I':
+            # Include an insertion only if we are past the start and still inside
+            # the target (ref hasn't advanced for I, so use strict < target_end).
+            if rd_s >= 0 and ref > target_start and ref < target_end:
+                rd_e = rd + n
+            rd += n
+        elif op in ('D', 'N'):
+            ref += n
+        elif op == 'S':
+            rd += n
+        # H / P: neither pointer advances
+
+    return rd_s, rd_e
+
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+POA_BIN = Path(__file__).parent.parent / "target/release/poa-consensus"
+
+# ── Locus definitions ─────────────────────────────────────────────────────────
+
+@dataclass
+class Locus:
+    name: str
+    chrom: str          # with chr prefix (stripped if BAM uses bare contigs)
+    start: int          # 0-based
+    end: int            # exclusive
+    unit: str           # canonical repeat unit; empty string for non-repetitive controls
+    pad: int = 300      # bp of flanking context added when extracting reads
+    min_depth: int = 5  # skip locus if fewer reads overlap
+    note: str = ""
+    category: str = "str"  # "str" = disease repeat locus; "control" = non-repetitive
+
+# hg38 coordinates.  Sources: OMIM, Locus Reference Genomic, TRGT catalog.
+# Control regions: non-repetitive exonic/coding regions used as sanity checks.
+HG38_LOCI: list[Locus] = [
+    # ── Disease STR loci ──────────────────────────────────────────────────────
+    # Coordinates are 0-based half-open intervals matching the ExpansionHunter
+    # hg38 variant catalog (github.com/Illumina/ExpansionHunter).
+    #
+    # The repeat unit below is the CLINICAL unit (defined on the coding strand).
+    # Genes on the minus strand (DMPK, ATXN1, ATXN2, ATXN3, RFC1) have their
+    # unit appear as the reverse complement in the reference plus strand.
+    # count_units() searches both strands automatically.
+    Locus("HTT",   "chr4",  3_074_877,    3_074_944,    "CAG",   pad=400, note="Huntington disease"),
+    Locus("FMR1",  "chrX",  147_912_050,  147_912_110,  "CGG",   pad=400, note="Fragile X syndrome"),
+    Locus("DMPK",  "chr19", 45_770_203,   45_770_264,   "CTG",   pad=400, note="Myotonic dystrophy 1"),
+    # RFC1: normal allele is AAAAG (on the minus/coding strand); disease allele is AAGGG.
+    # HG002 is healthy so we count AAAAG.  The revcomp fix in count_units also finds the
+    # plus-strand representation (CTТTТ) automatically.
+    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAAAG", pad=400, note="CANVAS / RFC1 ataxia (normal: AAAAG; disease: AAGGG)"),
+    Locus("ATXN3", "chr14", 92_071_992,   92_072_120,   "CAG",   pad=400, note="Spinocerebellar ataxia 3"),
+    Locus("ATXN2", "chr12", 111_598_950,  111_599_019,  "CAG",   pad=400, note="Spinocerebellar ataxia 2"),
+    Locus("ATXN1", "chr6",  16_327_633,   16_327_723,   "CAG",   pad=400, note="Spinocerebellar ataxia 1"),
+    # ── Non-repetitive controls ───────────────────────────────────────────────
+    # These should yield a single clean consensus with no bubble sites and
+    # depth tracking the local WGS coverage.  Any multi-allele result or
+    # zero-depth here indicates a pipeline or extraction problem.
+    Locus("GAPDH", "chr12", 6_534_517,   6_534_800,   "",      pad=200,
+          note="GAPDH coding (housekeeping control)", category="control"),
+    Locus("TP53e7", "chr17", 7_674_220,  7_674_400,   "",      pad=200,
+          note="TP53 exon 7 (non-repetitive coding)", category="control"),
+    Locus("ACTB",  "chr7",  5_529_264,   5_529_600,   "",      pad=200,
+          note="ACTB coding (housekeeping control)", category="control"),
+]
+
+# ── BAM header inspection ─────────────────────────────────────────────────────
+
+def bam_header(bam: Path) -> str:
+    r = subprocess.run(["samtools", "view", "-H", str(bam)],
+                       capture_output=True, text=True, check=True)
+    return r.stdout
+
+
+def detect_chr_prefix(header: str) -> bool:
+    """Return True if contigs use 'chr' prefix."""
+    for line in header.splitlines():
+        if line.startswith("@SQ"):
+            fields = dict(f.split(":", 1) for f in line.split("\t")[1:] if ":" in f)
+            sn = fields.get("SN", "")
+            if sn.startswith("chr"):
+                return True
+            if sn.isdigit() or sn in ("X", "Y", "M", "MT"):
+                return False
+    # Default to chr-prefix if we can't tell.
+    return True
+
+
+def detect_assembly(header: str) -> str:
+    """
+    Return 'hg38', 'chm13', or 'unknown' by checking chr1 length in @SQ lines.
+    hg38 chr1 = 248,956,422 bp; CHM13 v2.0 chr1 = 248,387,328 bp.
+    """
+    for line in header.splitlines():
+        if line.startswith("@SQ"):
+            fields = dict(f.split(":", 1) for f in line.split("\t")[1:] if ":" in f)
+            sn = fields.get("SN", "")
+            ln = int(fields.get("LN", 0))
+            if sn in ("chr1", "1"):
+                if abs(ln - 248_956_422) < 100_000:
+                    return "hg38"
+                if abs(ln - 248_387_328) < 100_000:
+                    return "chm13"
+    return "unknown"
+
+
+def detect_platform(header: str, bam_path: Optional[Path] = None) -> str:
+    """Return 'ont', 'hifi', or 'unknown' from @RG tags and BAM filename."""
+    for line in header.splitlines():
+        if line.startswith("@RG"):
+            fields = dict(f.split(":", 1) for f in line.split("\t")[1:] if ":" in f)
+            # Concatenate all field values to catch any tag that indicates platform.
+            combined = " ".join(v.upper() for v in fields.values())
+            if "ONT" in combined or "NANOPORE" in combined:
+                return "ont"
+            if any(k in combined for k in ("HIFI", "PACBIO", "SEQUEL", "SMRT", "CCS", "REVIO")):
+                return "hifi"
+    # Fall back to filename heuristics.
+    if bam_path is not None:
+        name = bam_path.name.lower()
+        if "ont" in name or "nanopore" in name:
+            return "ont"
+        if any(k in name for k in ("hifi", "pb.", "_pb_", "pacbio", "ccs", "revio", "sequel")):
+            return "hifi"
+    return "unknown"
+
+# ── Coordinate adjustment ─────────────────────────────────────────────────────
+
+def adjust_chrom(chrom: str, use_chr: bool) -> str:
+    """Add or strip 'chr' prefix to match the BAM's contig naming."""
+    if use_chr and not chrom.startswith("chr"):
+        return "chr" + chrom
+    if not use_chr and chrom.startswith("chr"):
+        return chrom[3:]
+    return chrom
+
+# ── CLI flags by platform ─────────────────────────────────────────────────────
+
+def poa_flags(platform: str) -> list[str]:
+    """Return poa-consensus CLI flags appropriate for the platform."""
+    # --band-width 50 floor prevents silent unit loss in long repetitive alleles.
+    # --semi-global handles partial reads that don't span the full locus.
+    base = ["--adaptive-band", "--band-width", "50", "--semi-global", "--min-reads", "3"]
+    return base
+
+# ── Read extraction ───────────────────────────────────────────────────────────
+
+def extract_reads(bam: Path, chrom: str, start: int, end: int, pad: int) -> list[bytes]:
+    """
+    Return read sequences trimmed to [start-pad, end+pad] in genomic coordinates.
+
+    Full WGS reads are 10–20 kb; poa-consensus is designed for 50–2000 bp STR
+    reads.  Passing full reads causes the banded DP to fail on the large graph.
+    CIGAR-based clipping reduces each read to just the padded region (~800–1500 bp
+    for STR loci), which is the input size poa-consensus is tuned for.
+
+    Reads whose trimmed length is shorter than the core (start, end) region are
+    dropped as non-spanning.
+    """
+    core_len     = end - start
+    padded_start = max(0, start - pad)
+    padded_end   = end + pad
+    region = f"{chrom}:{padded_start + 1}-{padded_end}"  # samtools is 1-based
+
+    # -F 2308: exclude unmapped (4) + secondary (256) + supplementary (2048)
+    cmd = ["samtools", "view", "-F", "2308", str(bam), region]
+    try:
+        view = subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError:
+        return []
+
+    if not view.stdout:
+        return []
+
+    reads = []
+    for line in view.stdout.splitlines():
+        fields = line.split(b"\t")
+        if len(fields) < 10:
+            continue
+        try:
+            pos0  = int(fields[3]) - 1          # SAM POS is 1-based
+            cigar = fields[5].decode()
+            seq   = fields[9]
+        except (ValueError, IndexError):
+            continue
+        if seq == b"*" or cigar == "*":
+            continue
+
+        rd_s, rd_e = _cigar_clip(pos0, cigar, padded_start, padded_end)
+        if rd_s < 0 or rd_e <= rd_s:
+            continue
+
+        trimmed = seq[rd_s:rd_e]
+        if len(trimmed) >= core_len:
+            reads.append(trimmed)
+
+    return reads
+
+# ── poa-consensus invocation ──────────────────────────────────────────────────
+
+def run_poa(reads: list[bytes], flags: list[str], multi: bool,
+            verbose: bool = False) -> Optional[list[bytes]]:
+    """
+    Run poa-consensus on `reads` (as FASTA piped to stdin).
+    Returns list of consensus sequences, or None on failure.
+    """
+    fasta = b""
+    for i, seq in enumerate(reads):
+        fasta += b">r%d\n%s\n" % (i, seq)
+
+    cmd = [str(POA_BIN)] + flags
+    if multi:
+        cmd.append("--multi")
+    cmd.append("-")  # read from stdin
+
+    try:
+        r = subprocess.run(cmd, input=fasta, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        print("  [timeout]", file=sys.stderr)
+        return None
+    if r.returncode != 0:
+        if r.stderr:
+            msg = r.stderr.decode(errors="replace").strip()
+            print(f"  [poa error: {msg}]", file=sys.stderr)
+        return None
+
+    # Parse FASTA output: collect all sequences.
+    seqs = []
+    current = b""
+    for line in r.stdout.splitlines():
+        if line.startswith(b">"):
+            if current:
+                seqs.append(current)
+            current = b""
+        else:
+            current += line.strip()
+    if current:
+        seqs.append(current)
+    return seqs or None
+
+# ── Repeat unit counting ──────────────────────────────────────────────────────
+
+_COMP = bytes.maketrans(b"ACGTacgt", b"TGCAtgca")
+
+def _revcomp_unit(unit: str) -> str:
+    return unit.upper().encode().translate(_COMP)[::-1].decode()
+
+
+def count_units(seq: bytes, unit: str) -> int:
+    """
+    Find the longest contiguous run of `unit` within `seq` and return its count.
+
+    The consensus includes flanking context, so dividing total length by unit
+    length gives the wrong answer.  Instead, search for the longest run via regex,
+    trying all rotational phases of the unit to handle phase ambiguity in the
+    consensus (e.g. CAG / AGC / GCA all represent the same trinucleotide repeat),
+    AND trying the reverse-complement strand of the unit.
+
+    poa-consensus outputs the consensus in the seed read's orientation, which may
+    be the minus strand.  Searching both strands ensures correct counts regardless
+    of which strand the consensus comes out on.
+
+    Example: for unit="CAG" and consensus on the minus strand
+        "...ACGTCTGCTGCTGCTGCTGACGT..."  →  5 (CTG = revcomp of CAG)
+    """
+    if not unit or not seq:
+        return 0
+    n = len(unit)
+    unit_fwd = unit.upper()
+    unit_rc  = _revcomp_unit(unit)
+
+    best = 0
+    seen: set[bytes] = set()
+    for strand_unit in (unit_fwd, unit_rc):
+        ub = strand_unit.encode()
+        for i in range(n):
+            rot = ub[i:] + ub[:i]
+            if rot in seen:
+                continue
+            seen.add(rot)
+            pat = re.compile(rb"(?:" + rot + rb")+", re.IGNORECASE)
+            for m in pat.finditer(seq):
+                count = len(m.group()) // n
+                if count > best:
+                    best = count
+    return best
+
+# ── BED loader ────────────────────────────────────────────────────────────────
+
+def load_bed(path: Path) -> list[Locus]:
+    """Load loci from a BED file.  Format: chrom start end name unit [note]."""
+    loci = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 5:
+                sys.exit(f"error: BED line needs ≥5 fields: {line!r}")
+            chrom, start, end, name, unit = parts[:5]
+            note = parts[5] if len(parts) > 5 else ""
+            loci.append(Locus(name=name, chrom=chrom,
+                              start=int(start), end=int(end),
+                              unit=unit, note=note))
+    return loci
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("bam", type=Path, help="Input BAM file (must be indexed)")
+    ap.add_argument("--locus", nargs="+", metavar="NAME",
+                    help="Run only these loci (e.g. HTT RFC1)")
+    ap.add_argument("--bed", type=Path, metavar="FILE",
+                    help="Custom loci in BED format (chrom start end name unit [note])")
+    ap.add_argument("--assembly", choices=["hg38", "chm13", "auto"],
+                    default="auto", help="Reference assembly (default: auto-detect)")
+    ap.add_argument("--platform", choices=["ont", "hifi", "auto"],
+                    default="auto", help="Sequencing platform (default: auto-detect)")
+    ap.add_argument("--pad", type=int, default=None,
+                    help="Override flanking context in bp (default: per-locus)")
+    ap.add_argument("--no-multi", action="store_true",
+                    help="Disable multi-allele mode (report single consensus only)")
+    ap.add_argument("--out", type=Path, metavar="FILE",
+                    help="Write TSV results to this file in addition to stdout")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Print each consensus sequence after the summary row")
+    args = ap.parse_args()
+
+    # ── Sanity checks ─────────────────────────────────────────────────────────
+    if not args.bam.exists():
+        sys.exit(f"error: BAM not found: {args.bam}")
+    bai = args.bam.with_suffix(args.bam.suffix + ".bai")
+    csi = args.bam.with_suffix(args.bam.suffix + ".csi")
+    if not bai.exists() and not csi.exists():
+        sys.exit(f"error: no BAM index found ({bai} or {csi})\n"
+                 f"       run: samtools index {args.bam}")
+    if not POA_BIN.exists():
+        sys.exit(f"error: poa-consensus binary not found at {POA_BIN}\n"
+                 f"       run: cargo build --release --features cli")
+
+    # ── BAM header inspection ─────────────────────────────────────────────────
+    header = bam_header(args.bam)
+    use_chr   = detect_chr_prefix(header)
+    assembly  = args.assembly if args.assembly != "auto" else detect_assembly(header)
+    platform  = args.platform if args.platform != "auto" else detect_platform(header, args.bam)
+
+    # ── Loci selection ────────────────────────────────────────────────────────
+    if args.bed:
+        loci = load_bed(args.bed)
+    elif assembly == "chm13":
+        print("warning: CHM13/T2T detected.  Built-in coordinates are for hg38.")
+        print("         Supply liftover coordinates via --bed for accurate results.")
+        print("         Using hg38 coordinates as a rough approximation.\n")
+        loci = HG38_LOCI
+    else:
+        loci = HG38_LOCI
+
+    if args.locus:
+        names = set(args.locus)
+        loci = [l for l in loci if l.name in names]
+        missing = names - {l.name for l in loci}
+        if missing:
+            sys.exit(f"error: unknown loci: {', '.join(sorted(missing))}\n"
+                     f"       available: {', '.join(l.name for l in HG38_LOCI)}")
+
+    # ── CLI flags ─────────────────────────────────────────────────────────────
+    flags = poa_flags(platform)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    asm_str = assembly if assembly != "unknown" else "unknown (hg38 assumed)"
+    plat_str = platform if platform != "unknown" else "unknown (ONT settings used)"
+    chr_str = "chr prefix" if use_chr else "no chr prefix"
+
+    print("HG002 poa-consensus real-data test")
+    print(f"  BAM:      {args.bam}")
+    print(f"  Assembly: {asm_str} ({chr_str})")
+    print(f"  Platform: {plat_str}")
+    print(f"  Binary:   {POA_BIN}")
+    print(f"  Flags:    {' '.join(flags)}")
+    print()
+
+    col_w = dict(locus=9, chrom=6, region=26, unit=6, depth=6,
+                 alleles=30, repeats=20, time=8)
+    header_row = (
+        f"  {'Locus':<{col_w['locus']}}  {'Chrom':<{col_w['chrom']}}"
+        f"  {'Region':<{col_w['region']}}  {'Unit':<{col_w['unit']}}"
+        f"  {'Depth':>{col_w['depth']}}  {'Allele lengths':<{col_w['alleles']}}"
+        f"  {'Repeat counts':<{col_w['repeats']}}  {'Time':>{col_w['time']}}"
+    )
+    sep = "  " + "─" * (len(header_row) - 2)
+
+    tsv_rows: list[str] = [
+        "\t".join(["locus", "category", "chrom", "start", "end", "unit", "depth",
+                   "allele_lengths_bp", "repeat_counts", "time_s", "note"])
+    ]
+
+    # ── Per-locus loop ────────────────────────────────────────────────────────
+    prev_category: Optional[str] = None
+    for locus in loci:
+        # Print a section header whenever the category changes.
+        if locus.category != prev_category:
+            if prev_category is not None:
+                print()
+            label = {
+                "str":     "Disease STR loci",
+                "control": "Non-repetitive controls (expect single clean consensus)",
+            }.get(locus.category, locus.category)
+            print(f"  {label}")
+            print(header_row)
+            print(sep)
+            prev_category = locus.category
+
+        chrom = adjust_chrom(locus.chrom, use_chr)
+        pad   = args.pad if args.pad is not None else locus.pad
+
+        t0 = time.perf_counter()
+        reads = extract_reads(args.bam, chrom, locus.start, locus.end, pad)
+        depth = len(reads)
+
+        if depth < locus.min_depth:
+            elapsed = time.perf_counter() - t0
+            allele_str = f"SKIP (depth {depth} < {locus.min_depth})"
+            repeat_str = ""
+            _print_row(col_w, locus.name, chrom, locus.start, locus.end,
+                       locus.unit, depth, allele_str, repeat_str, elapsed)
+            tsv_rows.append("\t".join([
+                locus.name, locus.category, chrom,
+                str(locus.start), str(locus.end), locus.unit,
+                str(depth), "skip", "", f"{elapsed:.2f}", locus.note,
+            ]))
+            continue
+
+        # Controls run in single-allele mode: they're not repeat loci, and
+        # any multi-allele result from a control would flag a pipeline issue.
+        is_control = locus.category == "control"
+        multi = not args.no_multi and not is_control
+        alleles = run_poa(reads, flags, multi=multi)
+        elapsed = time.perf_counter() - t0
+
+        if alleles is None:
+            allele_str = "ERROR"
+            repeat_str = ""
+        elif len(alleles) == 0:
+            allele_str = "no consensus"
+            repeat_str = ""
+        else:
+            lengths = [len(a) for a in alleles]
+            allele_str = "  /  ".join(f"{l} bp" for l in lengths)
+            if locus.unit:
+                counts = [count_units(a, locus.unit) for a in alleles]
+                repeat_str = "  /  ".join(f"{c}× {locus.unit}" for c in counts)
+            else:
+                repeat_str = "—"
+
+        _print_row(col_w, locus.name, chrom, locus.start, locus.end,
+                   locus.unit, depth, allele_str, repeat_str, elapsed)
+
+        if args.verbose and alleles:
+            for i, seq in enumerate(alleles):
+                label = f"allele {i+1}" if len(alleles) > 1 else "consensus"
+                preview = seq[:120].decode(errors="replace")
+                print(f"    [{label}] {preview}...")
+
+        allele_bp = "; ".join(str(len(a)) for a in (alleles or []))
+        repeat_ct = "; ".join(
+            str(count_units(a, locus.unit)) for a in (alleles or [])
+        ) if locus.unit else ""
+        tsv_rows.append("\t".join([
+            locus.name, locus.category, chrom,
+            str(locus.start), str(locus.end), locus.unit,
+            str(depth), allele_bp, repeat_ct,
+            f"{elapsed:.2f}", locus.note,
+        ]))
+
+    print()
+
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text("\n".join(tsv_rows) + "\n")
+        print(f"TSV written to {args.out}")
+
+
+def _print_row(col_w: dict, name: str, chrom: str,
+               start: int, end: int, unit: str,
+               depth: int, allele_str: str, repeat_str: str,
+               elapsed: float) -> None:
+    region = f"{start:,}-{end:,}"
+    print(
+        f"  {name:<{col_w['locus']}}  {chrom:<{col_w['chrom']}}"
+        f"  {region:<{col_w['region']}}  {unit:<{col_w['unit']}}"
+        f"  {depth:>{col_w['depth']}}  {allele_str:<{col_w['alleles']}}"
+        f"  {repeat_str:<{col_w['repeats']}}  {elapsed:>{col_w['time']}.1f}s"
+    )
+
+
+if __name__ == "__main__":
+    main()
