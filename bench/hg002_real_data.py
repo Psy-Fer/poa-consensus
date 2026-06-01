@@ -436,9 +436,10 @@ def run_poa(reads: list[bytes], flags: list[str], multi: bool,
         print("  [timeout]", file=sys.stderr)
         return None
     if r.returncode != 0:
-        if r.stderr:
-            msg = r.stderr.decode(errors="replace").strip()
-            print(f"  [poa error: {msg}]", file=sys.stderr)
+        stderr_msg = r.stderr.decode(errors="replace").strip() if r.stderr else ""
+        stdout_msg = r.stdout.decode(errors="replace").strip() if r.stdout else ""
+        detail = stderr_msg or stdout_msg or f"(no output; exit code {r.returncode})"
+        print(f"  [poa error rc={r.returncode}: {detail}]", file=sys.stderr)
         return None
 
     # Parse FASTA output: collect all sequences.
