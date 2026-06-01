@@ -54,10 +54,13 @@ Known limitations and locus-specific findings (validated against HG002 HiFi):
     error reported.  The flanking-anchor pre-processing step is the intended fix.
     Until then, treat the RFC1 count as a lower bound.
 
-  ATXN2 spurious multi-allele at similar allele lengths
-    When both ATXN2 alleles have similar repeat counts (~22/22 CAG), ONT-level
-    noise bubbles can produce a spurious split (e.g. 8/21 instead of 22/22).
-    Use min_allele_freq >= 0.40 for ONT data to suppress this artefact.
+  ATXN2 interrupted GCT/GTT structure
+    ATXN2 uses the GCT unit (a CAG rotation; revcomp of CAG), with GTT
+    interruptions.  Bladerunner ground truth for HG002 hg38:
+      Hap1: (GCT)8(GTT)1(GCT)21 -- 29 total, longest uninterrupted run = 21
+      Hap2: (GCT)8(GTT)1(GCT)4(GTT)1(GCT)8 -- 20 total, longest run = 8
+    poa-consensus reports 8/21 (longest uninterrupted run per haplotype), which
+    is correct.  count_units() finds GCT via CAG rotation + strand search.
 
   ONT min_allele_freq sensitivity
     At ONT error rates (>=4% substitution), the default min_allele_freq = 0.25
@@ -184,8 +187,8 @@ HG38_LOCI: list[Locus] = [
 # ATXN2) this is shorter than the clinical total count:
 #   FMR1  — AGG interruptions every ~9-12 CGG units; longest run ~11
 #   ATXN1 — CAT interruptions; longest uninterrupted CAG run ~14-15
-#   ATXN2 — CAA interruption separates two CAG blocks; counts reflect the
-#            two segments, not the total (see ATXN2 note below)
+#   ATXN2 — GTT interruptions separate GCT blocks; count_units returns the
+#            longest uninterrupted GCT run per haplotype (8 and 21 for HG002)
 #
 # HTT and DMPK: observed from HiFi + ONT runs on HG002 hg38 (both platforms
 # agree).  Longest-run == total because no interruptions in normal alleles.
@@ -217,11 +220,12 @@ HG002_TRUTH: dict[str, dict] = {
                "source": "HiFi + ONT observed; longest uninterrupted CAG run in interrupted allele",
                "note": "Total CAG ~28-35 but count_units reports longest run (~14-15) "
                        "due to CAT interruptions. 1 bp allele length difference is consistent."},
-    "ATXN2":  {"alleles": [8, 21],  "confidence": "low",
-               "source": "HiFi + ONT observed; INCONSISTENT with allele length difference",
-               "note": "Allele lengths differ by 24bp (8 CAG units) but counts differ by 13 units "
-                       "(8 vs 21). Likely reflects different CAA interruption positions on each "
-                       "allele ((CAG)8-CAA-(CAG)n structure). Needs verification vs TRGT/EH truth."},
+    "ATXN2":  {"alleles": [8, 21],  "confidence": "medium",
+               "source": "Bladerunner ground truth (HG002 hg38, HP-phased GCT analysis)",
+               "note": "Unit is GCT (CAG rotation; revcomp of CAG).  GTT interruptions: "
+                       "Hap1=(GCT)8(GTT)1(GCT)21 (29 total, longest run=21); "
+                       "Hap2=(GCT)8(GTT)1(GCT)4(GTT)1(GCT)8 (20 total, longest run=8). "
+                       "poa-consensus 8/21 is CORRECT: count_units reports longest uninterrupted run."},
     "ATXN3":  {"alleles": [17, 21], "confidence": "medium",
                "source": "HiFi + ONT observed; both platforms agree; length-consistent (Δ12bp = 4 CAG)"},
 }
