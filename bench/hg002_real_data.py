@@ -47,16 +47,20 @@ Known limitations and locus-specific findings (validated against HG002 HiFi):
     land on the CAG repeat in HG002 (both platforms return 1× CAG on
     identical-length consensuses at that position).
 
-  RFC1 alignment degeneracy in pure AAAAG (HiFi only)
+  RFC1 alignment degeneracy in pure AAAAG (HiFi, workaround via pad=20)
     The AAAAG 5-mer repeat is pure periodic sequence.  For HiFi reads (~0.1-0.5%
     error), DP paths offset by ±5, ±10, ... positions score nearly identically;
-    different reads anchor to different graph positions, causing graph fragmentation.
-    The consensus has the correct length but count_units finds only ~60× (longest
-    unbroken run before the first fork).  Band width and unbanded DP are both
-    ineffective: the degeneracy is in the scoring landscape, not the band.
+    different reads anchor to different graph positions, causing internal graph
+    fragmentation.  Band width and unbanded DP alone are both ineffective: the
+    degeneracy is in the scoring landscape, not the band.
     ONT works because 4-8% errors break the periodicity and force each read to the
-    correct diagonal.  HiFi fix requires flanking-anchor pre-processing or
-    run-length encoding.  The bimodal read-length estimate gives the correct count.
+    correct diagonal.  HiFi is handled via a two-step mechanism with pad=20: (1)
+    with only 20 bp unique flanks, banded DP scrambling of the repeat causes the
+    right flank to lose coverage and be boundary-trimmed, dropping the consensus to
+    ~50% of the median read length; (2) the truncation detector fires and retries
+    with unbanded DP, yielding the correct ~106× AAAAG count (within ±10 of truth
+    115×).  pad=100 does not trigger this: the longer flank survives boundary trim
+    even with a scrambled repeat, ratio stays ~1.0, and no retry fires.
 
   ATXN2 interrupted GCT/GTT structure
     ATXN2 uses the GCT unit (a CAG rotation; revcomp of CAG), with GTT
@@ -189,18 +193,16 @@ HG38_LOCI: list[Locus] = [
     # AAAAG expansion (~115 units, ~520 bp insertion vs. reference).  The disease-causing
     # allele is AAGGG; HG002 has only AAAAG so it is unaffected.
     #
-    # Known bug: POA cannot correctly assemble a pure AAAAG repeat from HiFi reads.
-    # The root cause is alignment degeneracy: for AAAAG×N aligned against AAAAG×N, DP
-    # paths offset by ±5, ±10, ... positions score near-identically.  HiFi reads have
-    # so few errors (~0.1-0.5%) that different reads naturally anchor to different
-    # positions in the degenerate landscape, causing graph fragmentation.  The consensus
-    # has the correct LENGTH but count_units finds only ~60× (the longest unbroken run
-    # before the first fork).  Band width and unbanded DP both fail for the same reason:
-    # the degeneracy is in the scoring landscape, not in the band constraint.
-    # ONT works because 4-8% errors break the periodicity and force reads to the correct
-    # diagonal.  The fix requires flanking-anchor pre-processing (extract_flanked_region)
-    # or run-length encoding of the repeat before graph construction.
-    # The bimodal read-length estimate (printed below) gives the correct count.
+    # HiFi alignment degeneracy workaround (pad=20):
+    # For AAAAG×N, DP paths offset by ±5, ±10, ... positions score near-identically.
+    # HiFi reads (~0.1-0.5% error) cause different reads to anchor to different graph
+    # positions, fragmenting the graph.  The consensus length is wrong, not just the
+    # count.  With pad=20, the 20 bp right flank loses coverage when the repeat is
+    # scrambled and is boundary-trimmed, making the consensus ~50% of median read
+    # length.  The truncation detector retries with unbanded DP and recovers ~106×
+    # AAAAG (within ±10 of the 115× truth).  pad=100 does not work: the longer flank
+    # survives boundary trim, ratio stays ~1.0, and no retry fires.
+    # ONT works without this workaround because 4-8% errors break the periodicity.
     Locus(
         "RFC1",
         "chr4",
@@ -290,7 +292,7 @@ HG38_LOCI: list[Locus] = [
 #
 # RFC1: one normal AAAAG allele and one large non-pathogenic AAAAG expansion
 # (~115 units from a 520 bp insertion in the HG002 paternal haplotype, bedpull
-# README).  Marked known_bug=True; POA bug #4 silently truncates this repeat.
+# README).  Works with pad=20 + truncation-detection unbanded retry (~106× HiFi).
 #
 # ATXN3: coordinates chr14:92,071,992-92,072,120 are incorrect for hg38 HG002
 # (both platforms return 1× CAG on two identical-length consensuses).  Omitted
@@ -320,10 +322,8 @@ HG002_TRUTH: dict[str, dict] = {
         "alleles": [11, 115],
         "confidence": "medium",
         "source": "bedpull README (520 bp paternal insertion = ~104 extra AAAAG units)",
-        "known_bug": True,
-        "note": "HiFi: alignment degeneracy in pure AAAAG prevents correct POA assembly "
-        "regardless of band settings; ONT works because error rate breaks periodicity. "
-        "Bimodal read-length estimate gives the correct count for HiFi.",
+        "note": "HiFi: pad=20 triggers truncation-detection unbanded retry (~106× vs 115× truth). "
+        "ONT works directly; HP-tag splitting produces ~25 reads/haplotype at correct count.",
     },
     "ATXN1": {
         "alleles": [14, 15],
