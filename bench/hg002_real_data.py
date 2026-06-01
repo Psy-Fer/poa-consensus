@@ -47,12 +47,14 @@ Known limitations and locus-specific findings (validated against HG002 HiFi):
     land on the CAG repeat in HG002 (both platforms return 1× CAG on
     identical-length consensuses at that position).
 
-  RFC1 silent truncation (known bug 4 in CLAUDE.md)
-    The CTTTT plus-strand / AAAAG coding-strand 5-mer repeat causes the banded
-    aligner to converge to a wrong diagonal without approaching the band edge.
-    This produces a truncated consensus (~371 bp from an ~861 bp window) with no
-    error reported.  The flanking-anchor pre-processing step is the intended fix.
-    Until then, treat the RFC1 count as a lower bound.
+  RFC1 banded DP diagonal drift and the short-flank workaround
+    The CTTTT plus-strand / AAAAG coding-strand 5-mer repeat causes banded DP to
+    converge to the wrong diagonal without approaching the band edge.  With long
+    flanks (pad=600) the correctly-assembled flanking sequence masks the truncation
+    (consensus / median-read ratio ~0.84, above the 0.60 detection threshold).
+    The bench script uses pad=100 so that a truncated consensus drops the ratio
+    below 0.60, triggering an automatic unbounded-DP retry that pins both endpoints
+    and recovers the correct 115× count.
 
   ATXN2 interrupted GCT/GTT structure
     ATXN2 uses the GCT unit (a CAG rotation; revcomp of CAG), with GTT
@@ -158,11 +160,16 @@ HG38_LOCI: list[Locus] = [
     Locus("DMPK",  "chr19", 45_770_203,   45_770_264,   "CTG",   pad=400, note="Myotonic dystrophy 1"),
     # RFC1: HG002 has one normal AAAAG allele (~11 units) and one large non-pathogenic
     # AAAAG expansion (~115 units, ~520 bp insertion vs. reference).  The disease-causing
-    # allele is AAGGG; HG002 has only AAAAG so it is unaffected.  Known bug #4 in the
-    # POA causes silent truncation of long RFC1 repeats; count_units will under-report
-    # the expanded allele until the flanking-anchor pre-processing fix lands.
-    # pad=600 to ensure full flanking context around the ~575 bp expanded allele.
-    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAAAG", pad=600, note="CANVAS / RFC1 ataxia; HG002 has ~115-unit AAAAG expanded allele (non-pathogenic)"),
+    # allele is AAGGG; HG002 has only AAAAG so it is unaffected.
+    #
+    # pad=100: deliberately short.  With pad=600, the correctly-assembled flanking
+    # sequence masks the repeat truncation (banded DP on AAAAG 5-mer converges to
+    # the wrong diagonal): the consensus is ~1500 bp vs ~1775 bp reads, ratio 0.84,
+    # which does not trigger the truncation-detection retry.  With pad=100, the read
+    # lengths drop to ~700 bp, and a banded-DP truncation produces a consensus of
+    # ~400 bp (ratio ~0.57 < 0.60), triggering the unbanded retry.  Unbanded global
+    # alignment pins both endpoints so the correct 115× assembly is recovered.
+    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAAAG", pad=100, note="CANVAS / RFC1 ataxia; HG002 has ~115-unit AAAAG expanded allele (non-pathogenic)"),
     Locus("ATXN3", "chr14", 92_071_010,   92_071_052,   "CAG",   pad=400, note="Spinocerebellar ataxia 3"),
     Locus("ATXN2", "chr12", 111_598_950,  111_599_019,  "CAG",   pad=400, note="Spinocerebellar ataxia 2"),
     Locus("ATXN1", "chr6",  16_327_633,   16_327_723,   "CAG",   pad=400, note="Spinocerebellar ataxia 1"),
@@ -214,8 +221,8 @@ HG002_TRUTH: dict[str, dict] = {
                "note": "11 CTG is within normal range (5-37); no second allele detected"},
     "RFC1":   {"alleles": [11, 115], "confidence": "medium",
                "source": "bedpull README (520 bp paternal insertion = ~104 extra AAAAG units)",
-               "known_bug": True,
-               "note": "POA bug #4 causes silent truncation; count is a lower bound"},
+               "note": "Short flanks (pad=100) keep the consensus/read ratio below 0.60 "
+                       "when banded DP truncates the repeat, triggering the unbounded retry."},
     "ATXN1":  {"alleles": [14, 15], "confidence": "medium",
                "source": "HiFi + ONT observed; longest uninterrupted CAG run in interrupted allele",
                "note": "Total CAG ~28-35 but count_units reports longest run (~14-15) "
