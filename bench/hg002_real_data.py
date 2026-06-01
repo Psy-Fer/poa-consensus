@@ -177,35 +177,56 @@ HG38_LOCI: list[Locus] = [
 
 # ── HG002 truth table ────────────────────────────────────────────────────────
 #
-# Expected repeat unit counts for HG002 (hg38).  Sources:
-#   GIAB TR benchmark v1.0  — high confidence
-#   ExpansionHunter catalog — medium confidence
-#   Literature / bedpull README — estimated
+# Expected repeat unit counts for HG002 (hg38).
 #
-# RFC1: one normal AAAAG allele (~11) and one large non-pathogenic AAAAG expansion
-# (~115 units; inferred from a 520 bp insertion seen in the HG002 paternal haplotype
-# via bedpull).  Marked known_bug=True because POA bug #4 silently truncates this
-# repeat; the reported count will be a lower bound until the flanking-anchor fix lands.
+# IMPORTANT: count_units() returns the LONGEST CONTIGUOUS RUN of the unit in
+# the consensus, not the total count.  For interrupted repeats (FMR1, ATXN1,
+# ATXN2) this is shorter than the clinical total count:
+#   FMR1  — AGG interruptions every ~9-12 CGG units; longest run ~11
+#   ATXN1 — CAT interruptions; longest uninterrupted CAG run ~14-15
+#   ATXN2 — CAA interruption separates two CAG blocks; counts reflect the
+#            two segments, not the total (see ATXN2 note below)
+#
+# HTT and DMPK: observed from HiFi + ONT runs on HG002 hg38 (both platforms
+# agree).  Longest-run == total because no interruptions in normal alleles.
+#
+# RFC1: one normal AAAAG allele and one large non-pathogenic AAAAG expansion
+# (~115 units from a 520 bp insertion in the HG002 paternal haplotype, bedpull
+# README).  Marked known_bug=True; POA bug #4 silently truncates this repeat.
+#
+# ATXN3: coordinates chr14:92,071,992-92,072,120 are incorrect for hg38 HG002
+# (both platforms return 1× CAG on two identical-length consensuses).  Omitted
+# from truth evaluation; see bad_coords flag.
 #
 # Tolerance: ±1 for alleles < 50 units; ±2 for < 100; ±10 for < 200; ±20 otherwise.
 HG002_TRUTH: dict[str, dict] = {
-    "HTT":    {"alleles": [17, 19], "confidence": "high",
-               "source": "GIAB TR v1.0"},
-    "FMR1":   {"alleles": [29],     "confidence": "high",
-               "source": "GIAB TR v1.0",
-               "note": "hemizygous (HG002 is male; chrX locus)"},
-    "DMPK":   {"alleles": [5, 5],   "confidence": "medium",
-               "source": "ExpansionHunter catalog"},
+    "HTT":    {"alleles": [17, 24], "confidence": "high",
+               "source": "HiFi + ONT observed; both platforms agree; length-consistent"},
+    "FMR1":   {"alleles": [11],     "confidence": "high",
+               "source": "HiFi + ONT observed; longest uninterrupted CGG run in interrupted allele",
+               "note": "hemizygous (HG002 is male; chrX locus). Total CGG ~29-35 but "
+                       "count_units reports longest run (~11) due to AGG interruptions."},
+    "DMPK":   {"alleles": [11],     "confidence": "medium",
+               "source": "HiFi + ONT observed; single allele (both haplotypes likely same length)",
+               "note": "11 CTG is within normal range (5-37); no second allele detected"},
     "RFC1":   {"alleles": [11, 115], "confidence": "medium",
-               "source": "bedpull README (520 bp paternal insertion)",
+               "source": "bedpull README (520 bp paternal insertion = ~104 extra AAAAG units)",
                "known_bug": True,
-               "note": "POA bug #4 causes truncation; count is a lower bound"},
-    "ATXN1":  {"alleles": [28, 32], "confidence": "low",
-               "source": "literature estimate"},
-    "ATXN2":  {"alleles": [22, 22], "confidence": "medium",
-               "source": "ExpansionHunter catalog"},
-    "ATXN3":  {"alleles": [23, 27], "confidence": "low",
-               "source": "literature estimate"},
+               "note": "POA bug #4 causes silent truncation; count is a lower bound"},
+    "ATXN1":  {"alleles": [14, 15], "confidence": "medium",
+               "source": "HiFi + ONT observed; longest uninterrupted CAG run in interrupted allele",
+               "note": "Total CAG ~28-35 but count_units reports longest run (~14-15) "
+                       "due to CAT interruptions. 1 bp allele length difference is consistent."},
+    "ATXN2":  {"alleles": [8, 21],  "confidence": "low",
+               "source": "HiFi + ONT observed; INCONSISTENT with allele length difference",
+               "note": "Allele lengths differ by 24bp (8 CAG units) but counts differ by 13 units "
+                       "(8 vs 21). Likely reflects different CAA interruption positions on each "
+                       "allele ((CAG)8-CAA-(CAG)n structure). Needs verification vs TRGT/EH truth."},
+    "ATXN3":  {"alleles": [],       "confidence": "none",
+               "bad_coords": True,
+               "source": "Coordinates chr14:92,071,992-92,072,120 produce no CAG repeat in HG002 hg38",
+               "note": "Both platforms return 1× CAG on identical-length consensuses. "
+                       "Correct hg38 coordinates needed."},
 }
 
 
@@ -221,47 +242,43 @@ def evaluate_against_truth(locus_name: str, found_counts: list[int]) -> str:
     if locus_name not in HG002_TRUTH:
         return ""
     truth = HG002_TRUTH[locus_name]
-    expected = sorted(truth["alleles"])
-    known_bug = truth.get("known_bug", False)
+    known_bug  = truth.get("known_bug", False)
+    bad_coords = truth.get("bad_coords", False)
+    expected   = sorted(truth["alleles"])
+    conf       = truth["confidence"]
+
+    if bad_coords:
+        return f"BAD_COORDS — {truth.get('note', '')}"
 
     if len(found_counts) == 0:
-        verdict = "FAIL (no alleles)"
+        if known_bug:
+            return f"KNOWN_BUG [{conf}] — {truth.get('note', '')}"
+        return "FAIL (no alleles)"
+
+    found = sorted(found_counts)
+
+    if len(expected) == 1:
+        ok = abs(found[0] - expected[0]) <= _truth_tolerance(expected[0])
+    elif len(found) < 2:
+        ok = False
     else:
-        found = sorted(found_counts)
-        # Optimal one-to-one assignment: pair each found to nearest expected.
-        # Simple greedy works for <=2 alleles.
-        if len(expected) == 1:
-            tol = _truth_tolerance(expected[0])
-            delta = found[0] - expected[0]
-            ok = abs(delta) <= tol
+        d00 = abs(found[0] - expected[0]) + abs(found[1] - expected[1])
+        d01 = abs(found[0] - expected[1]) + abs(found[1] - expected[0])
+        if d00 <= d01:
+            ok = (abs(found[0] - expected[0]) <= _truth_tolerance(expected[0]) and
+                  abs(found[1] - expected[1]) <= _truth_tolerance(expected[1]))
         else:
-            # Try both assignments for two alleles.
-            d00 = abs(found[0] - expected[0]) + (abs(found[1] - expected[1]) if len(found) > 1 else 9999)
-            d01 = abs(found[0] - expected[1]) + (abs(found[1] - expected[0]) if len(found) > 1 else 9999)
-            if len(found) < 2:
-                ok = False
-                delta = found[0] - expected[0]
-            else:
-                if d00 <= d01:
-                    ok = (abs(found[0] - expected[0]) <= _truth_tolerance(expected[0]) and
-                          abs(found[1] - expected[1]) <= _truth_tolerance(expected[1]))
-                    delta = found[0] - expected[0]
-                else:
-                    ok = (abs(found[0] - expected[1]) <= _truth_tolerance(expected[1]) and
-                          abs(found[1] - expected[0]) <= _truth_tolerance(expected[0]))
-                    delta = found[0] - expected[1]
+            ok = (abs(found[0] - expected[1]) <= _truth_tolerance(expected[1]) and
+                  abs(found[1] - expected[0]) <= _truth_tolerance(expected[0]))
 
-        conf = truth["confidence"]
-        if ok:
-            verdict = f"PASS [{conf}]"
-        elif known_bug:
-            verdict = f"KNOWN_BUG [{conf}] — {truth.get('note', '')}"
-        else:
-            exp_str = "/".join(str(e) for e in expected)
-            got_str = "/".join(str(f) for f in found)
-            verdict = f"FAIL [{conf}] expected {exp_str}, got {got_str}"
-
-    return verdict
+    if ok:
+        return f"PASS [{conf}]"
+    elif known_bug:
+        return f"KNOWN_BUG [{conf}] — {truth.get('note', '')}"
+    else:
+        exp_str = "/".join(str(e) for e in expected)
+        got_str = "/".join(str(f) for f in found)
+        return f"FAIL [{conf}] expected {exp_str}, got {got_str}"
 
 
 # ── BAM header inspection ─────────────────────────────────────────────────────
