@@ -153,10 +153,13 @@ HG38_LOCI: list[Locus] = [
     Locus("HTT",   "chr4",  3_074_877,    3_074_944,    "CAG",   pad=400, note="Huntington disease"),
     Locus("FMR1",  "chrX",  147_912_050,  147_912_110,  "CGG",   pad=400, note="Fragile X syndrome"),
     Locus("DMPK",  "chr19", 45_770_203,   45_770_264,   "CTG",   pad=400, note="Myotonic dystrophy 1"),
-    # RFC1: normal allele is AAAAG (on the minus/coding strand); disease allele is AAGGG.
-    # HG002 is healthy so we count AAAAG.  The revcomp fix in count_units also finds the
-    # plus-strand representation (CTТTТ) automatically.
-    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAAAG", pad=400, note="CANVAS / RFC1 ataxia (normal: AAAAG; disease: AAGGG)"),
+    # RFC1: HG002 has one normal AAAAG allele (~11 units) and one large non-pathogenic
+    # AAAAG expansion (~115 units, ~520 bp insertion vs. reference).  The disease-causing
+    # allele is AAGGG; HG002 has only AAAAG so it is unaffected.  Known bug #4 in the
+    # POA causes silent truncation of long RFC1 repeats; count_units will under-report
+    # the expanded allele until the flanking-anchor pre-processing fix lands.
+    # pad=600 to ensure full flanking context around the ~575 bp expanded allele.
+    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAAAG", pad=600, note="CANVAS / RFC1 ataxia; HG002 has ~115-unit AAAAG expanded allele (non-pathogenic)"),
     Locus("ATXN3", "chr14", 92_071_992,   92_072_120,   "CAG",   pad=400, note="Spinocerebellar ataxia 3"),
     Locus("ATXN2", "chr12", 111_598_950,  111_599_019,  "CAG",   pad=400, note="Spinocerebellar ataxia 2"),
     Locus("ATXN1", "chr6",  16_327_633,   16_327_723,   "CAG",   pad=400, note="Spinocerebellar ataxia 1"),
@@ -171,6 +174,95 @@ HG38_LOCI: list[Locus] = [
     Locus("ACTB",  "chr7",  5_529_264,   5_529_600,   "",      pad=200,
           note="ACTB coding (housekeeping control)", category="control"),
 ]
+
+# ── HG002 truth table ────────────────────────────────────────────────────────
+#
+# Expected repeat unit counts for HG002 (hg38).  Sources:
+#   GIAB TR benchmark v1.0  — high confidence
+#   ExpansionHunter catalog — medium confidence
+#   Literature / bedpull README — estimated
+#
+# RFC1: one normal AAAAG allele (~11) and one large non-pathogenic AAAAG expansion
+# (~115 units; inferred from a 520 bp insertion seen in the HG002 paternal haplotype
+# via bedpull).  Marked known_bug=True because POA bug #4 silently truncates this
+# repeat; the reported count will be a lower bound until the flanking-anchor fix lands.
+#
+# Tolerance: ±1 for alleles < 50 units; ±2 for < 100; ±10 for < 200; ±20 otherwise.
+HG002_TRUTH: dict[str, dict] = {
+    "HTT":    {"alleles": [17, 19], "confidence": "high",
+               "source": "GIAB TR v1.0"},
+    "FMR1":   {"alleles": [29],     "confidence": "high",
+               "source": "GIAB TR v1.0",
+               "note": "hemizygous (HG002 is male; chrX locus)"},
+    "DMPK":   {"alleles": [5, 5],   "confidence": "medium",
+               "source": "ExpansionHunter catalog"},
+    "RFC1":   {"alleles": [11, 115], "confidence": "medium",
+               "source": "bedpull README (520 bp paternal insertion)",
+               "known_bug": True,
+               "note": "POA bug #4 causes truncation; count is a lower bound"},
+    "ATXN1":  {"alleles": [28, 32], "confidence": "low",
+               "source": "literature estimate"},
+    "ATXN2":  {"alleles": [22, 22], "confidence": "medium",
+               "source": "ExpansionHunter catalog"},
+    "ATXN3":  {"alleles": [23, 27], "confidence": "low",
+               "source": "literature estimate"},
+}
+
+
+def _truth_tolerance(n: int) -> int:
+    if n < 50:   return 1
+    if n < 100:  return 2
+    if n < 200:  return 10
+    return 20
+
+
+def evaluate_against_truth(locus_name: str, found_counts: list[int]) -> str:
+    """Compare repeat counts to HG002 truth; return a status string."""
+    if locus_name not in HG002_TRUTH:
+        return ""
+    truth = HG002_TRUTH[locus_name]
+    expected = sorted(truth["alleles"])
+    known_bug = truth.get("known_bug", False)
+
+    if len(found_counts) == 0:
+        verdict = "FAIL (no alleles)"
+    else:
+        found = sorted(found_counts)
+        # Optimal one-to-one assignment: pair each found to nearest expected.
+        # Simple greedy works for <=2 alleles.
+        if len(expected) == 1:
+            tol = _truth_tolerance(expected[0])
+            delta = found[0] - expected[0]
+            ok = abs(delta) <= tol
+        else:
+            # Try both assignments for two alleles.
+            d00 = abs(found[0] - expected[0]) + (abs(found[1] - expected[1]) if len(found) > 1 else 9999)
+            d01 = abs(found[0] - expected[1]) + (abs(found[1] - expected[0]) if len(found) > 1 else 9999)
+            if len(found) < 2:
+                ok = False
+                delta = found[0] - expected[0]
+            else:
+                if d00 <= d01:
+                    ok = (abs(found[0] - expected[0]) <= _truth_tolerance(expected[0]) and
+                          abs(found[1] - expected[1]) <= _truth_tolerance(expected[1]))
+                    delta = found[0] - expected[0]
+                else:
+                    ok = (abs(found[0] - expected[1]) <= _truth_tolerance(expected[1]) and
+                          abs(found[1] - expected[0]) <= _truth_tolerance(expected[0]))
+                    delta = found[0] - expected[1]
+
+        conf = truth["confidence"]
+        if ok:
+            verdict = f"PASS [{conf}]"
+        elif known_bug:
+            verdict = f"KNOWN_BUG [{conf}] — {truth.get('note', '')}"
+        else:
+            exp_str = "/".join(str(e) for e in expected)
+            got_str = "/".join(str(f) for f in found)
+            verdict = f"FAIL [{conf}] expected {exp_str}, got {got_str}"
+
+    return verdict
+
 
 # ── BAM header inspection ─────────────────────────────────────────────────────
 
@@ -493,18 +585,19 @@ def main() -> None:
     print()
 
     col_w = dict(locus=9, chrom=6, region=26, unit=6, depth=6,
-                 alleles=30, repeats=20, time=8)
+                 alleles=30, repeats=20, time=8, verdict=30)
     header_row = (
         f"  {'Locus':<{col_w['locus']}}  {'Chrom':<{col_w['chrom']}}"
         f"  {'Region':<{col_w['region']}}  {'Unit':<{col_w['unit']}}"
         f"  {'Depth':>{col_w['depth']}}  {'Allele lengths':<{col_w['alleles']}}"
         f"  {'Repeat counts':<{col_w['repeats']}}  {'Time':>{col_w['time']}}"
+        f"  {'Truth check':<{col_w['verdict']}}"
     )
     sep = "  " + "─" * (len(header_row) - 2)
 
     tsv_rows: list[str] = [
         "\t".join(["locus", "category", "chrom", "start", "end", "unit", "depth",
-                   "allele_lengths_bp", "repeat_counts", "time_s", "note"])
+                   "allele_lengths_bp", "repeat_counts", "time_s", "verdict"])
     ]
 
     # ── Per-locus loop ────────────────────────────────────────────────────────
@@ -535,11 +628,11 @@ def main() -> None:
             allele_str = f"SKIP (depth {depth} < {locus.min_depth})"
             repeat_str = ""
             _print_row(col_w, locus.name, chrom, locus.start, locus.end,
-                       locus.unit, depth, allele_str, repeat_str, elapsed)
+                       locus.unit, depth, allele_str, repeat_str, elapsed, "")
             tsv_rows.append("\t".join([
                 locus.name, locus.category, chrom,
                 str(locus.start), str(locus.end), locus.unit,
-                str(depth), "skip", "", f"{elapsed:.2f}", locus.note,
+                str(depth), "skip", "", f"{elapsed:.2f}", "",
             ]))
             continue
 
@@ -550,6 +643,7 @@ def main() -> None:
         alleles = run_poa(reads, flags, multi=multi)
         elapsed = time.perf_counter() - t0
 
+        counts: list[int] = []
         if alleles is None:
             allele_str = "ERROR"
             repeat_str = ""
@@ -565,8 +659,9 @@ def main() -> None:
             else:
                 repeat_str = "—"
 
+        verdict = evaluate_against_truth(locus.name, counts) if locus.unit else ""
         _print_row(col_w, locus.name, chrom, locus.start, locus.end,
-                   locus.unit, depth, allele_str, repeat_str, elapsed)
+                   locus.unit, depth, allele_str, repeat_str, elapsed, verdict)
 
         if args.verbose and alleles:
             for i, seq in enumerate(alleles):
@@ -575,14 +670,12 @@ def main() -> None:
                 print(f"    [{label}] {preview}...")
 
         allele_bp = "; ".join(str(len(a)) for a in (alleles or []))
-        repeat_ct = "; ".join(
-            str(count_units(a, locus.unit)) for a in (alleles or [])
-        ) if locus.unit else ""
+        repeat_ct = "; ".join(str(c) for c in counts) if counts else ""
         tsv_rows.append("\t".join([
             locus.name, locus.category, chrom,
             str(locus.start), str(locus.end), locus.unit,
             str(depth), allele_bp, repeat_ct,
-            f"{elapsed:.2f}", locus.note,
+            f"{elapsed:.2f}", verdict or locus.note,
         ]))
 
     print()
@@ -596,13 +689,15 @@ def main() -> None:
 def _print_row(col_w: dict, name: str, chrom: str,
                start: int, end: int, unit: str,
                depth: int, allele_str: str, repeat_str: str,
-               elapsed: float) -> None:
+               elapsed: float, verdict: str = "") -> None:
     region = f"{start:,}-{end:,}"
+    verdict_col = f"  {verdict:<{col_w['verdict']}}" if verdict else ""
     print(
         f"  {name:<{col_w['locus']}}  {chrom:<{col_w['chrom']}}"
         f"  {region:<{col_w['region']}}  {unit:<{col_w['unit']}}"
         f"  {depth:>{col_w['depth']}}  {allele_str:<{col_w['alleles']}}"
         f"  {repeat_str:<{col_w['repeats']}}  {elapsed:>{col_w['time']}.1f}s"
+        + verdict_col
     )
 
 

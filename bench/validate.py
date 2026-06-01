@@ -37,13 +37,17 @@ POA_BIN  = Path(__file__).parent.parent / "target/release/poa-consensus"
 
 # All other tools (minimap2, samtools, bedpull) are expected on PATH.
 
-# ── Flanks (2048 bp, no tandem repeats) ─────────────────────────────────────
+# ── Flanks (no tandem repeats) ───────────────────────────────────────────────
 
-_U = "ACGTACGTCGATCGATTAGCTAGCGCTAGCTA"   # 32 bp unit
-LEFT_FLANK  = (_U * 64)[:2048]
-RIGHT_FLANK = (_U[::-1] * 64)[:2048]
-FLANK_LEN   = 2048
-ANCHOR_PAD  = 100   # bp of flanking context included on each side of the STR locus
+_U = "ACGTACGTCGATCGATTAGCTAGCGCTAGCTA"   # 32 bp unit; CAG/GAA/CTTTT/AAAAG absent
+_LEFT_FLANK_FULL  = _U * 300              # 9600 bp pool; sliced per scenario
+_RIGHT_FLANK_FULL = _U[::-1] * 300
+
+FLANK_LEN      = 2_048   # default for short-read scenarios
+LONG_FLANK_LEN = 8_000   # for 15 k long-read scenarios
+LEFT_FLANK     = _LEFT_FLANK_FULL[:FLANK_LEN]    # backward compat alias
+RIGHT_FLANK    = _RIGHT_FLANK_FULL[:FLANK_LEN]   # backward compat alias
+ANCHOR_PAD     = 100   # bp of flanking context included on each side of the STR locus
 
 # ── Error models ────────────────────────────────────────────────────────────
 # Constraints baked in:
@@ -94,12 +98,15 @@ class Allele:
 
 @dataclass
 class Scenario:
-    name:       str
-    alleles:    list[Allele]           # one allele = single; two+ = multi-allele
-    model:      str                    # key into ERRMODELS
-    multi:      bool  = False          # pass --multi to poa-consensus
-    poa_flags:  list  = field(default_factory=list)
-    seed:       int   = 42
+    name:        str
+    alleles:     list[Allele]           # one allele = single; two+ = multi-allele
+    model:       str                    # key into ERRMODELS
+    multi:       bool  = False          # pass --multi to poa-consensus
+    poa_flags:   list  = field(default_factory=list)
+    seed:        int   = 42
+    length_mean: Optional[int] = None   # override simulated read length (default: 75% of ref)
+    flank_len:   int   = FLANK_LEN      # bp of flanking sequence on each side
+    long_read:   bool  = False          # gated behind --long-reads
 
     @property
     def is_multi(self) -> bool:
@@ -162,6 +169,35 @@ SCENARIOS: list[Scenario] = [
     Scenario("multi_skew_cag20_40",
              [Allele("CAG", 20, 24), Allele("CAG", 40, 8)],
              "ont_r10", multi=True),
+
+    # ── Long-read 15k ONT R10 (--long-reads) ────────────────────────────────
+    # 8 kb flanks on each side → ~18 kb reference; 15 kb reads span the full
+    # repeat at any reasonable allele length.  Depth 20 gives ~10 spanning reads
+    # per allele for alleles up to ~6 kb (wgs uniform coverage).
+    # These probe the long-repeat / disease-expansion regime: CAG repeat
+    # disorders (HD, SCA), FRDA GAA, and RFC1 CTTTT (CANVAS).
+    Scenario("lr_cag100_15k",
+             [Allele("CAG", 100, 20)], "ont_r10",
+             length_mean=15_000, flank_len=LONG_FLANK_LEN, long_read=True),
+    Scenario("lr_cag200_15k",
+             [Allele("CAG", 200, 20)], "ont_r10",
+             length_mean=15_000, flank_len=LONG_FLANK_LEN, long_read=True),
+    Scenario("lr_gaa200_15k",
+             [Allele("GAA", 200, 20)], "ont_r10",
+             length_mean=15_000, flank_len=LONG_FLANK_LEN, long_read=True),
+    Scenario("lr_gaa500_15k",
+             [Allele("GAA", 500, 20)], "ont_r10",
+             length_mean=15_000, flank_len=LONG_FLANK_LEN, long_read=True),
+    # CTTTT is the plus-strand RFC1 repeat unit; AAAAG is the coding-strand unit.
+    Scenario("lr_rfc1_100_15k",
+             [Allele("CTTTT", 100, 20)], "ont_r10",
+             length_mean=15_000, flank_len=LONG_FLANK_LEN, long_read=True),
+    Scenario("lr_rfc1_500_15k",
+             [Allele("CTTTT", 500, 20)], "ont_r10",
+             length_mean=15_000, flank_len=LONG_FLANK_LEN, long_read=True),
+    Scenario("lr_multi_cag100_200_15k",
+             [Allele("CAG", 100, 20), Allele("CAG", 200, 20)], "ont_r10",
+             multi=True, length_mean=15_000, flank_len=LONG_FLANK_LEN, long_read=True),
 ]
 
 
@@ -335,11 +371,14 @@ def parse_fasta(path: Path) -> list[tuple[str, bytes]]:
 # ── Pipeline steps ───────────────────────────────────────────────────────────
 
 def build_reference(scenario: Scenario, work: Path) -> Path:
-    """Write one FASTA record per allele: LEFT_FLANK + allele + RIGHT_FLANK."""
+    """Write one FASTA record per allele: left_flank + allele + right_flank."""
+    fl = scenario.flank_len
+    left  = _LEFT_FLANK_FULL[:fl]
+    right = _RIGHT_FLANK_FULL[:fl]
     ref = work / "reference.fa"
     with open(ref, "w") as fh:
         for i, allele in enumerate(scenario.alleles):
-            seq = LEFT_FLANK + allele.seq + RIGHT_FLANK
+            seq = left + allele.seq + right
             fh.write(f">allele_{i}  unit={allele.unit} count={allele.count}\n{seq}\n")
     return ref
 
@@ -347,12 +386,15 @@ def build_reference(scenario: Scenario, work: Path) -> Path:
 def simulate_reads(scenario: Scenario, ref: Path, work: Path, model: dict) -> Path:
     """Run pbsim on each allele and merge into a single FASTQ."""
     allele_len_max = max(len(a.seq) for a in scenario.alleles)
-    ref_len = FLANK_LEN * 2 + allele_len_max
+    ref_len = scenario.flank_len * 2 + allele_len_max
 
-    # Length parameters: mean = ~75 % of reference length; sd = mean / 5.
-    length_mean = max(500, int(ref_len * 0.75))
-    length_mean = min(length_mean, ref_len - 100)   # must be < ref_len
-    length_sd   = max(50, length_mean // 5)          # kappa ≤ 25
+    # Length parameters: explicit override or 75% of reference length; sd = mean / 5.
+    if scenario.length_mean is not None:
+        length_mean = scenario.length_mean
+    else:
+        length_mean = max(500, int(ref_len * 0.75))
+        length_mean = min(length_mean, ref_len - 100)   # must be < ref_len
+    length_sd   = max(50, length_mean // 5)              # kappa ≤ 25
 
     # pbsim outputs one .fq.gz per FASTA sequence (allele_0001.fq.gz, etc.)
     prefix = str(work / "sim")
@@ -441,10 +483,11 @@ def extract_reads(scenario: Scenario, bam: Path, work: Path) -> Path:
     bed = work / "targets.bed"
     min_lens: dict[str, int] = {}
     _flank_unit_len = len(_U)  # 32 bp
+    fl = scenario.flank_len
     with open(bed, "w") as fh:
         for i, allele in enumerate(scenario.alleles):
-            start = max(0, FLANK_LEN - ANCHOR_PAD)
-            end   = FLANK_LEN + len(allele.seq) + ANCHOR_PAD
+            start = max(0, fl - ANCHOR_PAD)
+            end   = fl + len(allele.seq) + ANCHOR_PAD
             fh.write(f"allele_{i}\t{start}\t{end}\n")
             # Phase-shifting is a problem only when the repeat is shorter than
             # the flank unit (32 bp): a shift of ≥1 unit displaces the read
@@ -691,6 +734,8 @@ def main():
     ap.add_argument("--scenarios", nargs="*", help="Scenario names to run (default: all)")
     ap.add_argument("--workdir", default="bench/work", help="Working directory for temp files")
     ap.add_argument("--keep", action="store_true", help="Keep working files after run")
+    ap.add_argument("--long-reads", action="store_true",
+                    help="Include 15 kb long-read scenarios (slow; requires long pbsim runs)")
     args = ap.parse_args()
 
     # Verify required binaries
@@ -701,8 +746,10 @@ def main():
             sys.exit(f"error: {name} not found ({binary}); build CLI with: cargo build --release --features cli")
 
     to_run = SCENARIOS
+    if not args.long_reads:
+        to_run = [s for s in to_run if not s.long_read]
     if args.scenarios:
-        to_run = [s for s in SCENARIOS if s.name in args.scenarios]
+        to_run = [s for s in to_run if s.name in args.scenarios]
         unknown = set(args.scenarios) - {s.name for s in SCENARIOS}
         if unknown:
             print(f"warning: unknown scenarios: {', '.join(sorted(unknown))}", file=sys.stderr)
