@@ -1131,7 +1131,11 @@ mod tests {
 
     // ── diagnose: truncation_suspected ───────────────────────────────────────
 
-    fn make_consensus_with_median(seq_len: usize, n_reads: usize, median_read_len: usize) -> Consensus {
+    fn make_consensus_with_median(
+        seq_len: usize,
+        n_reads: usize,
+        median_read_len: usize,
+    ) -> Consensus {
         let mut gs = GraphStats::default();
         gs.median_input_read_len = median_read_len;
         Consensus {
@@ -1161,7 +1165,13 @@ mod tests {
     fn truncation_clean_when_ratio_above_threshold() {
         // consensus 820 bp, median read 861 bp → ratio 0.95 — no truncation
         let c = make_consensus_with_median(820, 20, 861);
-        let w = diagnose(&c, &DiagnoseConfig { depth_warn_threshold: 0, ..Default::default() });
+        let w = diagnose(
+            &c,
+            &DiagnoseConfig {
+                depth_warn_threshold: 0,
+                ..Default::default()
+            },
+        );
         assert!(w.truncation_suspected.is_none());
     }
 
@@ -1169,7 +1179,13 @@ mod tests {
     fn truncation_suppressed_when_median_zero() {
         // median_input_read_len == 0 → check skipped
         let c = make_consensus_with_median(50, 20, 0);
-        let w = diagnose(&c, &DiagnoseConfig { depth_warn_threshold: 0, ..Default::default() });
+        let w = diagnose(
+            &c,
+            &DiagnoseConfig {
+                depth_warn_threshold: 0,
+                ..Default::default()
+            },
+        );
         assert!(w.truncation_suspected.is_none());
     }
 
@@ -1178,9 +1194,9 @@ mod tests {
         let c = make_consensus_with_median(371, 20, 861);
         let w = diagnose(&c, &DiagnoseConfig::default());
         let msgs = w.messages("rfc1");
-        let has_truncation = msgs.iter().any(|(is_warn, msg)| {
-            *is_warn && msg.contains("43%") && msg.contains("861 bp")
-        });
+        let has_truncation = msgs
+            .iter()
+            .any(|(is_warn, msg)| *is_warn && msg.contains("43%") && msg.contains("861 bp"));
         assert!(has_truncation, "expected truncation warning in: {:?}", msgs);
     }
 }
