@@ -45,8 +45,8 @@ pub struct PoaConfig {
 impl Default for PoaConfig {
     fn default() -> Self {
         PoaConfig {
-            band_width: 0,
-            adaptive_band: false,
+            band_width: 50,
+            adaptive_band: true,
             adaptive_band_b: 10,
             adaptive_band_f: 0.01,
             match_score: 1,
@@ -56,7 +56,7 @@ impl Default for PoaConfig {
             min_coverage_fraction: 0.0,
             min_allele_freq: 0.2,
             min_reads: 1,
-            alignment_mode: AlignmentMode::Global,
+            alignment_mode: AlignmentMode::SemiGlobal,
             consensus_mode: ConsensusMode::HeaviestPath,
             warn_on_long_unbanded: true,
             phasing_bubble_min_span: 10,

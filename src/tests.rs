@@ -301,7 +301,19 @@ fn diag_frda_gaa_rotation_with_flanking() {
         make("AAGAAGAAGAAG"),
         make("AGAAGAAGAAGA"),
     ];
-    let result = s(&consensus(&reads, 0));
+    // All reads are constructed to span the full TTTCCC..GGGAAA region, so global
+    // alignment is correct here: the traceback is forced to (n, l), anchoring both
+    // ends of the consensus.  With SemiGlobal the traceback exits from the max score
+    // in the last row; rotation-phase bubbles create near-tied scores at the tail and
+    // the traceback exits one base early.  Real data uses SemiGlobal because reads do
+    // not always span the full locus; here they do, so global is unambiguous.
+    let cfg = PoaConfig {
+        band_width: 0,
+        adaptive_band: false,
+        alignment_mode: AlignmentMode::Global,
+        ..PoaConfig::default()
+    };
+    let result = s(&consensus_cfg(&reads, 0, cfg));
     assert_eq!(result.len(), 24, "got: '{}'", result);
 }
 
@@ -1001,6 +1013,7 @@ fn global_produces_prefix_deletes_for_mid_start_read() {
     // producing Delete ops for those nodes.
     let cfg = PoaConfig {
         band_width: 0,
+        alignment_mode: AlignmentMode::Global,
         ..Default::default()
     };
     let graph = PoaGraph::new(b"GGACGT", cfg).unwrap();
@@ -1209,13 +1222,25 @@ fn stats_entropy_nonzero_on_length_variation() {
     // (Shorter reads aligned to a longer graph in global mode don't generate trailing
     // deletes — they simply stop at the best-scoring diagonal. Leading deletes DO fire
     // because the traceback reaches t=0, j=0 via the D-chain at the j=0 column.)
+    // Global alignment is required here: with SemiGlobal, shorter reads take a free
+    // terminal gap over the XXX prefix and never traverse those nodes, so delete_count=0.
     let reads = vec![
         b("XXXCATCATCAT"),
         b("CATCATCAT"),
         b("CATCATCAT"),
         b("CATCATCAT"),
     ];
-    let st = build_graph(&reads, 0).stats();
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::Global,
+        band_width: 0,
+        adaptive_band: false,
+        ..PoaConfig::default()
+    };
+    let mut graph = PoaGraph::new(&reads[0], cfg).unwrap();
+    for read in &reads[1..] {
+        graph.add_read(read).unwrap();
+    }
+    let st = graph.stats();
     // X nodes: coverage=1, delete_count=3 → p=0.25, binary_entropy(0.25) ≈ 0.811 bits.
     assert!(
         st.mean_column_entropy > 0.0,

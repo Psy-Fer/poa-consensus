@@ -11,6 +11,38 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.1.2] - 2026-06-01
+
+### Changed
+
+- **`PoaConfig::default()` now uses `AlignmentMode::SemiGlobal`** (was `Global`). Semi-global
+  alignment (free terminal gaps on the graph) is correct for extracted STR reads, which start
+  and end at slightly different positions depending on where each read clips into the flanking
+  sequence. Global alignment silently produces wrong boundary behaviour when the seed has more
+  leading identical bases than most reads: shorter reads place their deletions inside the
+  homopolymer run (not at the start), leaving the extra node on the only spine path where
+  boundary trim cannot reach it. Confirmed on FRDA FXN HiFi data.
+- **`PoaConfig::default()` now uses `adaptive_band: true, band_width: 50`** (was `false, 0`).
+  The previous unbanded default was impractical for reads above ~1 kb and silently produced
+  wrong unit counts in long repetitive alleles when called with the recommended adaptive + 50
+  floor settings. The new default matches the recommended single-allele STR configuration.
+  The 50 bp floor prevents unit loss that the raw adaptive formula (w ≈ 15 for 500 bp reads)
+  would allow. Callers that need unbanded DP (e.g. correctness tests, short reads where memory
+  is not a concern) can set `band_width: 0, adaptive_band: false` explicitly.
+
+### CLI changes
+
+- **`--semi-global` removed**; semi-global is now the default. Use `--global` to opt into
+  global alignment (useful when reads are guaranteed to span the full locus from identical
+  start/end positions).
+- **`--adaptive-band` removed**; adaptive band is now the default. Use `--no-adaptive-band`
+  to disable.
+- **`--band-width` default changed from `0` to `50`**. Together with adaptive band, the
+  effective band is `max(50, 10 + 0.01 × read_len)`. Pass `--no-adaptive-band --band-width 0`
+  for fully unbanded alignment.
+
+---
+
 ## [0.1.1] - 2026-06-01
 
 ### Added
@@ -86,6 +118,7 @@ Initial release.
   histogram, node-coverage histogram, alignment-density heatmap, band-with-reads overlay.
 - 193 tests; 20/20 synthetic validation scenarios passing (two via adequacy signals).
 
-[Unreleased]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Psy-Fer/poa-consensus/releases/tag/v0.1.0

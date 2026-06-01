@@ -21,15 +21,16 @@ struct Args {
     #[arg(short, long)]
     seed: Option<usize>,
 
-    /// Fixed band width for banded DP (0 = unbanded; set to ≥ expected length
-    /// variation between reads).
-    #[arg(short = 'b', long, default_value_t = 0)]
+    /// Fixed band width floor for banded DP (0 = unbanded).  Combined with
+    /// adaptive band (default on), effective width is max(band_width, adaptive
+    /// formula).  Set to 0 with --no-adaptive-band for fully unbanded DP.
+    #[arg(short = 'b', long, default_value_t = 50)]
     band_width: usize,
 
-    /// Enable adaptive band width: w = 10 + 0.01 × read_len (recommended
-    /// above 1 kb).
+    /// Disable adaptive band width.  Adaptive band (default on) uses the
+    /// formula w = 10 + 0.01 × read_len as a floor alongside --band-width.
     #[arg(long)]
-    adaptive_band: bool,
+    no_adaptive_band: bool,
 
     /// Minimum reads required to attempt consensus.
     #[arg(long, default_value_t = 3)]
@@ -39,10 +40,12 @@ struct Args {
     #[arg(short = 'm', long)]
     multi: bool,
 
-    /// Semi-global alignment: free terminal gaps (recommended when reads do
-    /// not all span the full locus).
+    /// Global alignment: penalise terminal gaps (use when reads are guaranteed
+    /// to span the full locus from identical start/end positions).  The default
+    /// is semi-global (free terminal gaps), which is correct for extracted STR
+    /// reads that may start or end at slightly different positions.
     #[arg(long)]
-    semi_global: bool,
+    global: bool,
 
     /// Suppress all warnings and notes on stderr.  The consensus sequence is
     /// still written to stdout.  Errors that prevent consensus building are
@@ -108,19 +111,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let slices: Vec<&[u8]> = oriented.iter().map(|r| r.as_ref()).collect();
 
     // ── Config ────────────────────────────────────────────────────────────────
+    let adaptive_band = !args.no_adaptive_band;
     let config = PoaConfig {
         band_width: args.band_width,
-        adaptive_band: args.adaptive_band,
+        adaptive_band,
         min_reads: args.min_reads,
-        alignment_mode: if args.semi_global {
-            AlignmentMode::SemiGlobal
-        } else {
+        alignment_mode: if args.global {
             AlignmentMode::Global
+        } else {
+            AlignmentMode::SemiGlobal
         },
         ..PoaConfig::default()
     };
 
-    let band_desc = if args.adaptive_band {
+    let band_desc = if adaptive_band {
         "adaptive".to_string()
     } else if args.band_width == 0 {
         "unbanded".to_string()

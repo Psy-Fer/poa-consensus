@@ -96,8 +96,9 @@ fn cli_noisy_fasta_recovers_majority() {
 #[test]
 fn cli_partial_reads_semi_global() {
     build_cli();
+    // Semi-global is now the default; no flag needed.
     let out = poa_bin()
-        .args(["--semi-global", fixture("partial.fa").to_str().unwrap()])
+        .args([fixture("partial.fa").to_str().unwrap()])
         .output()
         .expect("poa-consensus failed to run");
     assert!(out.status.success(), "exit: {}", out.status);
@@ -196,8 +197,9 @@ fn cli_single_record_passthrough() {
 #[test]
 fn cli_band_header_fixed() {
     build_cli();
+    // Use --no-adaptive-band to get a fixed-width band description in the header.
     let out = poa_bin()
-        .args(["-b", "50", fixture("simple.fa").to_str().unwrap()])
+        .args(["--no-adaptive-band", "-b", "50", fixture("simple.fa").to_str().unwrap()])
         .output()
         .expect("poa-consensus failed to run");
     assert!(out.status.success());
@@ -212,8 +214,9 @@ fn cli_band_header_fixed() {
 #[test]
 fn cli_band_header_adaptive() {
     build_cli();
+    // Adaptive band is now the default; no flag needed.
     let out = poa_bin()
-        .args(["--adaptive-band", fixture("simple.fa").to_str().unwrap()])
+        .args([fixture("simple.fa").to_str().unwrap()])
         .output()
         .expect("poa-consensus failed to run");
     assert!(out.status.success());
