@@ -222,8 +222,8 @@ HG002_TRUTH: dict[str, dict] = {
                "note": "Allele lengths differ by 24bp (8 CAG units) but counts differ by 13 units "
                        "(8 vs 21). Likely reflects different CAA interruption positions on each "
                        "allele ((CAG)8-CAA-(CAG)n structure). Needs verification vs TRGT/EH truth."},
-    "ATXN3":  {"alleles": [23, 27], "confidence": "low",
-               "source": "literature estimate; corrected coordinates chr14:92,071,010-92,071,052"},
+    "ATXN3":  {"alleles": [17, 21], "confidence": "medium",
+               "source": "HiFi + ONT observed; both platforms agree; length-consistent (Δ12bp = 4 CAG)"},
 }
 
 
