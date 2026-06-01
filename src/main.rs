@@ -3,9 +3,7 @@ use std::process;
 
 use clap::Parser;
 
-use poa_consensus::{
-    AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, auto_orient, consensus_adaptive, diagnose,
-};
+use poa_consensus::{AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, auto_orient, diagnose};
 
 /// Build a consensus sequence from FASTA or FASTQ reads using Partial Order
 /// Alignment.
@@ -164,40 +162,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Single-allele path with truncation retry.
         //
-        // consensus_adaptive detects when banded DP silently converges to the
-        // wrong diagonal (ratio of consensus length to median read length < 0.60)
-        // and retries with band_width = 0.  The retry is only attempted when
-        // median_read_len <= 5000 bp; above that threshold unbanded DP is
-        // too expensive to run automatically.
+        // After getting the initial consensus, diagnose() checks whether it is
+        // suspiciously short relative to the median input read length (ratio <
+        // DiagnoseConfig::truncation_ratio_threshold, default 0.60).  When that
+        // fires AND banded DP was used AND median_read_len <= 5000 bp, rebuild
+        // with band_width = 0.  Unbanded forces the traceback to the correct
+        // graph endpoint, recovering from the wrong-diagonal failure mode.
+        //
+        // Note: consensus_adaptive is intentionally NOT used here.  That function
+        // also checks for multi-allele bubbles, which can fire on het SNPs in
+        // non-repetitive controls and produce unexpected results in a caller that
+        // expects single-allele output.
         let was_banded = config.band_width > 0 || config.adaptive_band;
-        let result = if was_banded {
-            let mut candidates = consensus_adaptive(&slices, seed_idx, &config)
-                .inspect_err(|e| explain_error(e, n))?;
-            // consensus_adaptive always returns >= 1 element; pop to get the
-            // single-allele result without cloning.
-            let c = candidates.swap_remove(0);
-            // If the retry produced a corrected result, let it through, but if
-            // reads are long (> 5 kb median) the unbanded retry is too expensive
-            // to run without explicit --band-width 0; in that case warn instead.
-            if let Some(ref t) = diagnose(&c, &DiagnoseConfig::default()).truncation_suspected {
-                if t.median_read_len > 5_000 {
-                    if !args.quiet {
-                        eprintln!(
-                            "poa-consensus: warning: consensus ({} bp) is {:.0}% of \
-                             median read length ({} bp) — suspected banded DP truncation; \
-                             retry with --band-width 0 (unbanded) to correct",
-                            t.consensus_len,
-                            t.ratio * 100.0,
-                            t.median_read_len,
-                        );
+        let mut result = poa_consensus::consensus(&slices, seed_idx, &config)
+            .inspect_err(|e| explain_error(e, n))?;
+        if was_banded {
+            let diag = diagnose(&result, &DiagnoseConfig::default());
+            if let Some(ref t) = diag.truncation_suspected {
+                if t.median_read_len <= 5_000 {
+                    let mut cfg2 = config.clone();
+                    cfg2.band_width = 0;
+                    cfg2.adaptive_band = false;
+                    if let Ok(r2) = poa_consensus::consensus(&slices, seed_idx, &cfg2) {
+                        result = r2;
                     }
+                } else if !args.quiet {
+                    eprintln!(
+                        "poa-consensus: warning: consensus ({} bp) is {:.0}% of median \
+                         read length ({} bp) — suspected banded DP truncation on a long \
+                         read set; retry with --band-width 0 to correct",
+                        t.consensus_len,
+                        t.ratio * 100.0,
+                        t.median_read_len,
+                    );
                 }
             }
-            c
-        } else {
-            poa_consensus::consensus(&slices, seed_idx, &config)
-                .inspect_err(|e| explain_error(e, n))?
-        };
+        }
         if !args.quiet {
             emit_warnings(&diagnose(&result, &DiagnoseConfig::default()), "consensus");
         }
