@@ -42,10 +42,10 @@ Known limitations and locus-specific findings (validated against HG002 HiFi):
     uninterrupted run is the clinically relevant stability predictor.
 
   ATXN3 coordinates
-    The coordinates at chr14:92,071,992-92,072,120 match the ExpansionHunter
-    hg38 catalog, but the HG002 HiFi consensus does not show CTG repeats at
-    this location.  Verify with `samtools faidx hg38.fa chr14:92071993-92072120`
-    before trusting the ATXN3 repeat count.
+    Correct hg38 coordinates are chr14:92,071,010-92,071,052.  The
+    ExpansionHunter catalog entry at chr14:92,071,992-92,072,120 does not
+    land on the CAG repeat in HG002 (both platforms return 1× CAG on
+    identical-length consensuses at that position).
 
   RFC1 silent truncation (known bug 4 in CLAUDE.md)
     The CTTTT plus-strand / AAAAG coding-strand 5-mer repeat causes the banded
@@ -160,7 +160,7 @@ HG38_LOCI: list[Locus] = [
     # the expanded allele until the flanking-anchor pre-processing fix lands.
     # pad=600 to ensure full flanking context around the ~575 bp expanded allele.
     Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAAAG", pad=600, note="CANVAS / RFC1 ataxia; HG002 has ~115-unit AAAAG expanded allele (non-pathogenic)"),
-    Locus("ATXN3", "chr14", 92_071_992,   92_072_120,   "CAG",   pad=400, note="Spinocerebellar ataxia 3"),
+    Locus("ATXN3", "chr14", 92_071_010,   92_071_052,   "CAG",   pad=400, note="Spinocerebellar ataxia 3"),
     Locus("ATXN2", "chr12", 111_598_950,  111_599_019,  "CAG",   pad=400, note="Spinocerebellar ataxia 2"),
     Locus("ATXN1", "chr6",  16_327_633,   16_327_723,   "CAG",   pad=400, note="Spinocerebellar ataxia 1"),
     # ── Non-repetitive controls ───────────────────────────────────────────────
@@ -222,11 +222,8 @@ HG002_TRUTH: dict[str, dict] = {
                "note": "Allele lengths differ by 24bp (8 CAG units) but counts differ by 13 units "
                        "(8 vs 21). Likely reflects different CAA interruption positions on each "
                        "allele ((CAG)8-CAA-(CAG)n structure). Needs verification vs TRGT/EH truth."},
-    "ATXN3":  {"alleles": [],       "confidence": "none",
-               "bad_coords": True,
-               "source": "Coordinates chr14:92,071,992-92,072,120 produce no CAG repeat in HG002 hg38",
-               "note": "Both platforms return 1× CAG on identical-length consensuses. "
-                       "Correct hg38 coordinates needed."},
+    "ATXN3":  {"alleles": [23, 27], "confidence": "low",
+               "source": "literature estimate; corrected coordinates chr14:92,071,010-92,071,052"},
 }
 
 
