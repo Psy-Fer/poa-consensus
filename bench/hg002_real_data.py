@@ -47,14 +47,17 @@ Known limitations and locus-specific findings (validated against HG002 HiFi):
     land on the CAG repeat in HG002 (both platforms return 1× CAG on
     identical-length consensuses at that position).
 
-  RFC1 banded DP diagonal drift and the short-flank workaround
+  RFC1 banded DP diagonal drift — force unbanded for this locus
     The CTTTT plus-strand / AAAAG coding-strand 5-mer repeat causes banded DP to
-    converge to the wrong diagonal without approaching the band edge.  With long
-    flanks (pad=600) the correctly-assembled flanking sequence masks the truncation
-    (consensus / median-read ratio ~0.84, above the 0.60 detection threshold).
-    The bench script uses pad=100 so that a truncated consensus drops the ratio
-    below 0.60, triggering an automatic unbounded-DP retry that pins both endpoints
-    and recovers the correct 115× count.
+    produce an internally fragmented consensus: different reads land on different
+    wrong diagonals and deposit extra AAAAG units at distinct graph positions.
+    The heaviest path skips all low-coverage insertions, producing a consensus of
+    the correct LENGTH but with a broken AAAAG run (count_units finds 60× instead
+    of 115×).  Because the length ratio stays ~1.0, the automatic truncation-
+    detection retry in the library/CLI does not fire.  The bench script forces
+    unbanded alignment (--band-width 0) via poa_extra_flags: any off-diagonal
+    drift in the AAAAG section costs N inserts + N deletes, which is always worse
+    than N matches when both endpoints are pinned by unique flanking sequence.
 
   ATXN2 interrupted GCT/GTT structure
     ATXN2 uses the GCT unit (a CAG rotation; revcomp of CAG), with GTT
@@ -143,6 +146,7 @@ class Locus:
     min_depth: int = 5  # skip locus if fewer reads overlap
     note: str = ""
     category: str = "str"  # "str" = disease repeat locus; "control" = non-repetitive
+    poa_extra_flags: list = field(default_factory=list)  # appended to the platform base flags
 
 # hg38 coordinates.  Sources: OMIM, Locus Reference Genomic, TRGT catalog.
 # Control regions: non-repetitive exonic/coding regions used as sanity checks.
@@ -162,14 +166,17 @@ HG38_LOCI: list[Locus] = [
     # AAAAG expansion (~115 units, ~520 bp insertion vs. reference).  The disease-causing
     # allele is AAGGG; HG002 has only AAAAG so it is unaffected.
     #
-    # pad=100: deliberately short.  With pad=600, the correctly-assembled flanking
-    # sequence masks the repeat truncation (banded DP on AAAAG 5-mer converges to
-    # the wrong diagonal): the consensus is ~1500 bp vs ~1775 bp reads, ratio 0.84,
-    # which does not trigger the truncation-detection retry.  With pad=100, the read
-    # lengths drop to ~700 bp, and a banded-DP truncation produces a consensus of
-    # ~400 bp (ratio ~0.57 < 0.60), triggering the unbanded retry.  Unbanded global
-    # alignment pins both endpoints so the correct 115× assembly is recovered.
-    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAAAG", pad=100, note="CANVAS / RFC1 ataxia; HG002 has ~115-unit AAAAG expanded allele (non-pathogenic)"),
+    # force_unbanded (--band-width 0): banded DP on the AAAAG 5-mer repeat converges
+    # to the wrong diagonal without approaching the band edge, producing an internally
+    # fragmented consensus of the correct LENGTH but with broken AAAAG runs (count_units
+    # finds only 60× instead of 115×).  The length ratio stays ~1.0 so the automatic
+    # truncation-detection retry in the CLI does not fire.  Unbanded global alignment
+    # pins both endpoints; any off-diagonal drift in the AAAAG section costs N inserts
+    # + N deletes, which is always worse than N matches, so the correct path is forced.
+    # For the ~700 bp reads produced by pad=100, unbanded DP is ~5 MB per read.
+    Locus("RFC1",  "chr4",  39_348_424,   39_348_485,   "AAAAG", pad=100,
+          poa_extra_flags=["--band-width", "0"],
+          note="CANVAS / RFC1 ataxia; HG002 has ~115-unit AAAAG expanded allele (non-pathogenic)"),
     Locus("ATXN3", "chr14", 92_071_010,   92_071_052,   "CAG",   pad=400, note="Spinocerebellar ataxia 3"),
     Locus("ATXN2", "chr12", 111_598_950,  111_599_019,  "CAG",   pad=400, note="Spinocerebellar ataxia 2"),
     Locus("ATXN1", "chr6",  16_327_633,   16_327_723,   "CAG",   pad=400, note="Spinocerebellar ataxia 1"),
@@ -728,17 +735,19 @@ def main() -> None:
         n_hp2 = len(hap_reads.get(2, []))
         _MIN_HP_READS = 3
 
+        locus_flags = flags + locus.poa_extra_flags
+
         if not is_control and n_hp1 >= _MIN_HP_READS and n_hp2 >= _MIN_HP_READS:
             # Both haplotypes tagged: run single-allele POA on each independently.
-            a1 = run_poa(hap_reads[1], flags, multi=False)
-            a2 = run_poa(hap_reads[2], flags, multi=False)
+            a1 = run_poa(hap_reads[1], locus_flags, multi=False)
+            a2 = run_poa(hap_reads[2], locus_flags, multi=False)
             alleles = (a1 or []) + (a2 or [])
             alleles = alleles or None
             phasing = f"hp-split HP1:{n_hp1}/HP2:{n_hp2}"
         else:
             # Unphased or control: pool all reads, use multi-allele mode.
             multi = not args.no_multi and not is_control
-            alleles = run_poa(all_reads, flags, multi=multi)
+            alleles = run_poa(all_reads, locus_flags, multi=multi)
             phasing = f"untagged:{len(hap_reads.get(0,[]))} HP1:{n_hp1} HP2:{n_hp2}"
         elapsed = time.perf_counter() - t0
 
