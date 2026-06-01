@@ -199,7 +199,12 @@ fn cli_band_header_fixed() {
     build_cli();
     // Use --no-adaptive-band to get a fixed-width band description in the header.
     let out = poa_bin()
-        .args(["--no-adaptive-band", "-b", "50", fixture("simple.fa").to_str().unwrap()])
+        .args([
+            "--no-adaptive-band",
+            "-b",
+            "50",
+            fixture("simple.fa").to_str().unwrap(),
+        ])
         .output()
         .expect("poa-consensus failed to run");
     assert!(out.status.success());
