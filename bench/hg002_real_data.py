@@ -360,6 +360,56 @@ def poa_flags(platform: str) -> list[str]:
     base = ["--adaptive-band", "--band-width", "50", "--semi-global", "--min-reads", "3"]
     return base
 
+# ── Read-length allele estimation ────────────────────────────────────────────
+
+def read_length_alleles(reads: list[bytes], unit: str, core_len: int,
+                        ref_len: int) -> Optional[str]:
+    """
+    For loci where POA fails (e.g. RFC1 bug #4), the read length distribution
+    encodes allele sizes directly: reads from the expanded allele are longer by
+    exactly the insertion size.
+
+    Fits a two-component model: reads cluster around ref_len (normal allele)
+    and ref_len + insertion (expanded allele).  Returns a human-readable
+    summary string if a bimodal split is detected, or None if the distribution
+    is unimodal.
+
+    unit_len is used to convert insertion bp → repeat units.
+    ref_len is the expected trimmed length for a non-expanded read (padded window).
+    """
+    if not reads or not unit:
+        return None
+    unit_len = len(unit)
+    lengths = sorted(len(r) for r in reads)
+
+    # Find the modal length of the "normal" cluster (readings ≤ ref_len * 1.15).
+    normal_floor = int(ref_len * 0.85)
+    normal_ceil  = int(ref_len * 1.15)
+    normal_reads = [l for l in lengths if normal_floor <= l <= normal_ceil]
+    if not normal_reads:
+        return None
+    normal_median = sorted(normal_reads)[len(normal_reads) // 2]
+
+    # Look for a second cluster clearly above the normal cluster.
+    gap_threshold = max(unit_len * 5, 50)   # at least 5 repeat units of gap
+    upper_reads = [l for l in lengths if l > normal_median + gap_threshold]
+    if not upper_reads:
+        return None
+    upper_median = sorted(upper_reads)[len(upper_reads) // 2]
+
+    insertion_bp   = upper_median - normal_median
+    insertion_units = round(insertion_bp / unit_len)
+
+    n_normal  = len(normal_reads)
+    n_upper   = len(upper_reads)
+    n_short   = sum(1 for l in lengths if l < normal_floor)
+
+    return (f"bimodal: {n_normal} reads ~{normal_median}bp (normal) / "
+            f"{n_upper} reads ~{upper_median}bp "
+            f"(+{insertion_bp}bp = +{insertion_units}× {unit} extra) "
+            f"[{n_short} short partials excluded]")
+
+
 # ── Read extraction ───────────────────────────────────────────────────────────
 
 def extract_reads(bam: Path, chrom: str, start: int, end: int, pad: int) -> list[bytes]:
@@ -680,6 +730,13 @@ def main() -> None:
         verdict = evaluate_against_truth(locus.name, counts) if locus.unit else ""
         _print_row(col_w, locus.name, chrom, locus.start, locus.end,
                    locus.unit, depth, allele_str, repeat_str, elapsed, verdict)
+
+        # For KNOWN_BUG loci, show the read-length bimodal as a diagnostic.
+        if verdict.startswith("KNOWN_BUG") and locus.unit:
+            ref_len = locus.end - locus.start + 2 * pad
+            rla = read_length_alleles(reads, locus.unit, locus.end - locus.start, ref_len)
+            if rla:
+                print(f"    [read-length estimate] {rla}")
 
         if args.verbose and alleles:
             for i, seq in enumerate(alleles):
