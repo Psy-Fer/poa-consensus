@@ -431,12 +431,12 @@ def extract_reads(bam: Path, chrom: str, start: int, end: int, pad: int) -> list
     try:
         view = subprocess.run(cmd, capture_output=True, check=True)
     except subprocess.CalledProcessError:
-        return []
+        return {0: [], 1: [], 2: []}
 
     if not view.stdout:
-        return []
+        return {0: [], 1: [], 2: []}
 
-    reads = []
+    reads: dict[int, list[bytes]] = {0: [], 1: [], 2: []}
     for line in view.stdout.splitlines():
         fields = line.split(b"\t")
         if len(fields) < 10:
@@ -455,8 +455,18 @@ def extract_reads(bam: Path, chrom: str, start: int, end: int, pad: int) -> list
             continue
 
         trimmed = seq[rd_s:rd_e]
-        if len(trimmed) >= core_len:
-            reads.append(trimmed)
+        if len(trimmed) < core_len:
+            continue
+
+        hp = 0
+        for tag in fields[11:]:
+            if tag.startswith(b"HP:i:"):
+                try:
+                    hp = int(tag[5:])
+                except ValueError:
+                    pass
+                break
+        reads.setdefault(hp, []).append(trimmed)
 
     return reads
 
@@ -662,7 +672,7 @@ def main() -> None:
 
     tsv_rows: list[str] = [
         "\t".join(["locus", "category", "chrom", "start", "end", "unit", "depth",
-                   "allele_lengths_bp", "repeat_counts", "time_s", "verdict"])
+                   "phasing", "allele_lengths_bp", "repeat_counts", "time_s", "verdict"])
     ]
 
     # ── Per-locus loop ────────────────────────────────────────────────────────
@@ -685,8 +695,9 @@ def main() -> None:
         pad   = args.pad if args.pad is not None else locus.pad
 
         t0 = time.perf_counter()
-        reads = extract_reads(args.bam, chrom, locus.start, locus.end, pad)
-        depth = len(reads)
+        hap_reads = extract_reads(args.bam, chrom, locus.start, locus.end, pad)
+        all_reads = [r for rs in hap_reads.values() for r in rs]
+        depth = len(all_reads)
 
         if depth < locus.min_depth:
             elapsed = time.perf_counter() - t0
@@ -701,11 +712,23 @@ def main() -> None:
             ]))
             continue
 
-        # Controls run in single-allele mode: they're not repeat loci, and
-        # any multi-allele result from a control would flag a pipeline issue.
         is_control = locus.category == "control"
-        multi = not args.no_multi and not is_control
-        alleles = run_poa(reads, flags, multi=multi)
+        n_hp1 = len(hap_reads.get(1, []))
+        n_hp2 = len(hap_reads.get(2, []))
+        _MIN_HP_READS = 3
+
+        if not is_control and n_hp1 >= _MIN_HP_READS and n_hp2 >= _MIN_HP_READS:
+            # Both haplotypes tagged: run single-allele POA on each independently.
+            a1 = run_poa(hap_reads[1], flags, multi=False)
+            a2 = run_poa(hap_reads[2], flags, multi=False)
+            alleles = (a1 or []) + (a2 or [])
+            alleles = alleles or None
+            phasing = f"hp-split HP1:{n_hp1}/HP2:{n_hp2}"
+        else:
+            # Unphased or control: pool all reads, use multi-allele mode.
+            multi = not args.no_multi and not is_control
+            alleles = run_poa(all_reads, flags, multi=multi)
+            phasing = f"untagged:{len(hap_reads.get(0,[]))} HP1:{n_hp1} HP2:{n_hp2}"
         elapsed = time.perf_counter() - t0
 
         counts: list[int] = []
@@ -731,7 +754,7 @@ def main() -> None:
         # For KNOWN_BUG loci, show the read-length bimodal as a diagnostic.
         if verdict.startswith("KNOWN_BUG") and locus.unit:
             ref_len = locus.end - locus.start + 2 * pad
-            rla = read_length_alleles(reads, locus.unit, locus.end - locus.start, ref_len)
+            rla = read_length_alleles(all_reads, locus.unit, locus.end - locus.start, ref_len)
             if rla:
                 print(f"    [read-length estimate] {rla}")
 
@@ -746,7 +769,7 @@ def main() -> None:
         tsv_rows.append("\t".join([
             locus.name, locus.category, chrom,
             str(locus.start), str(locus.end), locus.unit,
-            str(depth), allele_bp, repeat_ct,
+            str(depth), phasing, allele_bp, repeat_ct,
             f"{elapsed:.2f}", verdict or locus.note,
         ]))
 
