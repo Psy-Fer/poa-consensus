@@ -490,6 +490,40 @@ def extract_reads(bam: Path, chrom: str, start: int, end: int, pad: int) -> list
 
 # ── poa-consensus invocation ──────────────────────────────────────────────────
 
+def merge_poa_flags(base: list[str], extra: list[str]) -> list[str]:
+    """
+    Return base + extra, dropping any base flag (and its value) whose option
+    name appears in extra.  Prevents duplicate-argument errors in clap when a
+    locus overrides e.g. --band-width.
+
+    Special rule: if extra explicitly sets --band-width 0 (unbanded), also
+    strips --adaptive-band from base.  With adaptive_band=true and band_width=0
+    the library still computes a non-zero adaptive margin and runs banded DP;
+    removing --adaptive-band ensures truly unbanded alignment.
+    """
+    if not extra:
+        return base
+    # Collect the long-option names present in extra (e.g. {'--band-width'}).
+    extra_opts: set[str] = {tok for tok in extra if tok.startswith("--")}
+    # If extra forces unbanded, also strip --adaptive-band from base.
+    for i, tok in enumerate(extra):
+        if tok == "--band-width" and i + 1 < len(extra) and extra[i + 1] == "0":
+            extra_opts.add("--adaptive-band")
+            break
+    result: list[str] = []
+    i = 0
+    while i < len(base):
+        tok = base[i]
+        if tok in extra_opts:
+            i += 1  # drop this flag
+            # Drop its value too if the next token is not itself a flag.
+            if i < len(base) and not base[i].startswith("-"):
+                i += 1
+        else:
+            result.append(tok)
+            i += 1
+    return result + extra
+
 def run_poa(reads: list[bytes], flags: list[str], multi: bool,
             verbose: bool = False) -> Optional[list[bytes]]:
     """
@@ -735,7 +769,7 @@ def main() -> None:
         n_hp2 = len(hap_reads.get(2, []))
         _MIN_HP_READS = 3
 
-        locus_flags = flags + locus.poa_extra_flags
+        locus_flags = merge_poa_flags(flags, locus.poa_extra_flags)
 
         if not is_control and n_hp1 >= _MIN_HP_READS and n_hp2 >= _MIN_HP_READS:
             # Both haplotypes tagged: run single-allele POA on each independently.
