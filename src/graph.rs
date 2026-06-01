@@ -1779,7 +1779,17 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
         single_support_fraction,
         mean_column_entropy,
         longest_bubble_span,
+        median_input_read_len: 0, // caller fills this in from self.reads
     }
+}
+
+fn median_read_len(reads: &[Vec<u8>]) -> usize {
+    if reads.is_empty() {
+        return 0;
+    }
+    let mut lens: Vec<usize> = reads.iter().map(|r| r.len()).collect();
+    lens.sort_unstable();
+    lens[lens.len() / 2]
 }
 
 #[inline]
@@ -2287,7 +2297,9 @@ impl PoaGraph {
             let sequence: Vec<u8> = topo.iter().map(|&idx| self.nodes[idx].base).collect();
             let coverage: Vec<u32> = topo.iter().map(|_| 1).collect();
             let path_weights: Vec<i32> = topo.iter().map(|_| 1).collect();
-            let graph_stats = compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
+            let mut graph_stats =
+                compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
+            graph_stats.median_input_read_len = median_read_len(&self.reads);
             return Ok(Consensus {
                 sequence,
                 coverage,
@@ -2339,7 +2351,8 @@ impl PoaGraph {
             .collect();
         let path_weights: Vec<i32> = filtered.iter().map(|&(_, _, w)| w).collect();
 
-        let graph_stats = compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
+        let mut graph_stats = compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
+        graph_stats.median_input_read_len = median_read_len(&self.reads);
         let gaps = detect_coverage_gaps(&coverage);
         let bubble_sites = collect_bubble_sites(
             &self.nodes,
@@ -2363,7 +2376,9 @@ impl PoaGraph {
     }
 
     pub fn stats(&self) -> GraphStats {
-        compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads)
+        let mut s = compute_stats(&self.nodes, self.config.min_allele_freq, self.n_reads);
+        s.median_input_read_len = median_read_len(&self.reads);
+        s
     }
 
     /// Number of long-unbanded warnings emitted during `add_read` calls.

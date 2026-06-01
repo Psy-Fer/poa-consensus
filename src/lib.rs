@@ -352,7 +352,7 @@ mod tests;
 
 pub use analysis::{
     ConsensusWarnings, DiagnoseConfig, InteriorSupportWarning, LowDepthWarning,
-    StructuralCompetingSummary, diagnose,
+    StructuralCompetingSummary, TruncationWarning, diagnose,
 };
 pub use config::{AlignmentMode, ConsensusMode, PoaConfig};
 pub use error::PoaError;
@@ -423,12 +423,23 @@ pub fn consensus_multi(
 /// | Condition | Pass-2 action |
 /// |---|---|
 /// | 1-3 bubbles, minority arm ≥ `min_allele_freq × n` | `consensus_multi` on pass-1 graph |
+/// | Consensus < 60% of median input read length (banded only) | Retry with `band_width = 0` |
 /// | `single_support_fraction > 0.3` | Tighten `min_coverage_fraction` to ≥ 0.6, rebuild |
 /// | Coverage CV > 1.5 and mode is `Global` | Switch to `SemiGlobal`, rebuild |
 /// | Otherwise | Return pass-1 single consensus; no rebuild |
 ///
 /// Always returns a `Vec<Consensus>`: one element for single-allele outcomes,
 /// two for diploid.
+///
+/// ## Truncation detection
+///
+/// When banded DP is used on highly repetitive sequence (e.g. the AAAAG 5-mer
+/// in RFC1), multiple DP diagonals score identically.  The band can lock onto a
+/// shorter diagonal without approaching the band edge, producing a truncated
+/// consensus with no error.  `consensus_adaptive` detects this by comparing the
+/// pass-1 consensus length to the median input read length.  If the ratio is
+/// below 0.60, it retries with unbanded alignment (`band_width = 0`), which
+/// forces the traceback to reach the correct endpoint.
 pub fn consensus_adaptive(
     reads: &[&[u8]],
     seed_idx: usize,
@@ -453,6 +464,26 @@ pub fn consensus_adaptive(
         return graph.consensus_multi();
     }
 
+    // Compute pass-1 consensus; used for truncation check and as the fallthrough
+    // return value if no second pass fires.
+    let c1 = graph.consensus()?;
+
+    // Truncation: consensus much shorter than median read length.
+    // Indicates banded DP converged to the wrong diagonal (bug #4 pattern:
+    // degenerate scoring landscape in highly repetitive sequence means the band
+    // can snap to an off-by-N×period diagonal without approaching the edge).
+    // Unbanded forces the traceback to terminate at the correct graph endpoint.
+    let was_banded = config.band_width > 0 || config.adaptive_band;
+    if was_banded {
+        let median_len = c1.graph_stats.median_input_read_len;
+        if median_len > 0 && (c1.sequence.len() as f64) < 0.6 * median_len as f64 {
+            let mut cfg2 = config.clone();
+            cfg2.band_width = 0;
+            cfg2.adaptive_band = false;
+            return Ok(vec![build_graph(reads, seed_idx, cfg2)?.consensus()?]);
+        }
+    }
+
     // Noisy input: high fraction of singleton-supported nodes.
     // Tighten the coverage threshold and rebuild.
     if stats.single_support_fraction > 0.3 {
@@ -475,7 +506,7 @@ pub fn consensus_adaptive(
     }
 
     // No second pass needed.
-    Ok(vec![graph.consensus()?])
+    Ok(vec![c1])
 }
 
 /// Build a consensus from two non-overlapping read groups with a gap of

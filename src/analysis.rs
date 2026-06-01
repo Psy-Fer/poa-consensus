@@ -491,6 +491,15 @@ pub struct DiagnoseConfig {
     /// boundary-trim `min_cov` floor is computed from the per-partition count;
     /// with < 15 reads, terminal units can be clipped.
     pub depth_allele_threshold: usize,
+    /// Ratio of `consensus_len / median_input_read_len` below which a truncation
+    /// warning fires (default: 0.6).
+    ///
+    /// When banded DP converges to the wrong diagonal in highly repetitive
+    /// sequence (e.g. the AAAAG 5-mer in RFC1), the consensus can be silently
+    /// shorter than the input reads without triggering a band-edge error.
+    /// A ratio below this threshold is a strong signal of that failure mode.
+    /// Set to 0.0 to disable the check.
+    pub truncation_ratio_threshold: f32,
 }
 
 impl Default for DiagnoseConfig {
@@ -502,6 +511,7 @@ impl Default for DiagnoseConfig {
             boundary_margin: 0.20,
             is_allele_partition: false,
             depth_allele_threshold: 15,
+            truncation_ratio_threshold: 0.6,
         }
     }
 }
@@ -525,6 +535,24 @@ pub struct InteriorSupportWarning {
     pub position: usize,
     /// `path_weights[position] / n_reads` at the flagged position.
     pub fraction: f32,
+}
+
+/// Suspected silent truncation of the consensus due to banded DP diagonal drift.
+///
+/// Fired when `consensus_len / median_input_read_len` is below the configured
+/// threshold (default 0.60).  The most common cause is highly repetitive sequence
+/// (e.g. AAAAG 5-mer) where multiple DP diagonals score identically; the band
+/// locks onto the wrong one without approaching the band edge, so no
+/// `BandTooNarrow` error is raised.  The remedy is to retry with `band_width = 0`
+/// (unbanded), which forces the traceback to reach the correct endpoint.
+#[derive(Debug, Clone)]
+pub struct TruncationWarning {
+    /// Length of the consensus sequence produced.
+    pub consensus_len: usize,
+    /// Median length of all reads used to build the graph.
+    pub median_read_len: usize,
+    /// `consensus_len / median_read_len`; below `truncation_ratio_threshold`.
+    pub ratio: f32,
 }
 
 /// Summary of structural (length-changing) bubble sites that indicate a second
@@ -571,6 +599,10 @@ pub struct ConsensusWarnings {
     /// (`DiagnoseConfig::is_allele_partition = false`).
     /// Inspect `Consensus::bubble_sites` for the full site data.
     pub structural_competing: Option<StructuralCompetingSummary>,
+    /// Suspected silent truncation: consensus is much shorter than the median
+    /// input read, suggesting banded DP converged to the wrong diagonal.
+    /// Retry with `band_width = 0` or use `consensus_adaptive` to recover.
+    pub truncation_suspected: Option<TruncationWarning>,
 }
 
 impl ConsensusWarnings {
@@ -580,6 +612,7 @@ impl ConsensusWarnings {
             && !self.has_coverage_gaps
             && self.interior_low_support.is_none()
             && self.structural_competing.is_none()
+            && self.truncation_suspected.is_none()
     }
 
     /// Format as human-readable lines suitable for printing to stderr.
@@ -650,6 +683,21 @@ impl ConsensusWarnings {
                      (minority arm: {} read(s)) — if the locus is heterozygous, \
                      re-run with --multi",
                     sc.site_count, sc.min_arm_reads
+                ),
+            ));
+        }
+
+        if let Some(ref t) = self.truncation_suspected {
+            out.push((
+                true,
+                format!(
+                    "{label}: consensus ({} bp) is {:.0}% of median input read length \
+                     ({} bp) — banded DP may have converged to the wrong diagonal on \
+                     highly repetitive sequence; retry with band_width=0 or \
+                     consensus_adaptive",
+                    t.consensus_len,
+                    t.ratio * 100.0,
+                    t.median_read_len,
                 ),
             ));
         }
@@ -752,11 +800,31 @@ pub fn diagnose(c: &Consensus, config: &DiagnoseConfig) -> ConsensusWarnings {
         None
     };
 
+    // ── Truncation detection ──────────────────────────────────────────────────
+    let truncation_suspected = {
+        let median_len = c.graph_stats.median_input_read_len;
+        if median_len > 0 && config.truncation_ratio_threshold > 0.0 {
+            let ratio = c.sequence.len() as f32 / median_len as f32;
+            if ratio < config.truncation_ratio_threshold {
+                Some(TruncationWarning {
+                    consensus_len: c.sequence.len(),
+                    median_read_len: median_len,
+                    ratio,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     ConsensusWarnings {
         low_depth,
         has_coverage_gaps,
         interior_low_support,
         structural_competing,
+        truncation_suspected,
     }
 }
 
@@ -1059,5 +1127,60 @@ mod tests {
         let conf = consensus_confidence(&c, 0.25);
         assert!(conf.low_cov_fraction > 0.1);
         assert!(conf.is_low_confidence());
+    }
+
+    // ── diagnose: truncation_suspected ───────────────────────────────────────
+
+    fn make_consensus_with_median(seq_len: usize, n_reads: usize, median_read_len: usize) -> Consensus {
+        let mut gs = GraphStats::default();
+        gs.median_input_read_len = median_read_len;
+        Consensus {
+            sequence: vec![b'A'; seq_len],
+            coverage: vec![n_reads as u32; seq_len],
+            path_weights: vec![n_reads as i32; seq_len],
+            n_reads,
+            graph_stats: gs,
+            gaps: vec![],
+            bubble_sites: vec![],
+        }
+    }
+
+    #[test]
+    fn truncation_fires_when_consensus_too_short() {
+        // consensus 371 bp, median read 861 bp → ratio 0.43 < 0.60 threshold
+        let c = make_consensus_with_median(371, 20, 861);
+        let w = diagnose(&c, &DiagnoseConfig::default());
+        let t = w.truncation_suspected.as_ref().unwrap();
+        assert_eq!(t.consensus_len, 371);
+        assert_eq!(t.median_read_len, 861);
+        assert!(t.ratio < 0.60);
+        assert!(!w.is_clean());
+    }
+
+    #[test]
+    fn truncation_clean_when_ratio_above_threshold() {
+        // consensus 820 bp, median read 861 bp → ratio 0.95 — no truncation
+        let c = make_consensus_with_median(820, 20, 861);
+        let w = diagnose(&c, &DiagnoseConfig { depth_warn_threshold: 0, ..Default::default() });
+        assert!(w.truncation_suspected.is_none());
+    }
+
+    #[test]
+    fn truncation_suppressed_when_median_zero() {
+        // median_input_read_len == 0 → check skipped
+        let c = make_consensus_with_median(50, 20, 0);
+        let w = diagnose(&c, &DiagnoseConfig { depth_warn_threshold: 0, ..Default::default() });
+        assert!(w.truncation_suspected.is_none());
+    }
+
+    #[test]
+    fn truncation_message_format() {
+        let c = make_consensus_with_median(371, 20, 861);
+        let w = diagnose(&c, &DiagnoseConfig::default());
+        let msgs = w.messages("rfc1");
+        let has_truncation = msgs.iter().any(|(is_warn, msg)| {
+            *is_warn && msg.contains("43%") && msg.contains("861 bp")
+        });
+        assert!(has_truncation, "expected truncation warning in: {:?}", msgs);
     }
 }

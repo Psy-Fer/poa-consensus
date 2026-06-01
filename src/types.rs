@@ -118,6 +118,11 @@ pub struct GraphStats {
     /// `min_allele_freq` threshold.  0 when no qualifying bubble exists.
     /// Arms longer than 4096 nodes are capped at 4096.
     pub longest_bubble_span: usize,
+    /// Median length (in bases) of all reads that built this graph, including
+    /// the seed.  0 when no reads have been added.  Used by [`diagnose`] to
+    /// detect consensus truncation: a consensus much shorter than the median
+    /// input read is a signal that banded DP converged to the wrong diagonal.
+    pub median_input_read_len: usize,
 }
 
 /// Output of a consensus extraction pass.
