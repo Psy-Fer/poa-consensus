@@ -2236,8 +2236,9 @@ impl PoaGraph {
         // Refresh the spine when the cache is empty or the interval has elapsed.
         // The interval doubles each time the spine is stable (≤ SPINE_STABLE_THRESHOLD
         // base changes), and resets to 1 when it changes significantly.  The final
-        // consensus always recomputes the heaviest path from scratch, so a stale
-        // spine only affects alignment speed, never correctness.
+        // consensus always recomputes the heaviest path from scratch.  A stale
+        // spine affects both alignment speed and anchor quality: shifted k-mers
+        // built from an outdated spine can produce wrong anchor chains.
         let reads_since_update = self.n_reads.saturating_sub(self.spine_updated_at);
         if self.cached_spine.is_empty() || reads_since_update >= self.spine_interval {
             let new_spine = heaviest_path(&self.nodes, &topo, &rank_of);
@@ -2458,56 +2459,6 @@ impl PoaGraph {
     /// Number of nodes currently in the graph.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
-    }
-
-    /// Like `add_read` but returns the ops, anchor count, and raw anchor list for testing.
-    /// Mirrors the exact logic of `add_read` including cached spine and anchors.
-    #[doc(hidden)]
-    pub fn add_read_debug(
-        &mut self,
-        read: &[u8],
-    ) -> Result<(Vec<AlignOp>, usize, Vec<(usize, usize)>), PoaError> {
-        if read.is_empty() {
-            return Err(PoaError::EmptyInput);
-        }
-        let (topo, rank_of) = topological_order(&self.nodes);
-        let reads_since_update = self.n_reads.saturating_sub(self.spine_updated_at);
-        if self.cached_spine.is_empty() || reads_since_update >= self.spine_interval {
-            let new_spine = heaviest_path(&self.nodes, &topo, &rank_of);
-            let diff = spine_diff(&self.cached_spine, &new_spine);
-            self.cached_spine = new_spine;
-            self.spine_updated_at = self.n_reads;
-            self.spine_mers = build_spine_mers(&self.cached_spine, MINI_K, MINI_W);
-            if diff <= SPINE_STABLE_THRESHOLD {
-                self.spine_interval = (self.spine_interval * 2).min(SPINE_MAX_INTERVAL);
-            } else {
-                self.spine_interval = 1;
-            }
-        }
-        let read_mers = compute_minimizers(read, MINI_K, MINI_W);
-        let raw_anchors =
-            build_anchor_chain(&read_mers, &self.spine_mers, &self.cached_spine, &rank_of);
-        let anchor_count = raw_anchors.len();
-        let anchors: Vec<(usize, usize)> = if raw_anchors.len() >= MINI_MIN_CHAIN {
-            raw_anchors.clone()
-        } else {
-            vec![]
-        };
-        let ops = align(
-            &self.nodes,
-            &topo,
-            &rank_of,
-            &self.cached_spine,
-            read,
-            &self.config,
-            &mut self.align_scratch,
-            &anchors,
-        )?;
-        let read_idx = self.n_reads as u32;
-        add_to_graph(&mut self.nodes, &mut self.edge_reads, read, &ops, read_idx);
-        self.reads.push(read.to_vec());
-        self.n_reads += 1;
-        Ok((ops, anchor_count, raw_anchors))
     }
 
     /// Return a snapshot of the graph topology for visualization and inspection.

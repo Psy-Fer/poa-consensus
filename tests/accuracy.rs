@@ -836,8 +836,13 @@ fn diag_sca4_zfhx3_hap2_padded_stepwise() {
 }
 
 
-/// For seed=0, show the alignment ops that each read produces,
-/// to identify which read creates wrong INSERT nodes.
+/// Regression test: shifted minimizer anchors must not create spurious INSERT nodes.
+///
+/// The SCA4/ZFHX3 locus has a GCC repeat where shorter reads (one fewer GCC
+/// unit before ACT) produced k-mers that match the spine at a +3 diagonal offset.
+/// These shifted anchors used to constrain the DP band such that the diagonal
+/// skip wrote outside the valid range, silently discarding the correct DELETE
+/// path and falling back to 99 INSERT nodes.
 #[test]
 fn diag_sca4_zfhx3_hap2_alignment_ops() {
     use poa_consensus::AlignOp;
@@ -847,7 +852,7 @@ fn diag_sca4_zfhx3_hap2_alignment_ops() {
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 0 r8  63
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 1 r9  63
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 2 r10 63
-        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC",    // 3 r11 60
+        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC",    // 3 r11 60 (1 fewer GCC before ACT)
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCC",       // 4 r12 57
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 5 r13 63
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 6 r14 63
@@ -859,47 +864,32 @@ fn diag_sca4_zfhx3_hap2_alignment_ops() {
         v
     }).collect();
     let cfg = poa_consensus::PoaConfig::default();
-
-    println!("\n=== Alignment ops for seed=0, one read at a time ===");
     let seed_idx = 0;
     let mut graph = poa_consensus::PoaGraph::new(&padded[seed_idx], cfg.clone()).unwrap();
 
     for (i, r) in padded.iter().enumerate() {
         if i == seed_idx { continue; }
 
-        let (ops, _, _) = graph.align_read_ops(r).unwrap();
+        // align_read_ops uses a fresh spine with no anchors — the reference alignment.
+        let (ref_ops, _, _) = graph.align_read_ops(r).unwrap();
+        let ref_inserts = ref_ops.iter().filter(|o| matches!(o, AlignOp::Insert(_))).count();
 
-        // Summarize ops: count M/I/D and flag inserts
-        let matches = ops.iter().filter(|o| matches!(o, AlignOp::Match(_))).count();
-        let inserts: Vec<u8> = ops.iter().filter_map(|o| if let AlignOp::Insert(b) = o { Some(*b) } else { None }).collect();
-        let deletes = ops.iter().filter(|o| matches!(o, AlignOp::Delete(_))).count();
+        // add_read uses the cached spine with minimizer anchors.
+        // Shifted anchors must not cause spurious inserts.
+        graph.add_read(r).unwrap();
+        let nodes_after = graph.node_count();
 
-        let insert_str = if inserts.is_empty() {
-            String::from("none")
-        } else {
-            String::from_utf8_lossy(&inserts).to_string()
-        };
-
-        println!(
-            "  r{} ({}bp): M={} I={} D={}  inserts={}  graph_nodes={}",
-            i, padded[i].len(), matches, inserts.len(), deletes, insert_str,
-            graph.node_count()
+        // The anchor-based alignment must not add more nodes than the reference
+        // alignment would (ref has no inserts for all non-outlier reads).
+        assert_eq!(
+            ref_inserts, 0,
+            "r{} reference alignment has unexpected inserts", i
         );
-
-        let (add_ops, anchor_count, anchor_list) = graph.add_read_debug(r).unwrap();
-        let add_matches = add_ops.iter().filter(|o| matches!(o, AlignOp::Match(_))).count();
-        let add_inserts: Vec<u8> = add_ops.iter().filter_map(|o| if let AlignOp::Insert(b) = o { Some(b) } else { None }).cloned().collect();
-        let add_deletes = add_ops.iter().filter(|o| matches!(o, AlignOp::Delete(_))).count();
-        let add_insert_str = if add_inserts.is_empty() { String::from("none") } else { String::from_utf8_lossy(&add_inserts).to_string() };
-        println!(
-            "    add_read: M={} I={} D={}  inserts={}  anchors={}  graph_nodes={}",
-            add_matches, add_inserts.len(), add_deletes, add_insert_str, anchor_count,
-            graph.node_count()
+        // Graph must not grow unboundedly: no spurious INSERT nodes.
+        // Seed spine = 103 nodes; each read adds at most a handful of mismatch nodes.
+        assert!(
+            nodes_after <= 115,
+            "r{} caused graph to grow to {} nodes (spurious inserts?)", i, nodes_after
         );
-        if i == 3 {  // r3 is the first problem case
-            println!("    anchor_list (read_pos, topo_rank): {:?}", anchor_list);
-        }
-        let c = graph.consensus().unwrap();
-        println!("    -> cons={}bp", c.sequence.len());
     }
 }
