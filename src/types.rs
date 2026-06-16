@@ -96,6 +96,46 @@ pub struct BubbleSite {
     pub is_structural: bool,
 }
 
+/// A single node in the POA graph, as returned by [`PoaGraph::graph_topology`].
+#[derive(Debug, Clone)]
+pub struct GraphNodeInfo {
+    /// Internal node index (not stable across calls to `add_read`).
+    pub node_idx: usize,
+    /// DNA base at this node (`b'A'`, `b'C'`, `b'G'`, or `b'T'`).
+    pub base: u8,
+    /// Number of reads with a Match op at this node.
+    pub coverage: u32,
+    /// Number of reads that passed through via Delete (traversed without consuming a base).
+    pub delete_count: u32,
+    /// Topological position of this node (0 = first node).
+    pub topo_rank: usize,
+}
+
+/// A directed edge in the POA graph, as returned by [`PoaGraph::graph_topology`].
+#[derive(Debug, Clone)]
+pub struct GraphEdgeInfo {
+    /// Topological rank of the source node.
+    pub from_rank: usize,
+    /// Topological rank of the target node.
+    pub to_rank: usize,
+    /// Number of reads that traversed this edge.
+    pub weight: i32,
+}
+
+/// A snapshot of the POA graph topology for visualization and inspection.
+///
+/// Returned by [`PoaGraph::graph_topology`].  Indices in `edges` refer to
+/// entries in `nodes` by `topo_rank`.
+#[derive(Debug, Clone)]
+pub struct GraphTopology {
+    /// Nodes in topological order.
+    pub nodes: Vec<GraphNodeInfo>,
+    /// All directed edges.
+    pub edges: Vec<GraphEdgeInfo>,
+    /// Topological ranks of nodes on the heaviest-path (consensus) spine.
+    pub spine_ranks: Vec<usize>,
+}
+
 /// Per-graph statistics computed in a single O(V+E) pass.
 #[derive(Debug, Clone, Default)]
 pub struct GraphStats {

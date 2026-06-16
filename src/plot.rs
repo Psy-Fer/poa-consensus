@@ -6,7 +6,7 @@
 //!
 //! ```rust,no_run
 //! use poa_consensus::{PoaGraph, PoaConfig};
-//! use poa_consensus::plot::{coverage_svg, graph_stats_svg, edge_weight_histogram_svg};
+//! use poa_consensus::plot::{coverage_svg, graph_network_svg, graph_stats_svg, edge_weight_histogram_svg};
 //!
 //! let reads: &[&[u8]] = &[b"CATCATCAT", b"CATCATCAT", b"CATCGTCAT"];
 //! let mut graph = PoaGraph::new(reads[0], PoaConfig::default()).unwrap();
@@ -564,6 +564,169 @@ pub fn band_with_reads_svg(graph: &PoaGraph, reads: &[&[u8]], seed_idx: usize) -
         .with_y_label("Read position");
 
     render_to_svg(plots, layout)
+}
+
+// ── POA graph network diagram ─────────────────────────────────────────────────
+
+/// SVG network diagram of the POA graph.
+///
+/// The layout matches the standard POA paper convention: the consensus spine
+/// runs **top to bottom** down the centre, and bubble arms branch off to the
+/// **left**.  All node positions are pinned so the layout algorithm is not
+/// used — this avoids force-directed layouts that scatter arms far from the
+/// spine.
+///
+/// - Spine nodes are blue, sized by coverage.
+/// - Off-spine (bubble arm) nodes are grey, positioned left of the spine at
+///   the vertical midpoint of their entry/exit spine neighbours.
+/// - When `read` is `Some`, that sequence is aligned against the graph:
+///   Match nodes turn red, Delete nodes (traversed without consuming a base)
+///   turn orange.
+/// - Labels show `"{rank}:{base}"` (e.g. `"3:G"`) for graphs with ≤ 80 nodes.
+pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
+    use std::collections::HashMap;
+
+    let topology = graph.graph_topology();
+    if topology.nodes.is_empty() {
+        return empty_svg("POA graph (empty)");
+    }
+
+    // ── Read path ─────────────────────────────────────────────────────────
+    let mut match_ranks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut delete_ranks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    if let Some(r) = read {
+        if let Ok((ops, _, rank_of)) = graph.align_read_ops(r) {
+            for op in &ops {
+                match op {
+                    AlignOp::Match(ni) => { match_ranks.insert(rank_of[*ni]); }
+                    AlignOp::Delete(ni) => { delete_ranks.insert(rank_of[*ni]); }
+                    AlignOp::Insert(_) => {}
+                }
+            }
+        }
+    }
+
+    // ── Spine index ───────────────────────────────────────────────────────
+    let n = topology.nodes.len();
+    let spine_len = topology.spine_ranks.len();
+    let spine_set: std::collections::HashSet<usize> =
+        topology.spine_ranks.iter().copied().collect();
+    // topo_rank → position along spine (0-indexed)
+    let spine_idx: HashMap<usize, usize> = topology.spine_ranks
+        .iter()
+        .enumerate()
+        .map(|(i, &rank)| (rank, i))
+        .collect();
+
+    // ── Pinned layout ─────────────────────────────────────────────────────
+    // Spine: y = 0.5 (centre), x = 0.05..0.95 (left to right).
+    // Off-spine arms: x = midpoint of entry/exit spine x; y above (0.2) or
+    // below (0.8) the spine, alternating when multiple arms share a bracket.
+    let pad = 0.05_f64;
+    let spine_y_val = 0.5_f64;
+
+    let spine_x = |si: usize| -> f64 {
+        if spine_len <= 1 { 0.5 }
+        else { pad + (si as f64 / (spine_len - 1) as f64) * (1.0 - 2.0 * pad) }
+    };
+
+    let mut positions = vec![(0.5_f64, spine_y_val); n];
+
+    for &rank in &topology.spine_ranks {
+        positions[rank] = (spine_x(spine_idx[&rank]), spine_y_val);
+    }
+
+    // Group off-spine nodes by their (entry, exit) spine bracket so multiple
+    // arms at the same bubble site alternate above / below.
+    let mut arm_slots: HashMap<(Option<usize>, Option<usize>), usize> = HashMap::new();
+
+    for node in &topology.nodes {
+        let rank = node.topo_rank;
+        if spine_set.contains(&rank) { continue; }
+
+        let entry = (0..rank).rev().find(|&r| spine_set.contains(&r));
+        let exit  = (rank + 1..n).find(|&r| spine_set.contains(&r));
+
+        let x_entry = entry.and_then(|r| spine_idx.get(&r).copied()).map(spine_x).unwrap_or(pad);
+        let x_exit  = exit .and_then(|r| spine_idx.get(&r).copied()).map(spine_x).unwrap_or(1.0 - pad);
+        let x = (x_entry + x_exit) / 2.0;
+
+        let slot = arm_slots.entry((entry, exit)).or_insert(0);
+        // Even slots above (y=0.2), odd slots below (y=0.8).
+        let y = if *slot % 2 == 0 { 0.2 } else { 0.8 };
+        *slot += 1;
+
+        positions[rank] = (x, y);
+    }
+
+    // ── Node sizing ───────────────────────────────────────────────────────
+    // SVG output is infinitely scalable, so we size for readability not pixels.
+    // Base radius is large enough that the "{rank}:{base}" label fits inside
+    // once kuva supports inside-node labels; for now the label sits beside.
+    // Coverage scales the radius slightly so high-support nodes stand out.
+    let max_cov = topology.nodes.iter().map(|nd| nd.coverage).max().unwrap_or(1).max(1) as f64;
+    let base_r = 22.0_f64;
+
+    // ── Build NetworkPlot ─────────────────────────────────────────────────
+    let show_labels = n <= 80;
+
+    let mut net = NetworkPlot::new()
+        .with_directed()
+        .with_legend("type")
+        // Layout is irrelevant — every node is pinned.
+        .with_layout(NetworkLayout::ForceDirected);
+
+    if show_labels { net = net.with_labels(); }
+
+    // Pin all nodes before adding edges so isolated nodes are always present.
+    for node in &topology.nodes {
+        let label = fmt_label(node);
+        let (x, y) = positions[node.topo_rank];
+        net = net.with_node(label.clone()).with_node_position(label, x, y);
+    }
+
+    for edge in &topology.edges {
+        let src = fmt_label(&topology.nodes[edge.from_rank]);
+        let tgt = fmt_label(&topology.nodes[edge.to_rank]);
+        net = net.with_edge(src, tgt, edge.weight as f64);
+    }
+
+    for node in &topology.nodes {
+        let label = fmt_label(node);
+        let size = base_r + (node.coverage as f64 / max_cov) * 6.0;
+        let (color, group) = if match_ranks.contains(&node.topo_rank) {
+            ("#d73027", "read match")
+        } else if delete_ranks.contains(&node.topo_rank) {
+            ("#fdae61", "read delete")
+        } else if spine_set.contains(&node.topo_rank) {
+            ("#2166ac", "spine")
+        } else {
+            ("#aaaaaa", "other")
+        };
+        net = net
+            .with_node_color(&label, color)
+            .with_node_size(&label, size)
+            .with_node_group(&label, group);
+    }
+
+    let plots: Vec<Plot> = vec![net.into()];
+    let title = if read.is_some() {
+        format!("POA graph ({n} nodes, {} spine) — read overlay", spine_len)
+    } else {
+        format!("POA graph ({n} nodes, {} spine)", spine_len)
+    };
+    // 120px per spine node gives a clear arrow stem between adjacent circles.
+    // Height 500px gives ~125px above and below the spine for arm nodes.
+    let canvas_w = (spine_len as f64) * 120.0 + 200.0;
+    let layout = Layout::auto_from_plots(&plots)
+        .with_title(title)
+        .with_width(canvas_w)
+        .with_height(500.0);
+    render_to_svg(plots, layout)
+}
+
+fn fmt_label(node: &crate::GraphNodeInfo) -> String {
+    format!("{}:{}", node.topo_rank, node.base as char)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
