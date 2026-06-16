@@ -580,7 +580,6 @@ mod accuracy_plots {
     }
 }
 
-
 // ── SCA4_ZFHX3 Hap2 diagnostic ────────────────────────────────────────────────
 
 /// Reproduce the SCA4_ZFHX3 Hap2 consensus failure.
@@ -598,11 +597,11 @@ fn diag_sca4_zfhx3_hap2_seed_sweep() {
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // read 8  (63 bp)
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // read 9  (63 bp)
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // read 10 (63 bp)
-        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC",     // read 11 (60 bp)
-        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCC",        // read 12 (57 bp)
+        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC",    // read 11 (60 bp)
+        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCC",       // read 12 (57 bp)
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // read 13 (63 bp)
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // read 14 (63 bp)
-        b"GCCGCCGCGCCGCCGCCGCCGCCCCGCGCCGCCGCCGCACTGCCACCGCCGCCGCCGCC",     // read 15 (59 bp, outlier)
+        b"GCCGCCGCGCCGCCGCCGCCGCCCCGCGCCGCCGCCGCACTGCCACCGCCGCCGCCGCC", // read 15 (59 bp, outlier)
     ];
     let expected = b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC";
 
@@ -614,12 +613,15 @@ fn diag_sca4_zfhx3_hap2_seed_sweep() {
     };
 
     println!("\n=== SCA4_ZFHX3 Hap2 seed sweep ===");
-    println!("Expected ({} bp): {}", expected.len(), std::str::from_utf8(expected).unwrap());
+    println!(
+        "Expected ({} bp): {}",
+        expected.len(),
+        std::str::from_utf8(expected).unwrap()
+    );
     println!();
 
     for seed_idx in 0..reads.len() {
-        let result = poa_consensus::consensus(&reads, seed_idx, &cfg)
-            .expect("consensus failed");
+        let result = poa_consensus::consensus(&reads, seed_idx, &cfg).expect("consensus failed");
         let cons = &result.sequence;
         let dist = levenshtein(cons, expected);
         let matched = cons == expected;
@@ -644,7 +646,6 @@ fn diag_sca4_zfhx3_hap2_seed_sweep() {
     assert!(any_correct, "no seed produced the correct consensus");
 }
 
-
 /// Try to reproduce the bladerunner wrong output for SCA4_ZFHX3 Hap2
 /// by sweeping configs (alignment mode, band settings).
 #[test]
@@ -665,60 +666,94 @@ fn diag_sca4_zfhx3_hap2_config_sweep() {
     use poa_consensus::AlignmentMode;
 
     let configs: &[(&str, poa_consensus::PoaConfig)] = &[
-        ("adaptive+semi-global+bw50 (recommended)", poa_consensus::PoaConfig {
-            adaptive_band: true, band_width: 50,
-            alignment_mode: AlignmentMode::SemiGlobal,
-            ..poa_consensus::PoaConfig::default()
-        }),
-        ("adaptive+global+bw50", poa_consensus::PoaConfig {
-            adaptive_band: true, band_width: 50,
-            alignment_mode: AlignmentMode::Global,
-            ..poa_consensus::PoaConfig::default()
-        }),
-        ("fixed-bw50+semi-global", poa_consensus::PoaConfig {
-            adaptive_band: false, band_width: 50,
-            alignment_mode: AlignmentMode::SemiGlobal,
-            ..poa_consensus::PoaConfig::default()
-        }),
-        ("fixed-bw50+global", poa_consensus::PoaConfig {
-            adaptive_band: false, band_width: 50,
-            alignment_mode: AlignmentMode::Global,
-            ..poa_consensus::PoaConfig::default()
-        }),
-        ("adaptive+semi-global+bw10 (default adaptive_band_b)", poa_consensus::PoaConfig {
-            adaptive_band: true, band_width: 10,
-            alignment_mode: AlignmentMode::SemiGlobal,
-            ..poa_consensus::PoaConfig::default()
-        }),
-        ("adaptive+global+bw10", poa_consensus::PoaConfig {
-            adaptive_band: true, band_width: 10,
-            alignment_mode: AlignmentMode::Global,
-            ..poa_consensus::PoaConfig::default()
-        }),
+        (
+            "adaptive+semi-global+bw50 (recommended)",
+            poa_consensus::PoaConfig {
+                adaptive_band: true,
+                band_width: 50,
+                alignment_mode: AlignmentMode::SemiGlobal,
+                ..poa_consensus::PoaConfig::default()
+            },
+        ),
+        (
+            "adaptive+global+bw50",
+            poa_consensus::PoaConfig {
+                adaptive_band: true,
+                band_width: 50,
+                alignment_mode: AlignmentMode::Global,
+                ..poa_consensus::PoaConfig::default()
+            },
+        ),
+        (
+            "fixed-bw50+semi-global",
+            poa_consensus::PoaConfig {
+                adaptive_band: false,
+                band_width: 50,
+                alignment_mode: AlignmentMode::SemiGlobal,
+                ..poa_consensus::PoaConfig::default()
+            },
+        ),
+        (
+            "fixed-bw50+global",
+            poa_consensus::PoaConfig {
+                adaptive_band: false,
+                band_width: 50,
+                alignment_mode: AlignmentMode::Global,
+                ..poa_consensus::PoaConfig::default()
+            },
+        ),
+        (
+            "adaptive+semi-global+bw10 (default adaptive_band_b)",
+            poa_consensus::PoaConfig {
+                adaptive_band: true,
+                band_width: 10,
+                alignment_mode: AlignmentMode::SemiGlobal,
+                ..poa_consensus::PoaConfig::default()
+            },
+        ),
+        (
+            "adaptive+global+bw10",
+            poa_consensus::PoaConfig {
+                adaptive_band: true,
+                band_width: 10,
+                alignment_mode: AlignmentMode::Global,
+                ..poa_consensus::PoaConfig::default()
+            },
+        ),
     ];
 
     println!("\n=== SCA4_ZFHX3 Hap2 config sweep (seed=7, the outlier) ===");
-    println!("Expected ({} bp):       {}", expected.len(), std::str::from_utf8(expected).unwrap());
-    println!("Bladerunner got ({} bp): {}", bladerunner_got.len(), std::str::from_utf8(bladerunner_got).unwrap());
+    println!(
+        "Expected ({} bp):       {}",
+        expected.len(),
+        std::str::from_utf8(expected).unwrap()
+    );
+    println!(
+        "Bladerunner got ({} bp): {}",
+        bladerunner_got.len(),
+        std::str::from_utf8(bladerunner_got).unwrap()
+    );
     println!();
 
     for (name, cfg) in configs {
         // Try both the outlier (seed=7) and a 63bp read (seed=0) as seed
         for seed_idx in [7usize, 0] {
-            let result = poa_consensus::consensus(&reads, seed_idx, cfg)
-                .expect("consensus failed");
+            let result = poa_consensus::consensus(&reads, seed_idx, cfg).expect("consensus failed");
             let cons = &result.sequence;
             let dist_expected = levenshtein(cons, expected);
             let dist_bladerunner = levenshtein(cons, bladerunner_got);
             println!(
                 "cfg={:50} seed={}: got {}bp  dist_expected={} dist_bladerunner={}  -- {}",
-                name, seed_idx, cons.len(), dist_expected, dist_bladerunner,
+                name,
+                seed_idx,
+                cons.len(),
+                dist_expected,
+                dist_bladerunner,
                 std::str::from_utf8(cons).unwrap(),
             );
         }
     }
 }
-
 
 /// Test POA with padded reads (BED ± 20 bp flanks) as bladerunner sends them.
 ///
@@ -741,17 +776,20 @@ fn diag_sca4_zfhx3_hap2_padded() {
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCC",       // read 12 (57)
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // read 13 (63)
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // read 14 (63)
-        b"GCCGCCGCGCCGCCGCCGCCGCCCCGCGCCGCCGCCGCACTGCCACCGCCGCCGCCGCC",    // read 15 (59)
+        b"GCCGCCGCGCCGCCGCCGCCGCCCCGCGCCGCCGCCGCACTGCCACCGCCGCCGCCGCC",     // read 15 (59)
     ];
 
     // build padded sequences
-    let padded: Vec<Vec<u8>> = repeats.iter().map(|r| {
-        let mut v = Vec::with_capacity(lf.len() + r.len() + rf.len());
-        v.extend_from_slice(lf);
-        v.extend_from_slice(r);
-        v.extend_from_slice(rf);
-        v
-    }).collect();
+    let padded: Vec<Vec<u8>> = repeats
+        .iter()
+        .map(|r| {
+            let mut v = Vec::with_capacity(lf.len() + r.len() + rf.len());
+            v.extend_from_slice(lf);
+            v.extend_from_slice(r);
+            v.extend_from_slice(rf);
+            v
+        })
+        .collect();
 
     let expected_repeat = b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC";
     let bladerunner_got_repeat = b"CCGCCGCGCCGCCGCCGCCGCCCCGCCGCCGCCGCACTGCCACCGCCGCCG";
@@ -759,7 +797,10 @@ fn diag_sca4_zfhx3_hap2_padded() {
     let cfg = poa_consensus::PoaConfig::default();
 
     println!("\n=== SCA4_ZFHX3 Hap2 with padded reads (BED ± 20 bp) ===");
-    println!("Padded lengths: {:?}", padded.iter().map(|r| r.len()).collect::<Vec<_>>());
+    println!(
+        "Padded lengths: {:?}",
+        padded.iter().map(|r| r.len()).collect::<Vec<_>>()
+    );
 
     for seed_idx in 0..padded.len() {
         let slices: Vec<&[u8]> = padded.iter().map(|r| r.as_slice()).collect();
@@ -767,25 +808,27 @@ fn diag_sca4_zfhx3_hap2_padded() {
         let cons = &result.sequence;
 
         // strip flanks from result for comparison (if present)
-        let repeat_part: &[u8] = if cons.len() > lf.len() + rf.len()
-            && cons.starts_with(lf) && cons.ends_with(rf)
-        {
-            &cons[lf.len()..cons.len() - rf.len()]
-        } else {
-            cons.as_slice()
-        };
+        let repeat_part: &[u8] =
+            if cons.len() > lf.len() + rf.len() && cons.starts_with(lf) && cons.ends_with(rf) {
+                &cons[lf.len()..cons.len() - rf.len()]
+            } else {
+                cons.as_slice()
+            };
 
         let dist_exp = levenshtein(repeat_part, expected_repeat);
-        let dist_br  = levenshtein(repeat_part, bladerunner_got_repeat);
+        let dist_br = levenshtein(repeat_part, bladerunner_got_repeat);
         println!(
             "seed={} ({}bp total): cons={}bp  repeat_part={}bp  dist_expected={}  dist_br={}  -- {}",
-            seed_idx, padded[seed_idx].len(), cons.len(), repeat_part.len(),
-            dist_exp, dist_br,
+            seed_idx,
+            padded[seed_idx].len(),
+            cons.len(),
+            repeat_part.len(),
+            dist_exp,
+            dist_br,
             std::str::from_utf8(cons).unwrap(),
         );
     }
 }
-
 
 /// Step-by-step addition for padded reads with seed=0 vs seed=3 to find which
 /// read corrupts the graph.
@@ -801,40 +844,57 @@ fn diag_sca4_zfhx3_hap2_padded_stepwise() {
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCC",       // 4 r12 57
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 5 r13 63
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 6 r14 63
-        b"GCCGCCGCGCCGCCGCCGCCGCCCCGCGCCGCCGCCGCACTGCCACCGCCGCCGCCGCC",    // 7 r15 59 (outlier)
+        b"GCCGCCGCGCCGCCGCCGCCGCCCCGCGCCGCCGCCGCACTGCCACCGCCGCCGCCGCC",     // 7 r15 59 (outlier)
     ];
-    let padded: Vec<Vec<u8>> = repeats.iter().map(|r| {
-        let mut v = Vec::with_capacity(lf.len() + r.len() + rf.len());
-        v.extend_from_slice(lf); v.extend_from_slice(r); v.extend_from_slice(rf);
-        v
-    }).collect();
+    let padded: Vec<Vec<u8>> = repeats
+        .iter()
+        .map(|r| {
+            let mut v = Vec::with_capacity(lf.len() + r.len() + rf.len());
+            v.extend_from_slice(lf);
+            v.extend_from_slice(r);
+            v.extend_from_slice(rf);
+            v
+        })
+        .collect();
     let expected = b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC";
     let cfg = poa_consensus::PoaConfig::default();
 
     println!("\n=== Stepwise padded POA for seed=0 and seed=3 ===");
 
     for seed_idx in [0usize, 3, 4, 5] {
-        println!("\n--- seed={} ({}bp padded) ---", seed_idx, padded[seed_idx].len());
+        println!(
+            "\n--- seed={} ({}bp padded) ---",
+            seed_idx,
+            padded[seed_idx].len()
+        );
         let mut graph = poa_consensus::PoaGraph::new(&padded[seed_idx], cfg.clone()).unwrap();
         for (i, r) in padded.iter().enumerate() {
-            if i == seed_idx { continue; }
+            if i == seed_idx {
+                continue;
+            }
             graph.add_read(r).unwrap();
             let c = graph.consensus().unwrap();
             let seq = &c.sequence;
             // strip flanks if present
-            let rep: &[u8] = if seq.len() > lf.len() + rf.len() && seq.starts_with(lf) && seq.ends_with(rf) {
-                &seq[lf.len()..seq.len()-rf.len()]
-            } else { seq.as_slice() };
+            let rep: &[u8] =
+                if seq.len() > lf.len() + rf.len() && seq.starts_with(lf) && seq.ends_with(rf) {
+                    &seq[lf.len()..seq.len() - rf.len()]
+                } else {
+                    seq.as_slice()
+                };
             let dist = levenshtein(rep, expected);
             println!(
                 "  after adding r{} ({}bp): cons={}bp repeat={}bp dist={} -- {}",
-                i, padded[i].len(), seq.len(), rep.len(), dist,
+                i,
+                padded[i].len(),
+                seq.len(),
+                rep.len(),
+                dist,
                 std::str::from_utf8(seq).unwrap()
             );
         }
     }
 }
-
 
 /// Regression test: shifted minimizer anchors must not create spurious INSERT nodes.
 ///
@@ -852,27 +912,37 @@ fn diag_sca4_zfhx3_hap2_alignment_ops() {
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 0 r8  63
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 1 r9  63
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 2 r10 63
-        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC",    // 3 r11 60 (1 fewer GCC before ACT)
-        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCC",       // 4 r12 57
+        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 3 r11 60 (1 fewer GCC before ACT)
+        b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCC",    // 4 r12 57
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 5 r13 63
         b"GCCGCCGCCGCCGCCGCCGCCGCCACCGCCGCCGCCGCCGCCACTGCCACCGCCGCCGCCGCC", // 6 r14 63
-        b"GCCGCCGCGCCGCCGCCGCCGCCCCGCGCCGCCGCCGCACTGCCACCGCCGCCGCCGCC",    // 7 r15 59 (outlier)
+        b"GCCGCCGCGCCGCCGCCGCCGCCCCGCGCCGCCGCCGCACTGCCACCGCCGCCGCCGCC",  // 7 r15 59 (outlier)
     ];
-    let padded: Vec<Vec<u8>> = repeats.iter().map(|r| {
-        let mut v = Vec::with_capacity(lf.len() + r.len() + rf.len());
-        v.extend_from_slice(lf); v.extend_from_slice(r); v.extend_from_slice(rf);
-        v
-    }).collect();
+    let padded: Vec<Vec<u8>> = repeats
+        .iter()
+        .map(|r| {
+            let mut v = Vec::with_capacity(lf.len() + r.len() + rf.len());
+            v.extend_from_slice(lf);
+            v.extend_from_slice(r);
+            v.extend_from_slice(rf);
+            v
+        })
+        .collect();
     let cfg = poa_consensus::PoaConfig::default();
     let seed_idx = 0;
     let mut graph = poa_consensus::PoaGraph::new(&padded[seed_idx], cfg.clone()).unwrap();
 
     for (i, r) in padded.iter().enumerate() {
-        if i == seed_idx { continue; }
+        if i == seed_idx {
+            continue;
+        }
 
         // align_read_ops uses a fresh spine with no anchors — the reference alignment.
         let (ref_ops, _, _) = graph.align_read_ops(r).unwrap();
-        let ref_inserts = ref_ops.iter().filter(|o| matches!(o, AlignOp::Insert(_))).count();
+        let ref_inserts = ref_ops
+            .iter()
+            .filter(|o| matches!(o, AlignOp::Insert(_)))
+            .count();
 
         // add_read uses the cached spine with minimizer anchors.
         // Shifted anchors must not cause spurious inserts.
@@ -883,13 +953,16 @@ fn diag_sca4_zfhx3_hap2_alignment_ops() {
         // alignment would (ref has no inserts for all non-outlier reads).
         assert_eq!(
             ref_inserts, 0,
-            "r{} reference alignment has unexpected inserts", i
+            "r{} reference alignment has unexpected inserts",
+            i
         );
         // Graph must not grow unboundedly: no spurious INSERT nodes.
         // Seed spine = 103 nodes; each read adds at most a handful of mismatch nodes.
         assert!(
             nodes_after <= 115,
-            "r{} caused graph to grow to {} nodes (spurious inserts?)", i, nodes_after
+            "r{} caused graph to grow to {} nodes (spurious inserts?)",
+            i,
+            nodes_after
         );
     }
 }

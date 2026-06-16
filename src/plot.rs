@@ -598,8 +598,12 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
         if let Ok((ops, _, rank_of)) = graph.align_read_ops(r) {
             for op in &ops {
                 match op {
-                    AlignOp::Match(ni) => { match_ranks.insert(rank_of[*ni]); }
-                    AlignOp::Delete(ni) => { delete_ranks.insert(rank_of[*ni]); }
+                    AlignOp::Match(ni) => {
+                        match_ranks.insert(rank_of[*ni]);
+                    }
+                    AlignOp::Delete(ni) => {
+                        delete_ranks.insert(rank_of[*ni]);
+                    }
                     AlignOp::Insert(_) => {}
                 }
             }
@@ -612,7 +616,8 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
     let spine_set: std::collections::HashSet<usize> =
         topology.spine_ranks.iter().copied().collect();
     // topo_rank → position along spine (0-indexed)
-    let spine_idx: HashMap<usize, usize> = topology.spine_ranks
+    let spine_idx: HashMap<usize, usize> = topology
+        .spine_ranks
         .iter()
         .enumerate()
         .map(|(i, &rank)| (rank, i))
@@ -626,8 +631,11 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
     let spine_y_val = 0.5_f64;
 
     let spine_x = |si: usize| -> f64 {
-        if spine_len <= 1 { 0.5 }
-        else { pad + (si as f64 / (spine_len - 1) as f64) * (1.0 - 2.0 * pad) }
+        if spine_len <= 1 {
+            0.5
+        } else {
+            pad + (si as f64 / (spine_len - 1) as f64) * (1.0 - 2.0 * pad)
+        }
     };
 
     let mut positions = vec![(0.5_f64, spine_y_val); n];
@@ -642,13 +650,21 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
 
     for node in &topology.nodes {
         let rank = node.topo_rank;
-        if spine_set.contains(&rank) { continue; }
+        if spine_set.contains(&rank) {
+            continue;
+        }
 
         let entry = (0..rank).rev().find(|&r| spine_set.contains(&r));
-        let exit  = (rank + 1..n).find(|&r| spine_set.contains(&r));
+        let exit = (rank + 1..n).find(|&r| spine_set.contains(&r));
 
-        let x_entry = entry.and_then(|r| spine_idx.get(&r).copied()).map(spine_x).unwrap_or(pad);
-        let x_exit  = exit .and_then(|r| spine_idx.get(&r).copied()).map(spine_x).unwrap_or(1.0 - pad);
+        let x_entry = entry
+            .and_then(|r| spine_idx.get(&r).copied())
+            .map(spine_x)
+            .unwrap_or(pad);
+        let x_exit = exit
+            .and_then(|r| spine_idx.get(&r).copied())
+            .map(spine_x)
+            .unwrap_or(1.0 - pad);
         let x = (x_entry + x_exit) / 2.0;
 
         let slot = arm_slots.entry((entry, exit)).or_insert(0);
@@ -664,7 +680,13 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
     // Base radius is large enough that the "{rank}:{base}" label fits inside
     // once kuva supports inside-node labels; for now the label sits beside.
     // Coverage scales the radius slightly so high-support nodes stand out.
-    let max_cov = topology.nodes.iter().map(|nd| nd.coverage).max().unwrap_or(1).max(1) as f64;
+    let max_cov = topology
+        .nodes
+        .iter()
+        .map(|nd| nd.coverage)
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
     let base_r = 22.0_f64;
 
     // ── Build NetworkPlot ─────────────────────────────────────────────────
@@ -676,7 +698,9 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
         // Layout is irrelevant — every node is pinned.
         .with_layout(NetworkLayout::ForceDirected);
 
-    if show_labels { net = net.with_labels(); }
+    if show_labels {
+        net = net.with_labels();
+    }
 
     // Pin all nodes before adding edges so isolated nodes are always present.
     for node in &topology.nodes {

@@ -3,8 +3,8 @@
 //! Run with:
 //!   cargo run --example network_plot --features plot
 
-use poa_consensus::{PoaConfig, PoaGraph};
 use poa_consensus::plot::graph_network_svg;
+use poa_consensus::{PoaConfig, PoaGraph};
 use std::fs;
 
 fn main() {
