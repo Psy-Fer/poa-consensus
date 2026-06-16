@@ -760,6 +760,11 @@ fn anchor_j_bounds(
 /// constrained by slide-lock windows.  Returns the original window unchanged
 /// when anchors provide no constraint or the intersection is empty (wrong
 /// anchor — correctness fallback to existing window).
+///
+/// Also skips the anchor when its upper bound falls below `j_center`
+/// (j_pred_max + 1): a shifted anchor that would exclude the expected
+/// diagonal causes the diagonal skip to write outside the valid band,
+/// silently discarding the correct alignment path.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn anchor_refine_spine(
@@ -772,12 +777,18 @@ fn anchor_refine_spine(
     is_spine: bool,
     in_bubble: bool,
     is_locked: bool,
+    j_center: usize,
 ) -> (usize, usize) {
     if anchors.is_empty() || is_source || !is_spine || in_bubble || is_locked {
         return (j_lo, j_hi);
     }
     match anchor_j_bounds(t, anchors, l) {
         Some((alo, ahi)) => {
+            // A shifted anchor whose upper bound sits below the expected diagonal
+            // would exclude the correct alignment path.  Discard it.
+            if ahi < j_center {
+                return (j_lo, j_hi);
+            }
             let nlo = j_lo.max(alo);
             let nhi = j_hi.min(ahi);
             if nlo <= nhi { (nlo, nhi) } else { (j_lo, j_hi) }
@@ -983,7 +994,8 @@ fn align(
         // Narrow with minimizer anchor constraint for spine nodes that are
         // outside bubble regions and not already pinned by slide-lock windows.
         // Never widens the window; falls back to (j_lo, j_hi) when the anchor
-        // constraint is absent or would produce an empty interval.
+        // constraint is absent, would produce an empty interval, or would
+        // exclude the expected diagonal (shifted-anchor safety guard).
         let (j_lo, j_hi) = anchor_refine_spine(
             j_lo,
             j_hi,
@@ -994,6 +1006,7 @@ fn align(
             on_spine[node_idx],
             bubble_ranges[t].is_some(),
             scratch.get_node_j(node_idx).is_some() || scratch.get_exit_j(node_idx).is_some(),
+            j_pred_max.saturating_add(1),
         );
         j_lo_arr[t] = j_lo;
         j_hi_arr[t] = j_hi;
@@ -2445,6 +2458,111 @@ impl PoaGraph {
     /// Number of nodes currently in the graph.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Like `add_read` but returns the ops, anchor count, and raw anchor list for testing.
+    /// Mirrors the exact logic of `add_read` including cached spine and anchors.
+    #[doc(hidden)]
+    pub fn add_read_debug(
+        &mut self,
+        read: &[u8],
+    ) -> Result<(Vec<AlignOp>, usize, Vec<(usize, usize)>), PoaError> {
+        if read.is_empty() {
+            return Err(PoaError::EmptyInput);
+        }
+        let (topo, rank_of) = topological_order(&self.nodes);
+        let reads_since_update = self.n_reads.saturating_sub(self.spine_updated_at);
+        if self.cached_spine.is_empty() || reads_since_update >= self.spine_interval {
+            let new_spine = heaviest_path(&self.nodes, &topo, &rank_of);
+            let diff = spine_diff(&self.cached_spine, &new_spine);
+            self.cached_spine = new_spine;
+            self.spine_updated_at = self.n_reads;
+            self.spine_mers = build_spine_mers(&self.cached_spine, MINI_K, MINI_W);
+            if diff <= SPINE_STABLE_THRESHOLD {
+                self.spine_interval = (self.spine_interval * 2).min(SPINE_MAX_INTERVAL);
+            } else {
+                self.spine_interval = 1;
+            }
+        }
+        let read_mers = compute_minimizers(read, MINI_K, MINI_W);
+        let raw_anchors =
+            build_anchor_chain(&read_mers, &self.spine_mers, &self.cached_spine, &rank_of);
+        let anchor_count = raw_anchors.len();
+        let anchors: Vec<(usize, usize)> = if raw_anchors.len() >= MINI_MIN_CHAIN {
+            raw_anchors.clone()
+        } else {
+            vec![]
+        };
+        let ops = align(
+            &self.nodes,
+            &topo,
+            &rank_of,
+            &self.cached_spine,
+            read,
+            &self.config,
+            &mut self.align_scratch,
+            &anchors,
+        )?;
+        let read_idx = self.n_reads as u32;
+        add_to_graph(&mut self.nodes, &mut self.edge_reads, read, &ops, read_idx);
+        self.reads.push(read.to_vec());
+        self.n_reads += 1;
+        Ok((ops, anchor_count, raw_anchors))
+    }
+
+    /// Return a snapshot of the graph topology for visualization and inspection.
+    ///
+    /// Nodes are in topological order; `edges` use topological ranks as source
+    /// and target identifiers.  `spine_ranks` lists the ranks of nodes on the
+    /// heaviest-path (consensus) spine.
+    pub fn graph_topology(&self) -> crate::types::GraphTopology {
+        use crate::types::{GraphEdgeInfo, GraphNodeInfo, GraphTopology};
+
+        let (topo, rank_of) = topological_order(&self.nodes);
+        let spine = heaviest_path(&self.nodes, &topo, &rank_of);
+
+        let nodes: Vec<GraphNodeInfo> = topo
+            .iter()
+            .enumerate()
+            .map(|(rank, &node_idx)| {
+                let n = &self.nodes[node_idx];
+                GraphNodeInfo {
+                    node_idx,
+                    base: n.base,
+                    coverage: n.coverage,
+                    delete_count: n.delete_count,
+                    topo_rank: rank,
+                }
+            })
+            .collect();
+
+        let edges: Vec<GraphEdgeInfo> = topo
+            .iter()
+            .enumerate()
+            .flat_map(|(from_rank, &node_idx)| {
+                self.nodes[node_idx]
+                    .out_edges
+                    .iter()
+                    .map(move |&(succ_idx, weight)| (from_rank, succ_idx, weight))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(from_rank, succ_idx, weight)| GraphEdgeInfo {
+                from_rank,
+                to_rank: rank_of[succ_idx],
+                weight,
+            })
+            .collect();
+
+        let spine_ranks: Vec<usize> = spine
+            .iter()
+            .map(|(node_idx, _, _)| rank_of[*node_idx])
+            .collect();
+
+        GraphTopology {
+            nodes,
+            edges,
+            spine_ranks,
+        }
     }
 
     /// For each node, return `(out_edges_count, max_out_edge_weight, min_out_edge_weight)`.

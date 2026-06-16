@@ -357,10 +357,13 @@ pub use analysis::{
 pub use config::{AlignmentMode, ConsensusMode, PoaConfig};
 pub use error::PoaError;
 pub use flank::extract_flanked_region;
-pub use graph::PoaGraph;
+pub use graph::{AlignOp, PoaGraph};
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
 pub use seed::{SeedSelection, select_seed};
-pub use types::{BubbleSite, Consensus, CoverageGap, GapKind, GraphStats, Strand};
+pub use types::{
+    BubbleSite, Consensus, CoverageGap, GapKind, GraphEdgeInfo, GraphNodeInfo, GraphStats,
+    GraphTopology, Strand,
+};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
