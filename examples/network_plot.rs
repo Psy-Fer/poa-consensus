@@ -76,4 +76,39 @@ fn main() {
     let svg3 = graph_network_svg(&g2, None);
     fs::write("/tmp/poa_network_noisy.svg", &svg3).unwrap();
     println!("poa_network_noisy.svg written ({} bytes)", svg3.len());
+
+    // ── Deletion fixture: majority has full sequence, minority deletes 2 bases ──
+    // Creates a skip edge (entry → exit) that arcs above the spine.
+    let with_del: &[&[u8]] = &[
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCT", // deletion: 2 bases removed at positions 6-7 (AG)
+        b"GCTAGCTAGCTAGCT",
+        b"GCTAGCTAGCTAGCT",
+    ];
+
+    let mut g3 = PoaGraph::new(with_del[0], PoaConfig::default()).unwrap();
+    for r in &with_del[1..] {
+        g3.add_read(r).unwrap();
+    }
+
+    let svg4 = graph_network_svg(&g3, None);
+    fs::write("/tmp/poa_network_deletion.svg", &svg4).unwrap();
+    println!("poa_network_deletion.svg written ({} bytes)", svg4.len());
+
+    // Same graph with a deletion-read overlaid (shows orange delete-path nodes)
+    let svg5 = graph_network_svg(&g3, Some(b"GCTAGCTAGCTAGCT"));
+    fs::write("/tmp/poa_network_deletion_overlay.svg", &svg5).unwrap();
+    println!(
+        "poa_network_deletion_overlay.svg written ({} bytes)",
+        svg5.len()
+    );
 }

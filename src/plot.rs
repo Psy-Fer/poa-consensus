@@ -699,7 +699,7 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
         .with_layout(NetworkLayout::ForceDirected);
 
     if show_labels {
-        net = net.with_labels();
+        net = net.with_labels_inside();
     }
 
     // Pin all nodes before adding edges so isolated nodes are always present.
@@ -710,9 +710,26 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
     }
 
     for edge in &topology.edges {
-        let src = fmt_label(&topology.nodes[edge.from_rank]);
-        let tgt = fmt_label(&topology.nodes[edge.to_rank]);
-        net = net.with_edge(src, tgt, edge.weight as f64);
+        let src_rank = edge.from_rank;
+        let tgt_rank = edge.to_rank;
+        let src = fmt_label(&topology.nodes[src_rank]);
+        let tgt = fmt_label(&topology.nodes[tgt_rank]);
+        let src_on_spine = spine_set.contains(&src_rank);
+        let tgt_on_spine = spine_set.contains(&tgt_rank);
+
+        // Arm connections (exactly one endpoint off-spine): curve outward so the
+        // arc matches the JPEG convention — bubble arms bow away from the spine.
+        // The sign is chosen based on the arm's y-position: arms above the spine
+        // (y < 0.5) get a negative curve (arc further above); arms below get
+        // a positive curve (arc further below).
+        if src_on_spine != tgt_on_spine {
+            let arm_rank = if src_on_spine { tgt_rank } else { src_rank };
+            let arm_y = positions[arm_rank].1;
+            let curve = if arm_y < 0.5 { -0.25 } else { 0.25 };
+            net = net.with_edge_curved(src, tgt, edge.weight as f64, curve);
+        } else {
+            net = net.with_edge(src, tgt, edge.weight as f64);
+        }
     }
 
     for node in &topology.nodes {
