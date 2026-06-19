@@ -76,7 +76,8 @@
 //! // Pass 1 builds the graph and computes GraphStats.
 //! // Pass 2 is selected automatically: multi-allele split, noise tightening,
 //! // or semi-global switch, depending on what the stats reveal.
-//! let alleles = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
+//! let result  = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
+//! let alleles = result.consensuses;   // Vec<Consensus>; one or two elements
 //! # Ok::<(), poa_consensus::PoaError>(())
 //! ```
 //!
@@ -431,8 +432,10 @@ pub fn consensus_multi(
 /// | Coverage CV > 1.5 and mode is `Global` | Switch to `SemiGlobal`, rebuild |
 /// | Otherwise | Return pass-1 single consensus; no rebuild |
 ///
-/// Always returns a `Vec<Consensus>`: one element for single-allele outcomes,
-/// two for diploid.
+/// Returns an [`AdaptiveResult`] containing `consensuses` (one element for
+/// single-allele outcomes, two for diploid) and `action` (which pass-2 branch
+/// fired, if any).  Inspect `action` to distinguish a clean pass-through from
+/// a corrected result without re-running [`diagnose`].
 ///
 /// ## Truncation detection
 ///

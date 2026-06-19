@@ -42,8 +42,9 @@ let alleles = consensus_multi(&reads, 0, &PoaConfig::default())?;
 
 // Adaptive two-pass: inspects graph statistics after pass 1 and automatically
 // chooses multi-allele split, noise tightening, or semi-global switch for pass 2.
-// Always returns a Vec<Consensus> (one element for single-allele outcomes).
-let alleles = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
+// Returns AdaptiveResult { consensuses, action } — action records which branch fired.
+let result  = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
+let alleles = result.consensuses;  // Vec<Consensus>; one or two elements
 ```
 
 ### Stateful API
@@ -112,7 +113,7 @@ cargo install poa-consensus --features cli
 ```
 poa-consensus reads.fa                    # FASTA or FASTQ, auto-detected
 poa-consensus reads.fa --multi            # multi-allele mode
-poa-consensus reads.fa --adaptive-band    # recommended for reads > 1 kb
+poa-consensus reads.fa --no-adaptive-band # disable adaptive band (on by default)
 poa-consensus reads.fa --quiet            # suppress warnings; errors always printed
 ```
 
