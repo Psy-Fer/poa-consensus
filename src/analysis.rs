@@ -119,6 +119,7 @@ pub fn min_coverage(consensus: &Consensus) -> u32 {
 ///     graph_stats: GraphStats::default(),
 ///     gaps: vec![],
 ///     bubble_sites: vec![],
+///     read_indices: vec![],
 /// };
 ///
 /// let low = low_coverage_regions(&result, 3);
@@ -307,6 +308,7 @@ pub fn max_achievable_accuracy(n: usize, sigma_per_obs: f64) -> f64 {
 ///     graph_stats: GraphStats::default(),
 ///     gaps: vec![],
 ///     bubble_sites: vec![site],
+///     read_indices: vec![],
 /// };
 ///
 /// // 30% > 25%: a competing allele is present.
@@ -347,6 +349,7 @@ pub fn has_competing_allele(consensus: &Consensus, min_freq: f64) -> Option<&Bub
 ///     graph_stats: GraphStats::default(),
 ///     gaps: vec![],
 ///     bubble_sites: vec![],        // no bubbles
+///     read_indices: vec![],
 /// };
 /// assert!(!should_call_multiallele(&result, 0.25));
 /// ```
