@@ -11,6 +11,48 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.1.3] - unreleased
+
+### Fixed
+
+- **Shifted minimizer anchor bug in `anchor_refine_spine`** -- k-mers that span a
+  repeat/flanking boundary can appear at a different read position in shorter reads (one fewer
+  repeat unit before the anchor sequence). This produced anchors whose upper bound `ahi` fell
+  below the expected alignment diagonal `j_center`, constraining `j_hi` below the reachable
+  range and causing catastrophic alignment failure: the affected read produced M=1, I=99
+  (roughly 100 spurious insert nodes) instead of the correct M=100, D=3. `anchor_refine_spine`
+  now discards any anchor where `ahi < j_center` rather than applying it, leaving the band
+  at its unrefined default. Confirmed on SCA4 ZFHX3 hap2 HiFi reads; regression test:
+  `diag_sca4_zfhx3_hap2_alignment_ops`.
+
+### Added
+
+- **`graph_network_svg`** (`plot` feature) -- new visualisation of POA graph topology as a
+  directed network. Spine nodes are laid out horizontally; arm (insert) nodes sit above or
+  below their attachment points; edges between spine and arm nodes are drawn as curves. Labels
+  are rendered inside each node. An optional read slice overlays that read's alignment path in
+  a distinct colour, making it easy to inspect which nodes a specific read traverses. Run the
+  included example with `cargo run --example network_plot --features plot`.
+- **`Consensus::read_indices: Vec<usize>`** -- indices into the original `reads` slice that
+  contributed to this consensus. Populated by `consensus_multi` and `PoaGraph::consensus_multi`;
+  empty for single-allele outputs (empty means "all reads contributed"). Callers can use these
+  to assign per-read rows to the correct haplotype, pull reads for visualisation, or compute
+  per-allele statistics without re-running alignment.
+- **`AdaptiveAction` enum and `AdaptiveResult` struct** -- `consensus_adaptive` now returns
+  `Result<AdaptiveResult, PoaError>` instead of `Result<Vec<Consensus>, PoaError>`.
+  `AdaptiveResult` carries `consensuses: Vec<Consensus>` and `action: AdaptiveAction`.
+  `AdaptiveAction` variants: `PassThrough`, `MultiAllele`, `NoisyTighten`,
+  `TruncationRetry { recovered: bool }`, `SemiGlobalFallback`. Callers that previously
+  used the return value as a `Vec` directly must now access `.consensuses`.
+
+### Breaking
+
+- **`consensus_adaptive` return type** changed from `Result<Vec<Consensus>, PoaError>` to
+  `Result<AdaptiveResult, PoaError>`. Replace `consensus_adaptive(...)?` with
+  `consensus_adaptive(...)?.consensuses` at call sites that only need the consensus vec.
+
+---
+
 ## [0.1.2] - 2026-06-01
 
 ### Changed
@@ -118,7 +160,8 @@ Initial release.
   histogram, node-coverage histogram, alignment-density heatmap, band-with-reads overlay.
 - 193 tests; 20/20 synthetic validation scenarios passing (two via adequacy signals).
 
-[Unreleased]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Psy-Fer/poa-consensus/releases/tag/v0.1.0
