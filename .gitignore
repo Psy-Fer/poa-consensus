@@ -34,6 +34,9 @@ test_plots/
 bench/work/
 *.pyc
 
+# mdBook build output
+docs/book/
+
 # Real patient data -- extracted from BAM, not for public repo
 tests/fixtures/rfc1_canvas_hp1.fa
 tests/fixtures/rfc1_canvas_hp1_partial.fa

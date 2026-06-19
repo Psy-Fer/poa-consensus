@@ -1,0 +1,16 @@
+[book]
+title       = "poa-consensus"
+description = "Banded POA consensus for short tandem repeat and amplicon reads"
+authors     = ["James Ferguson"]
+language    = "en"
+src         = "src"
+
+[output.html]
+site-url          = "/poa-consensus/"
+git-repository-url = "https://github.com/Psy-Fer/poa-consensus"
+edit-url-template = "https://github.com/Psy-Fer/poa-consensus/edit/main/docs/src/{path}"
+no-section-label  = false
+
+[output.html.fold]
+enable = true
+level  = 1
