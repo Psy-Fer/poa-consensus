@@ -180,8 +180,9 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "kuva"
-version = "0.2.0"
-source = "git+https://github.com/Psy-Fer/kuva?branch=dev#517b4472c3718d45593dc1a739fb02c2e0467598"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f47e7704b7f37cc7ac8981a4b65b373ee9c8fdc6585b4f323dd67923f5d4ffb"
 dependencies = [
  "chrono",
  "colorous",
