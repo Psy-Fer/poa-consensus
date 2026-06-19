@@ -1,0 +1,1652 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>poa-consensus</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Banded POA consensus for short tandem repeat and amplicon reads">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-0392ca55.css">
+        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-0eb0b959.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-a82fcd50.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">poa-consensus</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/Psy-Fer/poa-consensus" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
+<p><code>poa-consensus</code> is a pure-Rust library for building a consensus sequence from a set of reads
+using Partial Order Alignment (POA). It is designed for short tandem repeat (STR) loci,
+amplicon sequencing, and any per-locus use case where reads cover a shared region with length
+variation, substitution errors, or true allelic differences.</p>
+<h2 id="what-poa-does"><a class="header" href="#what-poa-does">What POA does</a></h2>
+<p>POA aligns reads into a directed acyclic graph (DAG). Each node in the graph represents a
+base; edges represent adjacency. When reads agree they share nodes; when they disagree
+(substitution, insertion, or deletion) the graph branches. Consensus is extracted by finding
+the path through the graph with the highest total read support – the heaviest path.</p>
+<p>This is more powerful than a simple majority vote because it handles length variation
+naturally. A deletion in some reads creates a shortcut edge; an insertion creates an extra
+node. The heaviest path selects whichever variant has more read support, regardless of length.</p>
+<h2 id="when-to-use-this-crate"><a class="header" href="#when-to-use-this-crate">When to use this crate</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Scenario</th><th>Recommended</th></tr>
+</thead>
+<tbody>
+<tr><td>STR loci, 50–600 bp reads, high throughput across many loci</td><td><code>poa-consensus</code> (banded DP)</td></tr>
+<tr><td>Longer reads (&gt;1 kb), bacterial genes, HLA loci</td><td><a href="https://crates.io/crates/poasta"><code>poasta</code></a> (A* alignment)</td></tr>
+<tr><td>Diploid STR with two distinct allele lengths</td><td><code>poa-consensus</code> with <code>consensus_multi</code></td></tr>
+<tr><td>No spanning reads, expansion too long for any single read</td><td><code>poa-consensus</code> <code>bridged_consensus</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The nearest alternative on crates.io is
+<a href="https://crates.io/crates/poasta"><code>poasta</code></a> (Broad Institute), which uses exact gap-affine
+A* alignment and excels at large graphs. For STR reads where graphs stay small and
+throughput across hundreds of loci per sample matters, banded DP is faster and simpler.
+Both crates are pure Rust with no C dependencies.</p>
+<h2 id="feature-flags"><a class="header" href="#feature-flags">Feature flags</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>What it adds</th></tr>
+</thead>
+<tbody>
+<tr><td><em>(none)</em></td><td>Library only; zero external dependencies</td></tr>
+<tr><td><code>cli</code></td><td>Binary target; pulls in <code>clap</code> + <code>noodles</code></td></tr>
+<tr><td><code>plot</code></td><td>SVG visualisation helpers via <code>kuva</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="quick-example"><a class="header" href="#quick-example">Quick example</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{consensus, PoaConfig};
+
+let reads: Vec&lt;&amp;[u8]&gt; = vec![
+    b"CATCATCATCAT",
+    b"CATCATCATCAT",
+    b"CATCATCATCAT",
+    b"CATCATCATCATCAT",  // one read with an extra repeat unit
+];
+
+let result = consensus(&amp;reads, 0, &amp;PoaConfig::default())?;
+println!("{}", String::from_utf8_lossy(&amp;result.sequence));
+// =&gt; CATCATCATCAT  (majority length wins)
+<span class="boring">}</span></code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="algorithm-overview"><a class="header" href="#algorithm-overview">Algorithm Overview</a></h1>
+<p>The algorithm runs in three stages for each read set:</p>
+<ol>
+<li><strong>Seed initialisation</strong> – the seed read becomes a linear chain of nodes. Every subsequent
+read is aligned into this growing graph.</li>
+<li><strong>Iterative alignment</strong> – for each read: (a) topological sort, (b) banded DP alignment
+against the graph, (c) update the graph from the alignment traceback.</li>
+<li><strong>Consensus extraction</strong> – follow the heaviest (most-supported) path through the final
+graph, trim low-coverage boundaries, and return the sequence with coverage and statistics.</li>
+</ol>
+<h2 id="data-structures"><a class="header" href="#data-structures">Data structures</a></h2>
+<h3 id="node"><a class="header" href="#node">Node</a></h3>
+<p>Each node carries:</p>
+<ul>
+<li><code>base: u8</code> – the nucleotide at this position</li>
+<li><code>coverage: u32</code> – number of reads that matched (not deleted) this node</li>
+<li><code>out_edges: Vec&lt;(usize, i32)&gt;</code> – <code>(target_node_index, edge_weight)</code> pairs</li>
+</ul>
+<p>Edge weight records how many reads traversed from this node to the target. Weights are
+updated on every alignment: a match or insert op increments the outgoing edge weight.</p>
+<h3 id="poagraph"><a class="header" href="#poagraph">PoaGraph</a></h3>
+<p>The graph owns all nodes in a flat <code>Vec&lt;Node&gt;</code>. Node indices are stable across the life of
+the graph; topological order is recomputed before each alignment. The graph also caches a
+<strong>spine</strong> – the current heaviest-path consensus – which is used by the banded aligner to
+centre the DP band.</p>
+<h2 id="alignment-scoring"><a class="header" href="#alignment-scoring">Alignment scoring</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Score</th></tr>
+</thead>
+<tbody>
+<tr><td>Match</td><td>+1</td></tr>
+<tr><td>Mismatch</td><td>-1</td></tr>
+<tr><td>Gap open</td><td>-2</td></tr>
+<tr><td>Gap extend</td><td>-1 (per additional base)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Affine gap penalties are used from the start. The two-component recurrence (M/I/D matrices)
+handles gap-open separately from gap-extend, giving meaningfully better accuracy on
+homopolymer runs than linear penalties would.</p>
+<h2 id="critical-design-decisions"><a class="header" href="#critical-design-decisions">Critical design decisions</a></h2>
+<p>These choices are load-bearing – changing them without understanding the tests is likely to
+break things.</p>
+<p><strong>Delete ops do not increment coverage.</strong> A read that skips a node via a delete traverses
+it but does not count as evidence for it. This prevents phase-shifted reads from inflating
+boundary-node coverage and blocking the boundary trim from removing nodes that should not be
+in the consensus.</p>
+<p><strong>Edge weight normalisation <code>(weight - 1)</code>.</strong> The heaviest-path DP accumulates
+<code>edge_weight - 1</code> rather than <code>edge_weight</code>. Without this, a single outlier read with extra
+trailing bases always extends the consensus because its edge still scores positively. With
+normalisation, only edges supported by two or more reads score positively; single-read
+branches are penalised.</p>
+<p><strong>Seed selection is the caller’s responsibility.</strong> The library takes an explicit seed index.
+The recommended heuristic is the shortest fully-spanning read (see <a href="#seed-selection">Seed Selection</a>).
+A poor seed degrades alignment quality for every subsequent read because the seed becomes the
+initial graph backbone.</p>
+<p><strong>Semi-global alignment for STR reads.</strong> Global alignment has a subtle failure mode at
+homopolymer-flanked loci. Use <code>AlignmentMode::SemiGlobal</code> (the default) for extracted STR
+reads. See <a href="#single-allele-consensus">Single-Allele Consensus</a> for details.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="graph-construction"><a class="header" href="#graph-construction">Graph Construction</a></h1>
+<h2 id="seeding"><a class="header" href="#seeding">Seeding</a></h2>
+<p><code>PoaGraph::new(seed, config)</code> builds an initial linear chain: one node per base in the seed
+read, with each node connected to the next by an edge of weight 1 and coverage 1. This chain
+is the starting backbone; every subsequent read is aligned into it.</p>
+<p>The choice of seed matters. A seed that is much longer or shorter than the read set creates
+unnecessary early branches and inflates the band width the aligner needs to track them. A
+median-length spanning read is the right default (see <a href="#seed-selection">Seed Selection</a>).</p>
+<h2 id="adding-a-read"><a class="header" href="#adding-a-read">Adding a read</a></h2>
+<p><code>PoaGraph::add_read(read)</code> runs three steps:</p>
+<h3 id="1-topological-sort-kahns-algorithm"><a class="header" href="#1-topological-sort-kahns-algorithm">1. Topological sort (Kahn’s algorithm)</a></h3>
+<p>The graph is sorted into a linear ordering where every node appears before all nodes it has
+an outgoing edge to. This is required by the DP: the aligner processes nodes in topological
+order so that all predecessors of a node have been scored before the node itself is scored.</p>
+<p>The sort runs in O(V + E) and is cached between reads via the <strong>stale spine</strong> mechanism
+described in <a href="#banded-dp-alignment">Banded DP Alignment</a>.</p>
+<h3 id="2-dp-alignment"><a class="header" href="#2-dp-alignment">2. DP alignment</a></h3>
+<p>The read is aligned against the sorted graph using banded affine-gap DP. The alignment
+returns an <code>AlignOp</code> sequence: <code>Match(node)</code>, <code>Insert(base)</code>, or <code>Delete(node)</code>.</p>
+<h3 id="3-graph-update-add_to_graph"><a class="header" href="#3-graph-update-add_to_graph">3. Graph update (<code>add_to_graph</code>)</a></h3>
+<p>The traceback is replayed to update the graph:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Op</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Match(node)</code></td><td>Increment <code>node.coverage</code> and the incoming edge weight</td></tr>
+<tr><td><code>Insert(base)</code></td><td>Create a new node; connect it to the previous and next nodes in the traceback</td></tr>
+<tr><td><code>Delete(node)</code></td><td>Traverse <code>node</code> without incrementing its coverage; increment only the traversal edge weight</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Insert nodes</strong> are allocated with coverage 1 (the current read is the first to traverse
+them). Subsequent reads that match the same insert base will merge into the existing node
+rather than creating a new one, because the DP naturally finds the highest-scoring path and
+a match to an existing node scores +1 while a new insert scores 0 (open + extend penalty).</p>
+<p><strong>Delete traversals</strong> increment the outgoing edge weight at each skipped node, preserving
+the read count on the traversal path for the heaviest-path DP, but do not count as evidence
+that the node’s base is correct. This is the key design choice that makes boundary trim work:
+nodes that are skipped by the majority of reads have low <code>coverage</code> even if many reads
+traversed the graph position.</p>
+<h2 id="graph-growth-over-a-read-set"><a class="header" href="#graph-growth-over-a-read-set">Graph growth over a read set</a></h2>
+<p>A typical graph on a clean 20-read set of 150 bp STR reads:</p>
+<ul>
+<li>Seed: 150 nodes, 149 edges</li>
+<li>After 20 reads (5% substitution error): ~165 nodes (15 error insert nodes), ~185 edges</li>
+<li>Heaviest path: 150 nodes (the true consensus)</li>
+</ul>
+<p>Error insert nodes sit off the spine with edge weight 1 (or 2 if two reads share the same
+error). The <code>(weight - 1)</code> normalisation in the heaviest path DP gives them a negative
+contribution, keeping the heaviest path on the true spine.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="banded-dp-alignment"><a class="header" href="#banded-dp-alignment">Banded DP Alignment</a></h1>
+<h2 id="why-banding"><a class="header" href="#why-banding">Why banding</a></h2>
+<p>The full affine-gap DP over a graph with V nodes and a read of length L requires O(V × L)
+cells. For a 150 bp read against a 160-node graph that is ~24,000 cells – trivial. For a
+20 kb read against a 21,000-node graph it is ~400 million cells, requiring ~9.6 GB for three
+i32 matrices. Banding limits the DP to a corridor of width 2w + 1 around a predicted
+diagonal, reducing memory and work to O(w × L).</p>
+<h2 id="band-width"><a class="header" href="#band-width">Band width</a></h2>
+<p>Band width is controlled by <code>PoaConfig</code>:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct PoaConfig {
+    pub band_width: usize,     // fixed minimum; 0 = unbanded
+    pub adaptive_band: bool,   // use abPOA formula: w = b + f*L
+    pub adaptive_band_b: usize, // base (default 10)
+    pub adaptive_band_f: f32,  // fraction of read length (default 0.01)
+    // ...
+}
+<span class="boring">}</span></code></pre>
+<p>The <strong>adaptive formula</strong> computes <code>w = max(band_width, b + f * max(read_len, graph_nodes))</code>.
+Using <code>graph_nodes</code> rather than just <code>read_len</code> corrects for accumulated insert nodes from
+prior reads that shift topological ranks away from the read-position diagonal.</p>
+<p><strong>Default:</strong> <code>adaptive_band = true</code>, <code>band_width = 50</code>. The 50 bp floor prevents silent
+repeat-unit loss in long repetitive alleles where the raw adaptive formula (w ≈ 15 for 500 bp
+reads) would be too narrow for even a single wrong diagonal.</p>
+<p><strong>Memory table (3 × i32 matrices):</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Read length</th><th>Band width</th><th>Memory</th></tr>
+</thead>
+<tbody>
+<tr><td>600 bp</td><td>50</td><td>~1.4 MB</td></tr>
+<tr><td>600 bp</td><td>100</td><td>~2.9 MB</td></tr>
+<tr><td>20 kb</td><td>210 (adaptive)</td><td>~200 MB</td></tr>
+<tr><td>20 kb</td><td>unbanded</td><td>~9.6 GB</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="tracking-band"><a class="header" href="#tracking-band">Tracking band</a></h2>
+<p>The band is not centred on the fixed diagonal (read_pos = graph_rank). Instead it tracks
+<code>best_j</code> – the read position of the highest-scoring cell in the previous row. This
+self-corrects for:</p>
+<ul>
+<li>Phase shifts (reads with a different number of leading repeat units than the seed)</li>
+<li>SV events (a deletion in the read shifts the alignment diagonal by the deletion size)</li>
+<li>Graph expansion from prior reads (insert nodes push topological ranks upward)</li>
+</ul>
+<p>The tracking band means that a graph built from reads with CAG×20 and CAG×22 does not
+require a band wide enough to hold both simultaneously; the band re-centres at the phase
+shift boundary.</p>
+<h2 id="diagonal-skip"><a class="header" href="#diagonal-skip">Diagonal skip</a></h2>
+<p>For spine nodes (single predecessor, single successor, not at a bubble boundary) the
+full three-matrix DP is often unnecessary. If the predecessor’s best read position <code>bj</code>
+matches the node’s base <code>node_base == query[bj]</code>, the correct cell is a pure match:</p>
+<pre><code>M[t][bj+1] = M[pred][bj] + 1
+</code></pre>
+<p>This O(1) path is taken instead of computing the full row. It fires on roughly 99% of
+spine nodes once the graph has converged (after ~3 reads on a clean set). The saving is
+significant: a 150 bp spine with 95% skip rate reduces per-read work from ~150 × 2w
+cells to ~8 × 2w cells plus 142 O(1) operations.</p>
+<h2 id="bubble-range-j-window"><a class="header" href="#bubble-range-j-window">Bubble-range j-window</a></h2>
+<p>At bubble entry nodes (nodes with two or more outgoing edges above the allele-frequency
+threshold) the band is widened by the bubble span. Each arm is processed in its own
+narrow window anchored to the bubble entry’s j position, then the band contracts back to
+spine width at the bubble exit. This concentrates DP work at divergence points without
+widening the global band.</p>
+<h2 id="approaching-edge-detector-and-retry"><a class="header" href="#approaching-edge-detector-and-retry">Approaching-edge detector and retry</a></h2>
+<p>If <code>best_j</code> gets within <code>GAP_MARGIN</code> cells of either band edge during a non-trivial row,
+the alignment is approaching the band boundary. Rather than completing a potentially wrong
+alignment, the aligner returns <code>Err(BandTooNarrow { required })</code> early.</p>
+<p><code>add_read</code> wraps the alignment in a 3-pass retry loop:</p>
+<ol>
+<li><strong>Pass 1</strong> with the configured band width.</li>
+<li><strong>Pass 2</strong> with <code>w = required</code> (the width the approaching-edge detector estimated).</li>
+<li><strong>Pass 3</strong> unbanded (always correct; used only when passes 1 and 2 both approach an edge).</li>
+</ol>
+<p>Pass 1 exits early on <code>BandTooNarrow</code> so wasted work is minimal. Pass 3 is rare in
+practice.</p>
+<h2 id="stale-spine"><a class="header" href="#stale-spine">Stale spine</a></h2>
+<p>The spine (heaviest-path consensus cached in the graph) is used to centre the band and to
+anchor minimizer-based alignment. Recomputing it after every read is wasteful; the spine
+rarely changes once the graph has converged. The library recomputes only when:</p>
+<ul>
+<li><code>n_reads - spine_updated_at &gt;= spine_interval</code></li>
+<li>After each recompute, if the spine changed by ≤ 3 bases, <code>spine_interval</code> doubles
+(capped at 32). Otherwise it resets to 1.</li>
+</ul>
+<p>For 100 reads on a stable sequence this produces ~9 recomputes instead of 99. Correctness
+is unconditional: the final <code>consensus()</code> call always runs a fresh heaviest-path from the
+complete graph.</p>
+<h2 id="known-limitation-silent-wrong-alignment-on-repetitive-sequence"><a class="header" href="#known-limitation-silent-wrong-alignment-on-repetitive-sequence">Known limitation: silent wrong alignment on repetitive sequence</a></h2>
+<p>In pure-repetitive sequence (e.g. CAG×100) the DP landscape has many equally-scoring
+diagonals. The tracking band can converge to the wrong diagonal without approaching the
+band edge, producing a silently truncated consensus. The approaching-edge detector cannot
+catch this because the band never gets close to the edge.</p>
+<p>The workaround is the <strong>truncation detector</strong> in <code>diagnose()</code> and the automatic retry in
+<code>consensus_adaptive</code>: if the consensus is less than 60% of the median input read length and
+banded alignment was used, the alignment is retried unbanded. See
+<a href="#adaptive-two-pass-mode">Adaptive Two-Pass Mode</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="consensus-extraction"><a class="header" href="#consensus-extraction">Consensus Extraction</a></h1>
+<h2 id="heaviest-path-dp"><a class="header" href="#heaviest-path-dp">Heaviest-path DP</a></h2>
+<p>The heaviest path is found by a DP over the topologically sorted graph. At each node, the
+score is the maximum over all predecessors of:</p>
+<pre><code>score[node] = max over predecessors p of:
+    score[p] + (edge_weight(p, node) - 1)
+</code></pre>
+<p>The <code>(weight - 1)</code> normalisation is load-bearing. Without it, a single outlier read that
+inserts extra trailing bases produces a positive-scoring path to those bases, so the
+consensus always extends to the outlier. With normalisation, only edges supported by two or
+more reads score positively; single-read branches score -1 and are naturally avoided.</p>
+<p>The traceback from the highest-scoring terminal node gives the sequence.</p>
+<h2 id="coverage-filter"><a class="header" href="#coverage-filter">Coverage filter</a></h2>
+<p>After extracting the heaviest path, nodes below a minimum coverage threshold are removed.
+The threshold is:</p>
+<pre><code>min_cov = ceil(n_reads * min_coverage_fraction)
+</code></pre>
+<p><code>min_coverage_fraction</code> defaults to 0.5 (strict majority). A node with coverage below
+<code>min_cov</code> is not included in the consensus.</p>
+<p>This filter is applied in two phases:</p>
+<ol>
+<li><strong>Boundary trim</strong> – remove leading and trailing low-coverage nodes from the path ends.
+This handles partial reads that do not span the full locus: they contribute to the middle
+of the graph but not the boundaries, leaving boundary nodes with seed-only coverage.</li>
+<li><strong>Interior filtering</strong> – remove minority detour chains in the interior. A chain of nodes
+with coverage below <code>min_cov</code> that is connected to higher-coverage nodes on both sides
+is a noise branch and is excluded.</li>
+</ol>
+<h2 id="majority-frequency-mode"><a class="header" href="#majority-frequency-mode">Majority-frequency mode</a></h2>
+<p>As an alternative to heaviest path, <code>ConsensusMode::MajorityFrequency</code> converts the graph to
+a column-aligned MSA and takes the plurality base at each column. The denominator at each
+position is <code>coverage + delete_count</code> (reads on other bubble arms do not vote).</p>
+<p>MF mode is more robust to the phase-shift boundary trim bug because it counts delete
+traversals explicitly rather than relying on edge weights. It is better suited to HiFi data
+where read lengths within an allele group are nearly identical.</p>
+<h2 id="semi-global-alignment-and-boundary-trim"><a class="header" href="#semi-global-alignment-and-boundary-trim">Semi-global alignment and boundary trim</a></h2>
+<p>With <code>AlignmentMode::SemiGlobal</code> (the default), partial reads take free terminal gaps rather
+than forced delete traversals. This means that a read that does not span the full locus
+does not generate delete ops at the boundary nodes, leaving those nodes with genuinely low
+<code>coverage</code>. Boundary trim then correctly removes them.</p>
+<p>With <code>AlignmentMode::Global</code>, partial reads are forced to traverse boundary nodes via deletes.
+This does not increment <code>coverage</code> (by design), but it does keep the traversal path active
+in the edge weights. Boundary trim still fires, but the alignment of partial reads in global
+mode has a subtle failure: at homopolymer-flanked loci, shorter reads place their deletions
+inside the homopolymer run rather than at the start. The extra node at the run boundary sits
+on the only spine path with no shortcut alternative, so boundary trim cannot reach it. The
+result is a consensus that takes the minority-depth path for those leading bases.</p>
+<p><strong>Use <code>SemiGlobal</code> for extracted STR reads. It is the default.</strong></p>
+<h2 id="output-consensus"><a class="header" href="#output-consensus">Output: <code>Consensus</code></a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct Consensus {
+    pub sequence:     Vec&lt;u8&gt;,
+    pub coverage:     Vec&lt;u32&gt;,      // per-position read depth on the consensus path
+    pub path_weights: Vec&lt;i32&gt;,      // incoming edge weight per base
+    pub n_reads:      usize,
+    pub graph_stats:  GraphStats,
+    pub gaps:         Vec&lt;CoverageGap&gt;,
+    pub bubble_sites: Vec&lt;BubbleSite&gt;,
+    pub read_indices: Vec&lt;usize&gt;,    // populated by consensus_multi; empty otherwise
+}
+<span class="boring">}</span></code></pre>
+<p><code>coverage</code> and <code>path_weights</code> together describe confidence: a position where many reads
+agreed (<code>path_weights</code> high) and coverage is at full depth is reliable. A position where
+coverage drops (e.g. at a gap) is suspect.</p>
+<h2 id="graphstats"><a class="header" href="#graphstats">GraphStats</a></h2>
+<p><code>GraphStats</code> is computed in a single O(V + E) pass after the graph is built. Key fields:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bubble_count</code></td><td>Number of heterozygous nodes (2+ successors above <code>min_allele_freq</code>)</td></tr>
+<tr><td><code>max_bubble_depth</code></td><td>Read count on the strongest minority arm</td></tr>
+<tr><td><code>longest_bubble_span</code></td><td>Longest structural bubble in bases</td></tr>
+<tr><td><code>coverage_mean</code> / <code>coverage_variance</code></td><td>Node coverage distribution</td></tr>
+<tr><td><code>edge_weight_gini</code></td><td>Inequality of read support (0 = equal, 1 = one path dominates)</td></tr>
+<tr><td><code>single_support_fraction</code></td><td>Fraction of nodes with coverage == 1 (noise level)</td></tr>
+<tr><td><code>median_input_read_len</code></td><td>Median read length; used by the truncation detector</td></tr>
+</tbody>
+</table>
+</div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="multi-allele-phasing"><a class="header" href="#multi-allele-phasing">Multi-Allele Phasing</a></h1>
+<p>A single <code>PoaGraph</code> built from reads covering two haplotypes contains both alleles
+simultaneously. The graph has <strong>bubble</strong> structures at every position where the haplotypes
+differ. Multi-allele extraction recovers per-allele consensuses by partitioning reads into
+haplotype groups before running the heaviest-path DP.</p>
+<h2 id="bubble-detection"><a class="header" href="#bubble-detection">Bubble detection</a></h2>
+<p>A node is <strong>heterozygous</strong> if it has two or more outgoing edges where each target edge
+weight satisfies:</p>
+<pre><code>edge_weight &gt;= ceil(n_reads * min_allele_freq)
+</code></pre>
+<p><code>min_allele_freq</code> defaults to 0.25. With 20 reads, an arm must have at least 5 reads to
+qualify. Arms below the threshold are treated as noise.</p>
+<h2 id="structural-vs-snp-bubbles"><a class="header" href="#structural-vs-snp-bubbles">Structural vs SNP bubbles</a></h2>
+<p><strong>Structural bubbles</strong> are bubbles where at least one arm spans <code>phasing_bubble_min_span</code>
+bases (default 10). A CAG×20 vs CAG×30 allele difference creates a 30-node arm (30 × 3 =
+90 bp) that easily clears this threshold. An ONT substitution error at one position creates
+a 1-node arm that does not.</p>
+<p><strong>SNP bubbles</strong> are single-node forks caused by substitution errors or true SNPs.</p>
+<p>The phasing strategy uses structural bubbles preferentially because they are far less likely
+to be noise. SNP bubble phasing is a fallback when no structural bubble is found.</p>
+<h2 id="structural-phasing-union-find"><a class="header" href="#structural-phasing-union-find">Structural phasing (union-find)</a></h2>
+<ol>
+<li><code>find_structural_bubbles()</code> identifies all bubbles with at least one arm ≥
+<code>phasing_bubble_min_span</code> bases.</li>
+<li>For each structural bubble, reads are labelled with which arm they traversed (0 or 1).</li>
+<li>Across all structural bubbles, reads that agree on arm choice at every shared bubble are
+placed in the same haplotype group (union-find over pairwise compatibility).</li>
+<li>Groups below <code>min_reads</code> depth are merged into the largest group.</li>
+</ol>
+<p>This correctly separates CAG-length variants from error-induced SNP bubbles: the error
+bubbles are single-node and below the structural span threshold, so they don’t influence
+the phasing.</p>
+<h2 id="snp-fallback"><a class="header" href="#snp-fallback">SNP fallback</a></h2>
+<p>If no structural bubble exists after the initial banded graph build, <code>consensus_multi</code>
+rebuilds the graph <strong>unbanded</strong> and tries again. The banded aligner with w ≈ 13 cannot
+handle a 90 bp diagonal drift (e.g. CAG×20 vs CAG×50 = 90 bp length difference); unbanded
+creates the correct Insert-arm bubble, enabling structural phasing to succeed.</p>
+<p>If the unbanded graph still has no structural bubble, the single strongest SNP bubble
+(the one with the most-balanced arm support) is used to partition reads.</p>
+<p>If there is no bubble at all, <code>consensus_multi</code> returns the single-allele consensus.</p>
+<h2 id="per-allele-consensus"><a class="header" href="#per-allele-consensus">Per-allele consensus</a></h2>
+<p>After partitioning, each group builds its own sub-graph with only that group’s reads and
+extracts an independent heaviest-path consensus. The sub-graph uses <code>min_cov</code> computed from
+the <strong>per-group</strong> read count, not the total. With 20 reads split 10/10, <code>min_cov</code> is based
+on 10, not 20.</p>
+<p><code>read_indices</code> in each returned <code>Consensus</code> records which original read indices contributed
+to that allele, allowing the caller to assign per-read metadata (TSV rows, brick-plot lanes,
+statistics) to the correct haplotype.</p>
+<h2 id="depth-requirements"><a class="header" href="#depth-requirements">Depth requirements</a></h2>
+<p>With <code>min_reads = 3</code> (the default), <code>consensus_multi</code> requires at least 3 reads <strong>per
+allele</strong>. If a group falls below this after phasing, it is merged into the largest group and
+the result is effectively single-allele.</p>
+<p>For reliable two-allele calls, a minimum per-allele depth of 5–10 is recommended. At
+depth 3, a single error read equals 33% frequency and can influence the minority-arm
+detection.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="adaptive-two-pass-mode"><a class="header" href="#adaptive-two-pass-mode">Adaptive Two-Pass Mode</a></h1>
+<p><code>consensus_adaptive</code> runs a first pass to build the graph and compute <code>GraphStats</code>, then
+inspects those stats to decide whether a second pass is needed and what form it should take.</p>
+<h2 id="decision-table"><a class="header" href="#decision-table">Decision table</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Condition (checked in order)</th><th>Action</th><th><code>AdaptiveAction</code></th></tr>
+</thead>
+<tbody>
+<tr><td>1–3 bubbles, minority arm ≥ <code>min_allele_freq × n</code></td><td>Multi-allele split on pass-1 graph</td><td><code>MultiAllele</code></td></tr>
+<tr><td>Consensus &lt; 60% of median read length (banded only)</td><td>Retry unbanded</td><td><code>TruncationRetry { recovered }</code></td></tr>
+<tr><td><code>single_support_fraction &gt; 0.30</code></td><td>Rebuild with <code>min_coverage_fraction</code> raised to ≥ 0.6</td><td><code>NoisyTighten</code></td></tr>
+<tr><td>Coverage CV &gt; 1.5 and mode is <code>Global</code></td><td>Rebuild with <code>SemiGlobal</code></td><td><code>SemiGlobalFallback</code></td></tr>
+<tr><td>Otherwise</td><td>Return pass-1 result</td><td><code>PassThrough</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Conditions are checked in order; the first that matches fires.</p>
+<h2 id="return-type"><a class="header" href="#return-type">Return type</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct AdaptiveResult {
+    pub consensuses: Vec&lt;Consensus&gt;,  // one or two elements
+    pub action:      AdaptiveAction,
+}
+<span class="boring">}</span></code></pre>
+<p>The <code>action</code> field records which branch fired. This is useful for logging filter reasons:
+a truncation that was detected and corrected (<code>TruncationRetry { recovered: true }</code>) should
+be reported differently from a clean pass. Inspect <code>action</code> rather than re-running
+<code>diagnose</code> after the fact.</p>
+<h2 id="truncation-detection"><a class="header" href="#truncation-detection">Truncation detection</a></h2>
+<p>Banded DP on pure-repetitive sequence can silently converge to a shorter-than-correct
+diagonal without the alignment ever approaching the band edge. The consensus is shorter than
+it should be but no error is returned. The truncation detector catches this by comparing:</p>
+<pre><code>consensus_len / median_input_read_len &lt; 0.60
+</code></pre>
+<p>If this fires and alignment was banded, a second graph is built with <code>band_width = 0</code>
+(unbanded) and the result replaces the pass-1 consensus. <code>recovered</code> in the action is <code>true</code>
+if the unbanded consensus clears the 0.60 threshold.</p>
+<p>This is the workaround for the RFC1 5-mer repeat bug: using <code>pad = 20</code> bp unique flanking
+context causes the banded-DP-truncated consensus to trigger the ratio check; the unbanded
+retry recovers ~106× AAAAG (vs truth ~115×, within tolerance).</p>
+<h2 id="multi-allele-detection"><a class="header" href="#multi-allele-detection">Multi-allele detection</a></h2>
+<p>The bubble-count guard (<code>1--3 bubbles</code>) prevents accidental multi-allele splits on noisy
+single-allele data. At ONT substitution rates (4–8%), substitution errors at the same
+position across multiple reads can create a bubble above the 25% threshold. The upper bound
+of 3 bubbles limits the split to plausible diploid structure; a graph with 15 bubbles is
+almost certainly a noisy single allele, not 16 haplotypes.</p>
+<p>For ONT data, raising <code>min_allele_freq</code> to 0.40 suppresses the most common false-positive
+multi-allele calls from error-rate-driven bubbles.</p>
+<h2 id="when-to-use-consensus_adaptive-vs-consensus_multi"><a class="header" href="#when-to-use-consensus_adaptive-vs-consensus_multi">When to use <code>consensus_adaptive</code> vs <code>consensus_multi</code></a></h2>
+<p>Use <code>consensus_adaptive</code> when you want the library to decide. Use <code>consensus_multi</code> directly
+when you have already determined from prior analysis (e.g. from read length bimodality) that
+the locus is heterozygous and you want the split unconditionally.</p>
+<p><code>consensus_adaptive</code> calls <code>consensus_multi</code> internally when it detects the right conditions,
+so the two paths produce the same phasing result for clear heterozygous cases.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
+<h2 id="add-to-your-project"><a class="header" href="#add-to-your-project">Add to your project</a></h2>
+<pre><code class="language-toml">[dependencies]
+poa-consensus = "0.1"
+</code></pre>
+<p>For visualisation support:</p>
+<pre><code class="language-toml">[dependencies]
+poa-consensus = { version = "0.1", features = ["plot"] }
+</code></pre>
+<h2 id="minimal-example"><a class="header" href="#minimal-example">Minimal example</a></h2>
+<pre class="playground"><code class="language-rust">use poa_consensus::{consensus, PoaConfig};
+
+fn main() -&gt; Result&lt;(), poa_consensus::PoaError&gt; {
+    let reads: Vec&lt;&amp;[u8]&gt; = vec![
+        b"CATCATCATCAT",
+        b"CATCATCATCAT",
+        b"CATCATCATCAT",
+        b"CATCATCATCAT",
+        b"CATCATCATCATCAT",  // one longer read
+    ];
+
+    let result = consensus(&amp;reads, 0, &amp;PoaConfig::default())?;
+    println!("{}", String::from_utf8_lossy(&amp;result.sequence));
+    println!("depth: {}", result.n_reads);
+    println!("bubbles: {}", result.graph_stats.bubble_count);
+    Ok(())
+}</code></pre>
+<h2 id="choosing-an-api"><a class="header" href="#choosing-an-api">Choosing an API</a></h2>
+<p>There are two API styles: <strong>functional</strong> (convenience wrappers) and <strong>stateful</strong> (direct
+graph access).</p>
+<h3 id="functional"><a class="header" href="#functional">Functional</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{consensus, consensus_multi, consensus_adaptive, PoaConfig};
+
+// Single-allele
+let c = consensus(&amp;reads, seed_idx, &amp;config)?;
+
+// Multi-allele (returns one Consensus per detected allele)
+let alleles = consensus_multi(&amp;reads, seed_idx, &amp;config)?;
+
+// Adaptive: decide multi vs single based on graph statistics
+let result = consensus_adaptive(&amp;reads, seed_idx, &amp;config)?;
+let alleles = result.consensuses;
+<span class="boring">}</span></code></pre>
+<h3 id="stateful"><a class="header" href="#stateful">Stateful</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{PoaGraph, PoaConfig};
+
+let mut graph = PoaGraph::new(reads[seed_idx], PoaConfig::default())?;
+for (i, read) in reads.iter().enumerate() {
+    if i == seed_idx { continue; }
+    graph.add_read(read)?;
+}
+
+// Inspect state mid-build
+let stats = graph.stats();
+println!("bubble count after {} reads: {}", graph.n_reads(), stats.bubble_count);
+
+// Extract consensus
+let consensus = graph.consensus()?;
+
+// Or multi-allele
+let alleles = graph.consensus_multi()?;
+<span class="boring">}</span></code></pre>
+<p>The stateful API is preferable for high-throughput pipelines: the graph object pre-allocates
+internal buffers and reuses them across calls, avoiding repeated heap allocation. It also
+allows inspecting <code>GraphStats</code> mid-build to decide whether to continue adding reads or bail
+early.</p>
+<h2 id="poaconfig-defaults"><a class="header" href="#poaconfig-defaults"><code>PoaConfig</code> defaults</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>PoaConfig {
+    band_width: 50,                         // minimum band; 0 = unbanded
+    adaptive_band: true,                    // abPOA formula: w = 10 + 0.01 * max(read_len, graph_nodes)
+    adaptive_band_b: 10,
+    adaptive_band_f: 0.01,
+    match_score: 1,
+    mismatch_score: -1,
+    gap_open: -2,
+    gap_extend: -1,
+    min_coverage_fraction: 0.5,             // strict majority
+    min_allele_freq: 0.25,
+    min_reads: 3,
+    alignment_mode: AlignmentMode::SemiGlobal,
+    consensus_mode: ConsensusMode::HeaviestPath,
+    warn_on_long_unbanded: true,
+}
+<span class="boring">}</span></code></pre>
+<p>The defaults are tuned for STR loci with HiFi or ONT reads. For ONT data specifically,
+raise <code>min_allele_freq</code> to 0.40 to reduce false-positive multi-allele calls caused by
+the higher substitution rate.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="single-allele-consensus"><a class="header" href="#single-allele-consensus">Single-Allele Consensus</a></h1>
+<h2 id="basic-usage"><a class="header" href="#basic-usage">Basic usage</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{consensus, select_seed, SeedSelection, PoaConfig};
+
+let reads: Vec&lt;&amp;[u8]&gt; = /* your reads */;
+
+// Let the library pick the seed automatically.
+let seed_idx = select_seed(&amp;reads, &amp;SeedSelection::Auto)?;
+let result   = consensus(&amp;reads, seed_idx, &amp;PoaConfig::default())?;
+
+println!("{}", String::from_utf8_lossy(&amp;result.sequence));
+println!("length: {} bp, depth: {}", result.sequence.len(), result.n_reads);
+<span class="boring">}</span></code></pre>
+<h2 id="alignment-mode"><a class="header" href="#alignment-mode">Alignment mode</a></h2>
+<p><code>AlignmentMode::SemiGlobal</code> is the default and should be used for extracted STR reads.</p>
+<p><strong>Why not Global?</strong> Global alignment has a subtle failure at homopolymer-flanked loci. If
+the seed has more leading identical bases than most reads (e.g. a 17-A seed when the majority
+have 15–16 A’s), shorter reads must place their deletions somewhere inside the homopolymer
+run. The aligner puts them at the end of the run rather than the start, because both
+positions are equally penalised. This leaves the extra 1–2 A-nodes at the boundary of the
+run on the only spine path, with no shortcut alternative for those reads. The boundary trim
+approaches from the left and stops as soon as the first node has adequate coverage – the
+extra nodes are unreachable by the trim. The result is a consensus 1–2 bases longer than
+the true majority length.</p>
+<p>Semi-global eliminates this: shorter reads take free terminal gaps and never traverse the
+extra nodes, giving them genuine low coverage that the boundary trim removes.</p>
+<h2 id="coverage-output"><a class="header" href="#coverage-output">Coverage output</a></h2>
+<p><code>result.coverage</code> is the per-position read depth along the consensus path:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let min_cov = result.coverage.iter().copied().min().unwrap_or(0);
+let mean_cov = result.coverage.iter().sum::&lt;u32&gt;() as f64 / result.coverage.len() as f64;
+println!("min coverage: {min_cov}, mean coverage: {mean_cov:.1}");
+<span class="boring">}</span></code></pre>
+<p>Coverage can drop below the mean at coverage gaps (see
+<a href="#bridged-consensus">Bridged Consensus</a>) and at boundaries where partial reads don’t reach.</p>
+<h2 id="length-variation"><a class="header" href="#length-variation">Length variation</a></h2>
+<p>The heaviest-path consensus picks the allele length supported by the majority of reads. With
+20 reads from a heterozygous locus (10 × CAG×20, 10 × CAG×30), the single-allele consensus
+will be whichever length happened to have the seed read – typically the seed length wins the
+boundary contest. Use <code>consensus_multi</code> for genuinely diploid loci.</p>
+<p>With length variation from <strong>errors</strong> (reads that are ±1 repeat unit due to error), the
+heaviest path naturally picks the plurality length because the <code>(weight - 1)</code> normalisation
+penalises single-read detours. A minority of reads with an extra or missing unit do not
+shift the consensus.</p>
+<h2 id="checking-result-quality"><a class="header" href="#checking-result-quality">Checking result quality</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{diagnose, DiagnoseConfig};
+
+let warnings = diagnose(&amp;result, &amp;DiagnoseConfig::default());
+if !warnings.is_clean() {
+    for (is_warning, msg) in warnings.messages("my_locus") {
+        eprintln!("{}: {msg}", if is_warning { "WARN" } else { "NOTE" });
+    }
+}
+
+// Structured access
+if let Some(trunc) = &amp;warnings.truncation_suspected {
+    eprintln!("truncation: consensus {}bp vs median read {}bp (ratio {:.2})",
+        trunc.consensus_len, trunc.median_read_len, trunc.ratio);
+}
+<span class="boring">}</span></code></pre>
+<p>See <a href="#diagnostics-and-warnings">Diagnostics and Warnings</a> for all available checks.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="multi-allele-consensus"><a class="header" href="#multi-allele-consensus">Multi-Allele Consensus</a></h1>
+<h2 id="basic-usage-1"><a class="header" href="#basic-usage-1">Basic usage</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{consensus_multi, select_seed, SeedSelection, PoaConfig};
+
+let reads: Vec&lt;&amp;[u8]&gt; = /* reads from a diploid STR locus */;
+let seed_idx = select_seed(&amp;reads, &amp;SeedSelection::Auto)?;
+let alleles  = consensus_multi(&amp;reads, seed_idx, &amp;PoaConfig::default())?;
+
+for (i, allele) in alleles.iter().enumerate() {
+    println!("allele {}: {} bp ({} reads)",
+        i, allele.sequence.len(), allele.n_reads);
+}
+<span class="boring">}</span></code></pre>
+<p><code>consensus_multi</code> returns one <code>Consensus</code> per detected allele. If no heterozygous bubble
+is found the result is a single-element <code>Vec</code> equivalent to <code>consensus</code>.</p>
+<h2 id="read-indices"><a class="header" href="#read-indices">Read indices</a></h2>
+<p>Each returned <code>Consensus</code> carries <code>read_indices: Vec&lt;usize&gt;</code> – the indices into the
+original <code>reads</code> slice that contributed to that allele. This allows you to assign per-read
+metadata to the correct haplotype without re-running alignment:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>for (allele_id, allele) in alleles.iter().enumerate() {
+    for &amp;read_idx in &amp;allele.read_indices {
+        println!("read {} → allele {}", read_idx, allele_id);
+    }
+}
+<span class="boring">}</span></code></pre>
+<p>For single-allele outputs (where <code>consensus_multi</code> found no bubble), <code>read_indices</code> is
+empty, meaning all reads contributed.</p>
+<h2 id="depth-requirements-1"><a class="header" href="#depth-requirements-1">Depth requirements</a></h2>
+<p><code>min_reads</code> (default 3) is enforced <strong>per allele</strong>. If the minority allele has fewer than
+<code>min_reads</code> reads after phasing it is merged into the dominant group, producing a
+single-allele result. For reliable diploid calls, plan for at least 5–10 reads per allele.</p>
+<h2 id="multi-allele-with-explicit-config"><a class="header" href="#multi-allele-with-explicit-config">Multi-allele with explicit config</a></h2>
+<p>For a diploid STR locus with known depth:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let mut cfg = PoaConfig::default();
+cfg.min_reads       = 5;    // require 5 reads per allele minimum
+cfg.min_allele_freq = 0.30; // ONT: raise from default 0.25 to suppress error-rate bubbles
+
+let alleles = consensus_multi(&amp;reads, seed_idx, &amp;cfg)?;
+<span class="boring">}</span></code></pre>
+<h2 id="checking-allele-fractions"><a class="header" href="#checking-allele-fractions">Checking allele fractions</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::analysis::allele_fractions;
+
+for allele in &amp;alleles {
+    for site in &amp;allele.bubble_sites {
+        let fracs = allele_fractions(site);
+        println!("bubble at {}: arms = {:?}", site.consensus_pos, fracs);
+    }
+}
+<span class="boring">}</span></code></pre>
+<h2 id="stateful-multi-allele"><a class="header" href="#stateful-multi-allele">Stateful multi-allele</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let mut graph = PoaGraph::new(reads[seed_idx], PoaConfig::default())?;
+for (i, read) in reads.iter().enumerate() {
+    if i == seed_idx { continue; }
+    graph.add_read(read)?;
+}
+
+// Inspect graph before splitting
+let stats = graph.stats();
+println!("structural bubbles: {}", stats.bubble_count);
+
+let alleles = graph.consensus_multi()?;
+<span class="boring">}</span></code></pre>
+<h2 id="when-two-alleles-become-one"><a class="header" href="#when-two-alleles-become-one">When two alleles become one</a></h2>
+<p><code>consensus_multi</code> falls back to a single consensus in three cases:</p>
+<ol>
+<li>No bubble above <code>min_allele_freq</code> after building the graph (truly homozygous locus or
+insufficient depth to see the second allele).</li>
+<li>Only one phasing group has <code>&gt;= min_reads</code> reads after partitioning.</li>
+<li>The graph is built with a narrow band that cannot represent a large Insert-arm bubble
+for the allele-length difference – in this case <code>consensus_multi</code> automatically rebuilds
+with unbanded alignment and tries again before falling back.</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="adaptive-mode"><a class="header" href="#adaptive-mode">Adaptive Mode</a></h1>
+<p><code>consensus_adaptive</code> is a two-pass wrapper that uses <code>GraphStats</code> from the first pass to
+decide automatically whether a second pass is needed and what form it should take.</p>
+<h2 id="basic-usage-2"><a class="header" href="#basic-usage-2">Basic usage</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{consensus_adaptive, select_seed, SeedSelection, PoaConfig};
+
+let reads: Vec&lt;&amp;[u8]&gt; = /* your reads */;
+let seed_idx = select_seed(&amp;reads, &amp;SeedSelection::Auto)?;
+let result   = consensus_adaptive(&amp;reads, seed_idx, &amp;PoaConfig::default())?;
+
+// result.action tells you what happened
+println!("action: {:?}", result.action);
+
+for (i, allele) in result.consensuses.iter().enumerate() {
+    println!("allele {}: {} bp", i, allele.sequence.len());
+}
+<span class="boring">}</span></code></pre>
+<h2 id="using-the-action-for-logging"><a class="header" href="#using-the-action-for-logging">Using the action for logging</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::AdaptiveAction;
+
+match &amp;result.action {
+    AdaptiveAction::PassThrough =&gt; {
+        // clean single-allele result, no second pass needed
+    }
+    AdaptiveAction::MultiAllele =&gt; {
+        println!("{} alleles detected", result.consensuses.len());
+    }
+    AdaptiveAction::TruncationRetry { recovered } =&gt; {
+        if *recovered {
+            println!("truncation detected and corrected by unbanded retry");
+        } else {
+            eprintln!("truncation detected; unbanded retry did not recover full length");
+        }
+    }
+    AdaptiveAction::NoisyTighten =&gt; {
+        println!("high noise: coverage threshold tightened");
+    }
+    AdaptiveAction::SemiGlobalFallback =&gt; {
+        println!("partial reads detected: switched to semi-global alignment");
+    }
+}
+<span class="boring">}</span></code></pre>
+<h2 id="when-to-use-adaptive-vs-direct-multi-allele"><a class="header" href="#when-to-use-adaptive-vs-direct-multi-allele">When to use adaptive vs direct multi-allele</a></h2>
+<p>Use <code>consensus_adaptive</code> when:</p>
+<ul>
+<li>You don’t know in advance whether the locus is homozygous or heterozygous</li>
+<li>You want truncation detection as a safety net for repetitive sequence</li>
+<li>You want a single call that handles all common failure modes</li>
+</ul>
+<p>Use <code>consensus_multi</code> directly when:</p>
+<ul>
+<li>You have already determined the locus is heterozygous (e.g. from bimodal read lengths)</li>
+<li>You want the phasing unconditionally without the bubble-count guard</li>
+</ul>
+<h2 id="tuning-for-ont-data"><a class="header" href="#tuning-for-ont-data">Tuning for ONT data</a></h2>
+<p>ONT substitution rates (4–8%) cause error-driven bubbles that can look like alleles:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let mut cfg = PoaConfig::default();
+cfg.min_allele_freq = 0.40;  // raise from 0.25 to suppress error-rate bubbles
+let result = consensus_adaptive(&amp;reads, seed_idx, &amp;cfg)?;
+<span class="boring">}</span></code></pre>
+<p>With <code>min_allele_freq = 0.40</code> and depth ≥ 10, at least 4 reads must support the minority
+arm before the multi-allele split fires. An error that affects 1/10 reads (10%) is below
+the threshold and treated as noise.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="seed-selection"><a class="header" href="#seed-selection">Seed Selection</a></h1>
+<p>The seed read initialises the graph as a linear chain. All other reads are aligned into
+this initial structure, so the seed choice affects alignment quality for every subsequent
+read.</p>
+<h2 id="automatic-selection-seedselectionauto"><a class="header" href="#automatic-selection-seedselectionauto">Automatic selection (<code>SeedSelection::Auto</code>)</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{select_seed, SeedSelection};
+
+let seed_idx = select_seed(&amp;reads, &amp;SeedSelection::Auto)?;
+<span class="boring">}</span></code></pre>
+<p>The automatic heuristic uses <strong>terminal k-mer anchors</strong>:</p>
+<ol>
+<li>Sample the first and last 50 bp of each read with 15-mers.</li>
+<li>A k-mer is a valid anchor only if it is end-specific: common at one end of the read set
+and rare at the other. This suppresses interior repeat k-mers that appear at all
+positions.</li>
+<li>Among reads with anchors at both ends (fully spanning), the shortest is chosen as the
+seed. A shorter seed means fewer initial nodes, which reduces the initial band width
+needed to align longer reads.</li>
+</ol>
+<p><strong>Fallback hierarchy:</strong></p>
+<ul>
+<li>Reads with anchors at both ends → shortest spanning read</li>
+<li>No spanning reads → longest read</li>
+<li>Reads split into two non-overlapping groups → <code>Err(PoaError::NoSpanningReads)</code></li>
+</ul>
+<p><code>NoSpanningReads</code> is a signal to use <code>bridged_consensus</code> instead (see
+<a href="#bridged-consensus">Bridged Consensus</a>).</p>
+<h2 id="explicit-seed"><a class="header" href="#explicit-seed">Explicit seed</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Use read index 3 as the seed.
+let result = consensus(&amp;reads, 3, &amp;PoaConfig::default())?;
+<span class="boring">}</span></code></pre>
+<p>Useful when you know which read is the most representative (e.g. the medoid from a
+pairwise distance matrix). Pass the index directly and skip <code>select_seed</code>.</p>
+<h2 id="shortest-seed"><a class="header" href="#shortest-seed">Shortest seed</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let seed_idx = select_seed(&amp;reads, &amp;SeedSelection::Shortest)?;
+<span class="boring">}</span></code></pre>
+<p>Always picks the shortest read regardless of k-mer spanning. Useful as a fast heuristic
+when all reads are known to be spanning (e.g. after flanking-anchor extraction).</p>
+<h2 id="advice-for-repetitive-loci"><a class="header" href="#advice-for-repetitive-loci">Advice for repetitive loci</a></h2>
+<p>For STR loci with many short repeat units, interior k-mers are non-specific by definition.
+The end-specific filter in <code>Auto</code> mode is essential here: without it, interior repeat k-mers
+would rank all reads as “spanning” regardless of whether they actually reach both boundaries.</p>
+<p>If <code>Auto</code> consistently returns <code>NoSpanningReads</code> for a locus where reads do overlap, it
+likely means the flanking sequence is itself repetitive and the end-specific filter is too
+aggressive. In that case, use <code>Shortest</code> or pass an explicit index.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="read-orientation"><a class="header" href="#read-orientation">Read Orientation</a></h1>
+<p>POA assumes all reads are on the same strand. Mixed-strand input produces a garbage graph
+silently. Orientation must be handled before calling <code>consensus</code>.</p>
+<h2 id="auto-orientation"><a class="header" href="#auto-orientation">Auto-orientation</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{auto_orient, consensus, SeedSelection, select_seed, PoaConfig};
+
+// reads: Vec&lt;Vec&lt;u8&gt;&gt; from your BAM/FASTQ parser
+let seed_idx = select_seed(
+    &amp;reads.iter().map(|r| r.as_slice()).collect::&lt;Vec&lt;_&gt;&gt;(),
+    &amp;SeedSelection::Auto,
+)?;
+
+let oriented = auto_orient(&amp;reads, seed_idx);
+// oriented: Vec&lt;Cow&lt;[u8]&gt;&gt;
+// borrowed if already correct strand, owned (reversed) if flipped
+
+let ref_slices: Vec&lt;&amp;[u8]&gt; = oriented.iter().map(|r| r.as_ref()).collect();
+let result = consensus(&amp;ref_slices, seed_idx, &amp;PoaConfig::default())?;
+<span class="boring">}</span></code></pre>
+<p><code>auto_orient</code> returns <code>Cow&lt;[u8]&gt;</code> for each read: a borrowed slice if the read is already on
+the correct strand, or an owned <code>Vec&lt;u8&gt;</code> (the reverse complement) if it was flipped. This
+avoids copying reads that don’t need it.</p>
+<h2 id="per-read-strand-detection"><a class="header" href="#per-read-strand-detection">Per-read strand detection</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{orient_to_seed, Strand};
+
+let strand = orient_to_seed(read, seed, 15);  // k = 15
+match strand {
+    Strand::Forward =&gt; { /* use read as-is */ }
+    Strand::Reverse =&gt; { /* use reverse_complement(read) */ }
+}
+<span class="boring">}</span></code></pre>
+<p><code>orient_to_seed</code> builds a 15-mer frequency set from the seed and counts hits in both
+orientations of the read. The orientation with more matches wins. Falls back to alignment
+score comparison for ambiguous cases (low k-mer match counts, highly repetitive sequence).</p>
+<h2 id="reverse-complement"><a class="header" href="#reverse-complement">Reverse complement</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::reverse_complement;
+
+let rc = reverse_complement(b"ACGTACGT");
+assert_eq!(rc, b"ACGTACGT");
+<span class="boring">}</span></code></pre>
+<h2 id="when-to-apply-orientation"><a class="header" href="#when-to-apply-orientation">When to apply orientation</a></h2>
+<p>Always orient reads before POA for reads extracted from a BAM that may contain both strands.
+If your upstream pipeline already guarantees strand (e.g. haplotagged BAM with HP tag), you
+can skip this step.</p>
+<p>For amplicon reads from a symmetric PCR product (where reads from both strands represent the
+same sequence), always orient. For strand-specific protocols, check whether your reads are
+guaranteed to be on the sense strand.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="flanking-anchor-preprocessing"><a class="header" href="#flanking-anchor-preprocessing">Flanking-Anchor Preprocessing</a></h1>
+<h2 id="the-problem"><a class="header" href="#the-problem">The problem</a></h2>
+<p>STR reads extracted from a BAM may enter the POA graph with different rotational phases.
+For a GAA repeat, a read starting at the first G, one starting at the first A, and one
+starting at the second A all represent the same underlying sequence but look different to the
+aligner. This creates spurious branches and unreliable consensus.</p>
+<p>The root cause is that nothing pins the read to a common anchor point before alignment.</p>
+<h2 id="the-fix-extract-the-repeat-segment"><a class="header" href="#the-fix-extract-the-repeat-segment">The fix: extract the repeat segment</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::extract_flanked_region;
+
+let left_flank  = b"TTTCTTTCTTTC";   // unique sequence left of the repeat
+let right_flank = b"GAAGAAGAAGAA";   // unique sequence right of the repeat
+
+for read in &amp;reads {
+    if let Some(segment) = extract_flanked_region(read, left_flank, right_flank) {
+        // segment is a &amp;[u8] slice into the original read;
+        // no allocation, zero-copy
+        graph.add_read(segment)?;
+    }
+    // reads where neither flank is found are silently skipped
+}
+<span class="boring">}</span></code></pre>
+<p><code>extract_flanked_region</code> aligns the left and right flanks to the read using approximate
+matching (allowing up to a few mismatches). The returned slice contains only the bases
+between the two flanks. This:</p>
+<ol>
+<li>Anchors both boundaries to the same reference points in all reads.</li>
+<li>Excludes non-spanning reads (if either flank is not found, the read is skipped).</li>
+<li>Eliminates rotational phase ambiguity because all reads start and end at the same
+flanking sequence.</li>
+</ol>
+<h2 id="design-rationale"><a class="header" href="#design-rationale">Design rationale</a></h2>
+<p>This approach is used by TRGT, LongTR, and HMMSTR. It is more robust than relying on the
+POA aligner to resolve phase by itself, because phase ambiguity is a problem at the
+preprocessing stage, not an alignment error the DP can correct.</p>
+<p>The flanking sequences must be:</p>
+<ul>
+<li>Unique enough to not appear inside the repeat (a 12-mer from unique flanking context is
+usually sufficient)</li>
+<li>Present in all reads that should be included (reads that only partially span the repeat are
+naturally excluded because one or both flanks won’t be found)</li>
+</ul>
+<h2 id="full-pipeline-example"><a class="header" href="#full-pipeline-example">Full pipeline example</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{
+    extract_flanked_region, auto_orient, select_seed, SeedSelection,
+    consensus, diagnose, DiagnoseConfig, PoaConfig,
+};
+
+// Step 1: orient all reads to the forward strand
+let oriented = auto_orient(&amp;raw_reads, 0);
+let oriented_slices: Vec&lt;&amp;[u8]&gt; = oriented.iter().map(|r| r.as_ref()).collect();
+
+// Step 2: extract the repeat segment from each read
+let left_flank  = b"TTTCTTTCTTTC";
+let right_flank = b"GAAGAAGAAGAA";
+let segments: Vec&lt;&amp;[u8]&gt; = oriented_slices.iter()
+    .filter_map(|r| extract_flanked_region(r, left_flank, right_flank))
+    .collect();
+
+// Step 3: select seed and build consensus
+let seed_idx = select_seed(&amp;segments, &amp;SeedSelection::Auto)?;
+let result   = consensus(&amp;segments, seed_idx, &amp;PoaConfig::default())?;
+
+// Step 4: check result quality
+let warnings = diagnose(&amp;result, &amp;DiagnoseConfig::default());
+<span class="boring">}</span></code></pre>
+<h2 id="when-not-to-use-this"><a class="header" href="#when-not-to-use-this">When not to use this</a></h2>
+<p>If you do not have reliable flanking sequences (e.g. the flanks are themselves repetitive,
+or you are processing reads without a reference), the core POA still works without this
+step. The rotational phase bugs (CLAUDE.md bugs #1 and #2) will be present in edge cases,
+but for most clean read sets the aligner resolves phase by the third or fourth read and the
+consensus is correct.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="diagnostics-and-warnings"><a class="header" href="#diagnostics-and-warnings">Diagnostics and Warnings</a></h1>
+<p><code>diagnose</code> runs four independent checks on a completed <code>Consensus</code> and returns a
+<code>ConsensusWarnings</code> struct with structured output.</p>
+<h2 id="basic-usage-3"><a class="header" href="#basic-usage-3">Basic usage</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{diagnose, DiagnoseConfig};
+
+let warnings = diagnose(&amp;result, &amp;DiagnoseConfig::default());
+
+// Single go/no-go check
+if warnings.is_clean() {
+    println!("consensus looks good");
+} else {
+    // Human-readable messages (label appears in the output text)
+    for (is_warning, msg) in warnings.messages("HTT") {
+        let level = if is_warning { "WARN" } else { "NOTE" };
+        eprintln!("{level}: {msg}");
+    }
+}
+<span class="boring">}</span></code></pre>
+<h2 id="the-four-checks"><a class="header" href="#the-four-checks">The four checks</a></h2>
+<h3 id="1-low-depth"><a class="header" href="#1-low-depth">1. Low depth</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>if let Some(w) = &amp;warnings.low_depth {
+    println!("depth {} below threshold {}", w.depth, w.threshold);
+}
+<span class="boring">}</span></code></pre>
+<p>Fires when <code>n_reads &lt; DiagnoseConfig::min_depth</code> (default 5). Low depth means the coverage
+threshold (<code>min_cov</code>) is set too conservatively for the data, and the consensus may reflect
+noise rather than the true sequence.</p>
+<h3 id="2-coverage-gaps"><a class="header" href="#2-coverage-gaps">2. Coverage gaps</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>if warnings.has_coverage_gaps {
+    for gap in &amp;result.gaps {
+        println!("gap at {:?}: {:?}", gap.start..gap.end, gap.kind);
+    }
+}
+<span class="boring">}</span></code></pre>
+<p>Fires when <code>result.gaps</code> is non-empty. A gap means reads did not fully span the region. The
+consensus sequence at the gap position is either seed-only (Spanning gap) or not present at
+all (Unknown gap from <code>bridged_consensus</code>). The gap region should not be used for unit
+counting or variant calling.</p>
+<h3 id="3-interior-low-support"><a class="header" href="#3-interior-low-support">3. Interior low support</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>if let Some(w) = &amp;warnings.interior_low_support {
+    println!("min interior weight fraction: {:.2}", w.min_fraction);
+}
+<span class="boring">}</span></code></pre>
+<p>Fires when the minimum <code>path_weights</code> fraction (weight / n_reads) in the <strong>middle 60%</strong> of
+the consensus is below <code>interior_support_threshold</code> (default 0.15). Very low path weight in
+the interior suggests the heaviest path is stitching across a coverage gap or picking a
+low-support route through a complex bubble structure.</p>
+<h3 id="4-truncation"><a class="header" href="#4-truncation">4. Truncation</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>if let Some(w) = &amp;warnings.truncation_suspected {
+    println!("ratio {:.2}: consensus {}bp vs median read {}bp",
+        w.ratio, w.consensus_len, w.median_read_len);
+}
+<span class="boring">}</span></code></pre>
+<p>Fires when <code>consensus_len / median_input_read_len &lt; truncation_ratio_threshold</code> (default
+0.60). A ratio below 0.60 indicates the consensus is substantially shorter than the reads
+that built it. The most common cause is banded DP converging to the wrong diagonal on a
+highly repetitive locus.</p>
+<p>When this fires in <code>consensus_adaptive</code>, an unbanded retry is attempted automatically. When
+it fires on a standalone <code>consensus</code> call, the caller should retry with <code>band_width = 0</code>.</p>
+<h2 id="diagnoseconfig"><a class="header" href="#diagnoseconfig"><code>DiagnoseConfig</code></a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct DiagnoseConfig {
+    pub min_depth: usize,                    // default 5
+    pub interior_support_threshold: f64,     // default 0.15
+    pub truncation_ratio_threshold: f64,     // default 0.60; set 0.0 to disable
+    pub structural_allele_freq: f64,         // default 0.25
+}
+<span class="boring">}</span></code></pre>
+<h2 id="analysis-helpers"><a class="header" href="#analysis-helpers">Analysis helpers</a></h2>
+<p>For more targeted analysis without the full <code>diagnose</code> call:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::analysis::{
+    min_coverage, low_coverage_regions, has_competing_allele,
+    should_call_multiallele, consensus_confidence,
+};
+
+// Minimum per-position coverage
+let floor = min_coverage(&amp;result);
+
+// Positions below half-depth
+let low = low_coverage_regions(&amp;result, result.n_reads as u32 / 2);
+
+// Is there a competing allele above 25%?
+if let Some(site) = has_competing_allele(&amp;result, 0.25) {
+    println!("bubble at pos {}: {:?}", site.consensus_pos, site.arm_read_counts);
+}
+
+// Quick boolean for pipeline branching
+if should_call_multiallele(&amp;result, 0.25) {
+    // re-run with consensus_multi
+}
+
+// Summary struct for logging
+let conf = consensus_confidence(&amp;result, 0.25);
+println!("min_cov={} mean_cov={:.1} competing_allele={}",
+    conf.min_cov, conf.mean_cov, conf.competing_allele);
+<span class="boring">}</span></code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="visualisation"><a class="header" href="#visualisation">Visualisation</a></h1>
+<p>The <code>plot</code> feature provides SVG helpers for inspecting graph structure and alignment
+behaviour. All functions return a <code>String</code> containing a self-contained SVG.</p>
+<h2 id="enabling-the-feature"><a class="header" href="#enabling-the-feature">Enabling the feature</a></h2>
+<pre><code class="language-toml">[dependencies]
+poa-consensus = { version = "0.1", features = ["plot"] }
+</code></pre>
+<h2 id="graph-network"><a class="header" href="#graph-network">Graph network</a></h2>
+<p>The network plot shows the POA graph topology: spine nodes laid out horizontally, arm
+(insert) nodes above or below their attachment points, labels inside nodes.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::plot::graph_network_svg;
+
+// Basic graph (spine highlighted in blue)
+let svg = graph_network_svg(&amp;graph, None);
+std::fs::write("/tmp/graph.svg", &amp;svg)?;
+
+// Overlay a specific read's alignment path (highlighted in orange)
+let probe = b"CATCATCAT";
+let svg   = graph_network_svg(&amp;graph, Some(probe));
+std::fs::write("/tmp/graph_overlay.svg", &amp;svg)?;
+<span class="boring">}</span></code></pre>
+<p>Edges between spine nodes and arm nodes are drawn as curves so they don’t obscure the
+spine. The overlay uses a distinct colour to show which nodes a specific read traverses,
+useful for debugging alignment of an outlier read.</p>
+<h2 id="coverage-plot"><a class="header" href="#coverage-plot">Coverage plot</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::plot::coverage_svg;
+
+let svg = coverage_svg(&amp;result);
+std::fs::write("/tmp/coverage.svg", &amp;svg)?;
+<span class="boring">}</span></code></pre>
+<p>Per-position read depth along the consensus sequence as a line chart. Coverage drops at
+gaps or partial-read boundaries are clearly visible.</p>
+<h2 id="graph-statistics"><a class="header" href="#graph-statistics">Graph statistics</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::plot::graph_stats_svg;
+
+let svg = graph_stats_svg(&amp;result.graph_stats);
+std::fs::write("/tmp/stats.svg", &amp;svg)?;
+<span class="boring">}</span></code></pre>
+<p>Two-panel bar chart: count statistics on the left (bubble count, node count, edge count),
+rate statistics on the right (single-support fraction, edge weight Gini).</p>
+<h2 id="edge-weight-histogram"><a class="header" href="#edge-weight-histogram">Edge weight histogram</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::plot::edge_weight_histogram_svg;
+
+let svg = edge_weight_histogram_svg(&amp;graph);
+<span class="boring">}</span></code></pre>
+<p>Distribution of edge weights across the full graph. A clean single-allele graph has a spike
+at the read depth (all spine edges) and a smaller spike at 1 (noise edges). A bimodal
+distribution at two different depths suggests two alleles.</p>
+<h2 id="node-coverage-histogram"><a class="header" href="#node-coverage-histogram">Node coverage histogram</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::plot::node_coverage_histogram_svg;
+
+let svg = node_coverage_histogram_svg(&amp;graph);
+<span class="boring">}</span></code></pre>
+<p>Distribution of per-node coverage. Similar interpretation to the edge weight histogram but
+counts Match ops rather than traversals.</p>
+<h2 id="alignment-density-heatmap"><a class="header" href="#alignment-density-heatmap">Alignment density heatmap</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::plot::alignment_density_svg;
+
+let svg = alignment_density_svg(&amp;graph);
+<span class="boring">}</span></code></pre>
+<p>2D histogram of (graph_rank, read_position) alignment density across all reads. The density
+should be concentrated along the main diagonal. Off-diagonal density indicates reads that
+align to the wrong part of the graph (band too narrow, phase shift, or genuine SV).</p>
+<h2 id="band-with-reads-overlay"><a class="header" href="#band-with-reads-overlay">Band with reads overlay</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::plot::band_with_reads_svg;
+
+let svg = band_with_reads_svg(&amp;graph);
+<span class="boring">}</span></code></pre>
+<p>Shows the DP band corridor for each read, with per-read alignment paths drawn on top.
+Out-of-band segments are shown in red with a connection line to the nearest in-band segment.
+Useful for diagnosing <code>BandTooNarrow</code> errors or band-width tuning.</p>
+<h2 id="running-the-example"><a class="header" href="#running-the-example">Running the example</a></h2>
+<pre><code>cargo run --example network_plot --features plot
+</code></pre>
+<p>Writes five SVG files to <code>/tmp/</code>:</p>
+<ul>
+<li><code>poa_network.svg</code> – two-allele SNV graph</li>
+<li><code>poa_network_with_read.svg</code> – same graph with allele-B read overlaid</li>
+<li><code>poa_network_noisy.svg</code> – single-allele graph with noise branches</li>
+<li><code>poa_network_deletion.svg</code> – graph showing a deletion in minority reads</li>
+<li><code>poa_network_deletion_overlay.svg</code> – deletion graph with the deleting read overlaid</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="bridged-consensus"><a class="header" href="#bridged-consensus">Bridged Consensus</a></h1>
+<p>When a repeat expansion is longer than any single read, no read spans the full locus.
+Reads cover the left side (up to the expansion) or the right side (from the expansion
+onward) but nothing bridges both ends. A single POA call cannot produce a reliable
+consensus because the graph has no shared nodes connecting the two sides.</p>
+<p><code>bridged_consensus</code> handles this by building two independent consensuses and joining them
+with a gap of unknown size.</p>
+<h2 id="usage"><a class="header" href="#usage">Usage</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{bridged_consensus, PoaConfig};
+
+// left_reads: reads that anchor to the left flank
+// right_reads: reads that anchor to the right flank
+let result = bridged_consensus(
+    left_reads,  left_seed_idx,
+    right_reads, right_seed_idx,
+    &amp;PoaConfig::default(),
+)?;
+
+// The gap is in result.gaps
+for gap in &amp;result.gaps {
+    println!("gap at {}-{}: {:?}", gap.start, gap.end, gap.kind);
+}
+<span class="boring">}</span></code></pre>
+<h2 id="output-format"><a class="header" href="#output-format">Output format</a></h2>
+<p>The returned <code>Consensus</code> contains:</p>
+<ul>
+<li><code>sequence</code>: left consensus bases concatenated with right consensus bases (no bases
+represent the gap itself)</li>
+<li><code>gaps</code>: a single <code>CoverageGap { start, end, kind: GapKind::Unknown }</code> where
+<code>start == end</code> (zero-length in the sequence, because the gap size is unknown)</li>
+<li><code>n_reads</code>: <code>left.n_reads + right.n_reads</code></li>
+</ul>
+<p>Typical rendering:</p>
+<pre><code>left_seq...(gap:unknown)...right_seq
+</code></pre>
+<h2 id="detecting-the-need-for-bridged-consensus"><a class="header" href="#detecting-the-need-for-bridged-consensus">Detecting the need for bridged consensus</a></h2>
+<p><code>SeedSelection::Auto</code> returns <code>Err(PoaError::NoSpanningReads { left_depth, right_depth })</code>
+when it detects that reads form two non-overlapping groups:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use poa_consensus::{select_seed, SeedSelection, PoaError};
+
+match select_seed(&amp;reads, &amp;SeedSelection::Auto) {
+    Ok(seed_idx) =&gt; {
+        // normal path
+    }
+    Err(PoaError::NoSpanningReads { left_depth, right_depth }) =&gt; {
+        // Split reads into left and right groups and call bridged_consensus
+        // left_depth and right_depth are the sizes of the two groups
+    }
+    Err(e) =&gt; return Err(e),
+}
+<span class="boring">}</span></code></pre>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<p>The gap size is completely unknown. The output indicates that the expansion is too large for
+any single read to span, but gives no size estimate. The caller should record the gap as an
+unresolved region rather than treating the joined sequence as contiguous.</p>
+<p>For long STR expansions (hundreds to thousands of repeat units), anchored assembly is
+probably more appropriate than consensus POA. <code>bridged_consensus</code> is a best-effort result
+for cases where the caller prefers a partial answer over no answer.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
+<h2 id="from-cratesio"><a class="header" href="#from-cratesio">From crates.io</a></h2>
+<pre><code>cargo install poa-consensus --features cli
+</code></pre>
+<p>This installs the <code>poa-consensus</code> binary to <code>~/.cargo/bin/</code>.</p>
+<h2 id="from-source"><a class="header" href="#from-source">From source</a></h2>
+<pre><code>git clone https://github.com/Psy-Fer/poa-consensus
+cd poa-consensus
+cargo install --path . --features cli
+</code></pre>
+<h2 id="checking-the-installation"><a class="header" href="#checking-the-installation">Checking the installation</a></h2>
+<pre><code>poa-consensus --version
+poa-consensus --help
+</code></pre>
+<h2 id="requirements"><a class="header" href="#requirements">Requirements</a></h2>
+<ul>
+<li>Rust 1.85 or later</li>
+<li>No system libraries required (pure Rust)</li>
+</ul>
+<p>Input files must be FASTA or FASTQ (uncompressed or gzip-compressed). The format is
+auto-detected from the first byte of the file.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="basic-usage-4"><a class="header" href="#basic-usage-4">Basic Usage</a></h1>
+<h2 id="input-and-output"><a class="header" href="#input-and-output">Input and output</a></h2>
+<pre><code>poa-consensus reads.fa
+poa-consensus reads.fq
+poa-consensus reads.fa.gz
+</code></pre>
+<p>Input is FASTA or FASTQ, auto-detected. Output is a single FASTA record on stdout:</p>
+<pre><code>&gt;consensus n_reads=20 seed=7 band_width=50
+CATCATCATCATCATCATCATCAT
+</code></pre>
+<p>The header carries <code>n_reads</code>, <code>seed</code> (the seed read index), and <code>band_width</code> (effective
+band width used for the final read).</p>
+<h2 id="flags"><a class="header" href="#flags">Flags</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--multi</code></td><td>off</td><td>Multi-allele mode; outputs one record per detected allele</td></tr>
+<tr><td><code>--band-width N</code></td><td>50</td><td>Minimum band width; 0 = unbanded</td></tr>
+<tr><td><code>--no-adaptive-band</code></td><td>off</td><td>Disable adaptive band (adaptive is on by default)</td></tr>
+<tr><td><code>--global</code></td><td>off</td><td>Use global alignment (semi-global is the default)</td></tr>
+<tr><td><code>--min-reads N</code></td><td>3</td><td>Minimum reads required; error if below this</td></tr>
+<tr><td><code>--seed N</code></td><td>auto</td><td>Explicit seed index (0-based); overrides automatic selection</td></tr>
+<tr><td><code>--quiet</code></td><td>off</td><td>Suppress warnings and notes; errors always printed</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="common-invocations"><a class="header" href="#common-invocations">Common invocations</a></h2>
+<pre><code># Single-allele consensus with defaults (adaptive band, semi-global, seed auto)
+poa-consensus reads.fa
+
+# Multi-allele (e.g. diploid STR locus)
+poa-consensus reads.fa --multi
+
+# Disable adaptive band (use fixed band-width 50 only)
+poa-consensus reads.fa --no-adaptive-band
+
+# Fully unbanded (for short reads or when memory is not a concern)
+poa-consensus reads.fa --band-width 0
+
+# Suppress all non-error output
+poa-consensus reads.fa --quiet
+
+# Pipe reads from bedpull or samtools
+samtools view -b bam_file region | samtools fasta | poa-consensus /dev/stdin
+</code></pre>
+<h2 id="warnings-and-notes"><a class="header" href="#warnings-and-notes">Warnings and notes</a></h2>
+<p>By default, the CLI prints warnings and notes to stderr. These do not affect the stdout
+FASTA output:</p>
+<pre><code>NOTE [consensus]: interior support low (min fraction 0.08)
+WARN [consensus]: truncation suspected (ratio 0.43; consensus 371bp vs median read 861bp)
+</code></pre>
+<p>Use <code>--quiet</code> to suppress all of these. Errors (e.g. insufficient depth, empty input) are
+always printed regardless of <code>--quiet</code>.</p>
+<h2 id="exit-codes"><a class="header" href="#exit-codes">Exit codes</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Code</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td>0</td><td>Success</td></tr>
+<tr><td>1</td><td>Error (empty input, insufficient depth, band too narrow after retries)</td></tr>
+</tbody>
+</table>
+</div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="str-analysis-workflow"><a class="header" href="#str-analysis-workflow">STR Analysis Workflow</a></h1>
+<p>This guide shows how to use <code>poa-consensus</code> as part of an end-to-end STR genotyping
+pipeline using <a href="https://github.com/Psy-Fer/bedpull"><code>bedpull</code></a> to extract reads from a BAM.</p>
+<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+<ul>
+<li><code>bedpull</code> – extracts reads overlapping a BED region from a BAM</li>
+<li><code>samtools</code> – for BAM handling</li>
+<li><code>poa-consensus</code> – installed with <code>--features cli</code></li>
+</ul>
+<h2 id="single-allele-locus"><a class="header" href="#single-allele-locus">Single-allele locus</a></h2>
+<pre><code class="language-bash"># Extract reads at the HTT CAG repeat (hg38 coordinates)
+bedpull -b reads.bam -r chr4:3074877-3074967 &gt; htt_reads.fa
+
+# Build consensus
+poa-consensus htt_reads.fa &gt; htt_consensus.fa
+
+# Count CAG units in the consensus
+python3 -c "
+import re, sys
+seq = ''.join(l.strip() for l in sys.stdin if not l.startswith('&gt;'))
+print(len(re.findall('CAG', seq)), 'CAG units')
+" &lt; htt_consensus.fa
+</code></pre>
+<h2 id="diploid-locus"><a class="header" href="#diploid-locus">Diploid locus</a></h2>
+<pre><code class="language-bash">bedpull -b reads.bam -r chr4:3074877-3074967 &gt; htt_reads.fa
+
+# Multi-allele mode outputs two FASTA records
+poa-consensus htt_reads.fa --multi &gt; htt_alleles.fa
+
+# Count units in each allele
+grep -v "^&gt;" htt_alleles.fa | while read seq; do
+    python3 -c "import re; print(len(re.findall('CAG', '$seq')), 'CAG')"
+done
+</code></pre>
+<h2 id="haplotagged-bam-hp-tag"><a class="header" href="#haplotagged-bam-hp-tag">Haplotagged BAM (HP tag)</a></h2>
+<p>For haplotagged BAMs, split reads by HP tag before POA:</p>
+<pre><code class="language-bash"># HP=1 reads
+samtools view -b reads.bam chr4:3074877-3074967 \
+    | samtools view -b -d HP:1 \
+    | samtools fasta \
+    | poa-consensus /dev/stdin &gt; htt_hap1.fa
+
+# HP=2 reads
+samtools view -b reads.bam chr4:3074877-3074967 \
+    | samtools view -b -d HP:2 \
+    | samtools fasta \
+    | poa-consensus /dev/stdin &gt; htt_hap2.fa
+</code></pre>
+<h2 id="long-repeat-expansions-rfc1-example"><a class="header" href="#long-repeat-expansions-rfc1-example">Long repeat expansions (RFC1 example)</a></h2>
+<p>For the RFC1 AAAAG repeat, banded DP can silently truncate. Use <code>pad=20</code> bp of unique
+flanking context and let the automatic truncation retry handle it:</p>
+<pre><code class="language-bash"># Extract with 20 bp of unique flanking (pad=20 in bedpull or equivalent)
+bedpull -b reads.bam -r chr4:39348425-39348479 --pad 20 &gt; rfc1_reads.fa
+
+# The CLI retries unbanded automatically if truncation is detected
+poa-consensus rfc1_reads.fa
+</code></pre>
+<p>The truncation detector fires when the consensus is less than 60% of the median read
+length, triggering an unbanded retry. The FASTA header will note the retry:</p>
+<pre><code>&gt;consensus n_reads=15 seed=3 band_width=0 [truncation_retry]
+</code></pre>
+<h2 id="checking-result-quality-1"><a class="header" href="#checking-result-quality-1">Checking result quality</a></h2>
+<pre><code class="language-bash"># View any warnings to stderr
+poa-consensus reads.fa 2&gt;warnings.txt
+
+# Check for specific warning types
+grep "truncation" warnings.txt
+grep "competing allele" warnings.txt
+grep "low depth" warnings.txt
+</code></pre>
+<h2 id="recommended-flags-per-data-type"><a class="header" href="#recommended-flags-per-data-type">Recommended flags per data type</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Data type</th><th>Recommended flags</th></tr>
+</thead>
+<tbody>
+<tr><td>HiFi single-allele STR</td><td>defaults (adaptive band, band-width 50, semi-global)</td></tr>
+<tr><td>HiFi diploid STR</td><td><code>--multi</code></td></tr>
+<tr><td>ONT single-allele STR</td><td>defaults</td></tr>
+<tr><td>ONT diploid STR</td><td><code>--multi</code> (consider raising <code>min_allele_freq</code> in library API)</td></tr>
+<tr><td>Very long reads (&gt;5 kb)</td><td><code>--band-width 0</code> (unbanded; check memory)</td></tr>
+<tr><td>Reads guaranteed spanning</td><td><code>--seed 0</code> or <code>--seed N</code> for explicit seed control</td></tr>
+</tbody>
+</table>
+</div>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>
