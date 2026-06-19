@@ -1784,9 +1784,10 @@ fn fn_consensus_multi_seed_out_of_bounds() {
 fn adaptive_clean_single_allele() {
     // No bubbles → single consensus, no pass 2.
     let reads: Vec<&[u8]> = vec![b"CATCATCAT"; 6];
-    let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].sequence, b"CATCATCAT");
+    let r = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(r.action, poa_consensus::AdaptiveAction::PassThrough);
+    assert_eq!(r.consensuses.len(), 1);
+    assert_eq!(r.consensuses[0].sequence, b"CATCATCAT");
 }
 
 #[test]
@@ -1795,33 +1796,35 @@ fn adaptive_snv_bubble_splits_alleles() {
     let a: &[u8] = b"CATCATCAT";
     let bv: &[u8] = b"CATCGTCAT";
     let reads: Vec<&[u8]> = vec![a, a, a, a, bv, bv, bv, bv];
-    let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
-    assert_eq!(results.len(), 2, "expected two alleles from SNV bubble");
-    let seqs: Vec<&[u8]> = results.iter().map(|c| c.sequence.as_slice()).collect();
+    let r = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(r.action, poa_consensus::AdaptiveAction::MultiAllele);
+    assert_eq!(r.consensuses.len(), 2, "expected two alleles from SNV bubble");
+    let seqs: Vec<&[u8]> = r.consensuses.iter().map(|c| c.sequence.as_slice()).collect();
     assert!(seqs.contains(&a), "allele_a not in results");
     assert!(seqs.contains(&bv), "allele_b not in results");
 }
 
 #[test]
 fn adaptive_noisy_tightens_coverage() {
-    // 4 correct reads + 4 reads each with a unique error → singleton fraction high.
+    // 5 correct reads + 7 reads each with a unique single-base error.
+    // 7 singleton nodes out of 22 total → single_support_fraction ≈ 0.32 > 0.30.
     // Adaptive mode should tighten coverage and return a single clean consensus.
     let correct: Vec<u8> = b("CATCATCATCATCAT");
-    let mut r1 = correct.clone();
-    r1[0] = b'G';
-    let mut r2 = correct.clone();
-    r2[3] = b'G';
-    let mut r3 = correct.clone();
-    r3[6] = b'G';
-    let mut r4 = correct.clone();
-    r4[9] = b'G';
-    let reads: Vec<&[u8]> = vec![&correct, &correct, &correct, &correct, &r1, &r2, &r3, &r4];
-    let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(
-        results[0].sequence, correct,
-        "noisy reads should be filtered"
-    );
+    let mut r1 = correct.clone(); r1[0]  = b'G';
+    let mut r2 = correct.clone(); r2[3]  = b'G';
+    let mut r3 = correct.clone(); r3[6]  = b'G';
+    let mut r4 = correct.clone(); r4[9]  = b'G';
+    let mut r5 = correct.clone(); r5[12] = b'G';
+    let mut r6 = correct.clone(); r6[1]  = b'G';
+    let mut r7 = correct.clone(); r7[4]  = b'G';
+    let reads: Vec<&[u8]> = vec![
+        &correct, &correct, &correct, &correct, &correct,
+        &r1, &r2, &r3, &r4, &r5, &r6, &r7,
+    ];
+    let r = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(r.action, poa_consensus::AdaptiveAction::NoisyTighten);
+    assert_eq!(r.consensuses.len(), 1);
+    assert_eq!(r.consensuses[0].sequence, correct, "noisy reads should be filtered");
 }
 
 #[test]
@@ -1838,9 +1841,56 @@ fn adaptive_partial_reads_switches_semi_global() {
         partial.as_slice(),
         partial.as_slice(),
     ];
-    // Just verify it completes without error and returns a single result.
-    let results = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
-    assert_eq!(results.len(), 1);
+    // Verify it completes without error and returns a single result.
+    // The exact action (TruncationRetry or SemiGlobalFallback) depends on which
+    // condition fires first given the default banded config; this is a smoke test.
+    let r = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
+    assert_eq!(r.consensuses.len(), 1);
+}
+
+#[test]
+fn adaptive_truncation_retry_action_struct() {
+    // TruncationRetry { recovered } carries the recovery outcome.
+    // We cannot reliably trigger the truncation path from synthetic reads (it
+    // requires banded DP to silently snap to the wrong diagonal on highly
+    // repetitive real data — see bug #4 in CLAUDE.md).  Instead, verify that
+    // the AdaptiveAction enum compiles and the recovered field is accessible.
+    let recovered_true  = poa_consensus::AdaptiveAction::TruncationRetry { recovered: true  };
+    let recovered_false = poa_consensus::AdaptiveAction::TruncationRetry { recovered: false };
+    assert_ne!(recovered_true, recovered_false);
+    assert!(matches!(recovered_true,  poa_consensus::AdaptiveAction::TruncationRetry { recovered: true  }));
+    assert!(matches!(recovered_false, poa_consensus::AdaptiveAction::TruncationRetry { recovered: false }));
+}
+
+#[test]
+fn consensus_multi_read_indices_populated() {
+    // Two clear alleles; each Consensus returned by consensus_multi should carry
+    // the indices of the reads that built it, covering all input indices together.
+    let a: &[u8] = b"GCTAGCTAGCTACTAGCTAGCT"; // allele A
+    let bv: &[u8] = b"GCTAGCTAGCTGCTAGCTAGCT"; // allele B (SNP at pos 11)
+    // 5 A reads at indices 0-4, 5 B reads at indices 5-9.
+    let reads: Vec<&[u8]> = vec![a, a, a, a, a, bv, bv, bv, bv, bv];
+    let alleles = poa_consensus::consensus_multi(&reads, 0, &poa_consensus::PoaConfig::default())
+        .unwrap();
+    assert_eq!(alleles.len(), 2, "expected two alleles");
+    // All 10 indices must be covered exactly once across both alleles.
+    let mut all_indices: Vec<usize> = alleles.iter()
+        .flat_map(|c| c.read_indices.iter().copied())
+        .collect();
+    all_indices.sort_unstable();
+    assert_eq!(all_indices, (0..10).collect::<Vec<_>>(), "all read indices must be covered");
+    // Each allele's indices should be self-consistent: neither set should be empty.
+    for allele in &alleles {
+        assert!(!allele.read_indices.is_empty(), "each allele must have read indices");
+    }
+}
+
+#[test]
+fn consensus_single_allele_read_indices_empty() {
+    // Single-allele path must leave read_indices empty ("all reads contributed").
+    let reads: Vec<&[u8]> = vec![b"CATCATCAT"; 6];
+    let c = poa_consensus::consensus(&reads, 0, &poa_consensus::PoaConfig::default()).unwrap();
+    assert!(c.read_indices.is_empty(), "single-allele consensus should have empty read_indices");
 }
 
 #[test]

@@ -191,6 +191,61 @@ pub struct Consensus {
     /// consensus.  Inspect `arm_read_counts` and `arm_sequences` to decide
     /// whether to re-run with [`PoaGraph::consensus_multi`].
     pub bubble_sites: Vec<BubbleSite>,
+    /// Indices (into the original `reads` slice) of the reads that contributed
+    /// to this consensus.  Populated by [`PoaGraph::consensus_multi`] and the
+    /// [`consensus_multi`] free function; **empty for single-allele outputs**
+    /// ([`PoaGraph::consensus`], [`consensus`]).
+    ///
+    /// An empty `Vec` means "all reads contributed" — no phasing was performed.
+    /// A non-empty `Vec` identifies exactly which reads belong to this allele,
+    /// enabling the caller to assign per-read rows, pull reads for visualisation,
+    /// or compute per-allele statistics without re-running alignment.
+    pub read_indices: Vec<usize>,
+}
+
+/// The action taken by [`consensus_adaptive`] on its second pass.
+///
+/// Returned inside [`AdaptiveResult`] so callers can distinguish a clean
+/// pass-through from a corrected result without re-running [`diagnose`].
+///
+/// [`consensus_adaptive`]: crate::consensus_adaptive
+/// [`diagnose`]: crate::diagnose
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdaptiveAction {
+    /// Pass-1 result was returned unchanged; no second pass was needed.
+    PassThrough,
+    /// Competing bubble(s) above `min_allele_freq` triggered multi-allele
+    /// partitioning.  The `consensuses` vec has one element per detected allele.
+    MultiAllele,
+    /// Pass-1 consensus was below the truncation-ratio threshold; alignment was
+    /// retried with unbanded DP (`band_width = 0`).
+    TruncationRetry {
+        /// `true` if the unbanded retry produced a consensus at or above the
+        /// truncation threshold.  `false` means the output is still short:
+        /// the sequence may be genuinely short or the locus may need manual
+        /// review.
+        recovered: bool,
+    },
+    /// High singleton-support fraction triggered a tighter coverage floor; the
+    /// graph was rebuilt with `min_coverage_fraction` raised to ≥ 0.6.
+    NoisyTighten,
+    /// High coverage coefficient of variation in `Global` mode triggered a
+    /// rebuild with [`AlignmentMode::SemiGlobal`].
+    ///
+    /// [`AlignmentMode::SemiGlobal`]: crate::AlignmentMode
+    SemiGlobalFallback,
+}
+
+/// Return value of [`consensus_adaptive`].
+///
+/// [`consensus_adaptive`]: crate::consensus_adaptive
+#[derive(Debug, Clone)]
+pub struct AdaptiveResult {
+    /// Assembled consensus sequences.  One element for single-allele outcomes;
+    /// two or more for multi-allele.
+    pub consensuses: Vec<Consensus>,
+    /// Which second-pass action (if any) was taken.
+    pub action: AdaptiveAction,
 }
 
 impl Consensus {

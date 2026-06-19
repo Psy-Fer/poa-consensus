@@ -361,8 +361,8 @@ pub use graph::{AlignOp, PoaGraph};
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
 pub use seed::{SeedSelection, select_seed};
 pub use types::{
-    BubbleSite, Consensus, CoverageGap, GapKind, GraphEdgeInfo, GraphNodeInfo, GraphStats,
-    GraphTopology, Strand,
+    AdaptiveAction, AdaptiveResult, BubbleSite, Consensus, CoverageGap, GapKind, GraphEdgeInfo,
+    GraphNodeInfo, GraphStats, GraphTopology, Strand,
 };
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -447,7 +447,7 @@ pub fn consensus_adaptive(
     reads: &[&[u8]],
     seed_idx: usize,
     config: &PoaConfig,
-) -> Result<Vec<Consensus>, PoaError> {
+) -> Result<AdaptiveResult, PoaError> {
     validate(reads, seed_idx)?;
 
     // ── Pass 1 ───────────────────────────────────────────────────────────────
@@ -464,7 +464,10 @@ pub fn consensus_adaptive(
         && stats.bubble_count <= 3
         && stats.max_bubble_depth >= allele_threshold
     {
-        return graph.consensus_multi();
+        return Ok(AdaptiveResult {
+            consensuses: graph.consensus_multi()?,
+            action: AdaptiveAction::MultiAllele,
+        });
     }
 
     // Compute pass-1 consensus; used for truncation check and as the fallthrough
@@ -483,7 +486,12 @@ pub fn consensus_adaptive(
             let mut cfg2 = config.clone();
             cfg2.band_width = 0;
             cfg2.adaptive_band = false;
-            return Ok(vec![build_graph(reads, seed_idx, cfg2)?.consensus()?]);
+            let c2 = build_graph(reads, seed_idx, cfg2)?.consensus()?;
+            let recovered = (c2.sequence.len() as f64) >= 0.6 * median_len as f64;
+            return Ok(AdaptiveResult {
+                consensuses: vec![c2],
+                action: AdaptiveAction::TruncationRetry { recovered },
+            });
         }
     }
 
@@ -492,7 +500,10 @@ pub fn consensus_adaptive(
     if stats.single_support_fraction > 0.3 {
         let mut cfg2 = config.clone();
         cfg2.min_coverage_fraction = cfg2.min_coverage_fraction.max(0.6);
-        return Ok(vec![build_graph(reads, seed_idx, cfg2)?.consensus()?]);
+        return Ok(AdaptiveResult {
+            consensuses: vec![build_graph(reads, seed_idx, cfg2)?.consensus()?],
+            action: AdaptiveAction::NoisyTighten,
+        });
     }
 
     // Uneven boundary coverage (high CV) suggests partial reads in global mode.
@@ -505,11 +516,17 @@ pub fn consensus_adaptive(
     if cv > 1.5 && config.alignment_mode == AlignmentMode::Global {
         let mut cfg2 = config.clone();
         cfg2.alignment_mode = AlignmentMode::SemiGlobal;
-        return Ok(vec![build_graph(reads, seed_idx, cfg2)?.consensus()?]);
+        return Ok(AdaptiveResult {
+            consensuses: vec![build_graph(reads, seed_idx, cfg2)?.consensus()?],
+            action: AdaptiveAction::SemiGlobalFallback,
+        });
     }
 
     // No second pass needed.
-    Ok(vec![c1])
+    Ok(AdaptiveResult {
+        consensuses: vec![c1],
+        action: AdaptiveAction::PassThrough,
+    })
 }
 
 /// Build a consensus from two non-overlapping read groups with a gap of
@@ -587,5 +604,6 @@ pub fn bridged_consensus(
         graph_stats: left.graph_stats,
         gaps,
         bubble_sites: vec![],
+        read_indices: vec![],
     })
 }

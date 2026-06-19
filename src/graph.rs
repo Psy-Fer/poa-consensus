@@ -2322,6 +2322,7 @@ impl PoaGraph {
                 graph_stats,
                 gaps: vec![],
                 bubble_sites: vec![],
+                read_indices: vec![],
             });
         }
 
@@ -2386,6 +2387,7 @@ impl PoaGraph {
             graph_stats,
             gaps,
             bubble_sites,
+            read_indices: vec![],
         })
     }
 
@@ -2654,7 +2656,9 @@ impl PoaGraph {
                 }
                 sub.add_read(&self.reads[read_idx])?;
             }
-            results.push(sub.consensus()?);
+            let mut c = sub.consensus()?;
+            c.read_indices = group.to_vec();
+            results.push(c);
         }
 
         Ok(results)

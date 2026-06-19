@@ -849,6 +849,7 @@ mod tests {
             graph_stats: GraphStats::default(),
             gaps: vec![],
             bubble_sites,
+            read_indices: vec![],
         }
     }
 
@@ -1146,6 +1147,7 @@ mod tests {
             graph_stats: gs,
             gaps: vec![],
             bubble_sites: vec![],
+            read_indices: vec![],
         }
     }
 
