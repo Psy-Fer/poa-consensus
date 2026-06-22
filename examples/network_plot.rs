@@ -43,9 +43,8 @@ fn main() {
     // Spine edges carry weight 10; the arm's entry/exit edges carry weight 1.
     // Edge labels make the heaviest path obvious: follow weight 10, not weight 1.
     let hp_reads: &[&[u8]] = &[
-        b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT",
-        b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT",
-        b"CATGAT", // mismatch at pos 3: A→G
+        b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT",
+        b"CATCAT", b"CATGAT", // mismatch at pos 3: A→G
     ];
     let mut g_hp = PoaGraph::new(hp_reads[0], PoaConfig::default()).unwrap();
     for r in &hp_reads[1..] {
@@ -63,8 +62,7 @@ fn main() {
     // min_cov = ceil(10 * 0.5) = 5 and are trimmed; interior nodes survive.
     let full_span: &[&[u8]] = &[b"GGGCATCATGGG", b"GGGCATCATGGG", b"GGGCATCATGGG"];
     let partial: &[&[u8]] = &[
-        b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT",
-        b"CATCAT", b"CATCAT", b"CATCAT",
+        b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT", b"CATCAT",
     ];
     let mut all_reads: Vec<&[u8]> = full_span.to_vec();
     all_reads.extend_from_slice(partial);
@@ -93,16 +91,28 @@ fn main() {
     }
 
     let cag4: &[&[u8]] = &[
-        b"CAGCAGCAGCAG", b"CAGCAGCAGCAG", b"CAGCAGCAGCAG",
-        b"CAGCAGCAGCAG", b"CAGCAGCAGCAG", b"CAGCAGCAGCAG",
-        b"CAGCAGCAGCAG", b"CAGCAGCAGCAG", b"CAGCAGCAGCAG", b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
+        b"CAGCAGCAGCAG",
     ];
     let cag7: &[&[u8]] = &[
-        b"CAGCAGCAGCAGCAGCAGCAG", b"CAGCAGCAGCAGCAGCAGCAG",
-        b"CAGCAGCAGCAGCAGCAGCAG", b"CAGCAGCAGCAGCAGCAGCAG",
-        b"CAGCAGCAGCAGCAGCAGCAG", b"CAGCAGCAGCAGCAGCAGCAG",
-        b"CAGCAGCAGCAGCAGCAGCAG", b"CAGCAGCAGCAGCAGCAGCAG",
-        b"CAGCAGCAGCAGCAGCAGCAG", b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
+        b"CAGCAGCAGCAGCAGCAGCAG",
     ];
     let svg_cag_normal = graph_network_svg(&build_single_allele(cag4), None);
     write("/tmp/poa_cag_normal.svg", &svg_cag_normal);
@@ -120,16 +130,28 @@ fn main() {
     //   Normal:     (GAA)×4 = 12 bp
     //   Pathogenic: (GAA)×8 = 24 bp   (disease range: >66 units; scaled for clarity)
     let gaa4: &[&[u8]] = &[
-        b"GAAGAAGAAGAA", b"GAAGAAGAAGAA", b"GAAGAAGAAGAA",
-        b"GAAGAAGAAGAA", b"GAAGAAGAAGAA", b"GAAGAAGAAGAA",
-        b"GAAGAAGAAGAA", b"GAAGAAGAAGAA", b"GAAGAAGAAGAA", b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
+        b"GAAGAAGAAGAA",
     ];
     let gaa8: &[&[u8]] = &[
-        b"GAAGAAGAAGAAGAAGAAGAAGAA", b"GAAGAAGAAGAAGAAGAAGAAGAA",
-        b"GAAGAAGAAGAAGAAGAAGAAGAA", b"GAAGAAGAAGAAGAAGAAGAAGAA",
-        b"GAAGAAGAAGAAGAAGAAGAAGAA", b"GAAGAAGAAGAAGAAGAAGAAGAA",
-        b"GAAGAAGAAGAAGAAGAAGAAGAA", b"GAAGAAGAAGAAGAAGAAGAAGAA",
-        b"GAAGAAGAAGAAGAAGAAGAAGAA", b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
+        b"GAAGAAGAAGAAGAAGAAGAAGAA",
     ];
     let svg_gaa_normal = graph_network_svg(&build_single_allele(gaa4), None);
     write("/tmp/poa_gaa_normal.svg", &svg_gaa_normal);
@@ -190,16 +212,29 @@ fn main() {
     // the reference stays on the spine and the insertion arm stays grey.
     // min_cov = ceil(20 * 0.5) = 10; arm coverage 5 < 10 (below threshold).
     let ref_reads: &[&[u8]] = &[
-        b"ACGTACGTACGT", b"ACGTACGTACGT", b"ACGTACGTACGT",
-        b"ACGTACGTACGT", b"ACGTACGTACGT", b"ACGTACGTACGT",
-        b"ACGTACGTACGT", b"ACGTACGTACGT", b"ACGTACGTACGT",
-        b"ACGTACGTACGT", b"ACGTACGTACGT", b"ACGTACGTACGT",
-        b"ACGTACGTACGT", b"ACGTACGTACGT", b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
+        b"ACGTACGTACGT",
     ];
     // 2-base GG insertion between T(3) and A(4): ACGT | GG | ACGT ACGT
     let ins_reads: &[&[u8]] = &[
-        b"ACGTGGACGTACGT", b"ACGTGGACGTACGT", b"ACGTGGACGTACGT",
-        b"ACGTGGACGTACGT", b"ACGTGGACGTACGT",
+        b"ACGTGGACGTACGT",
+        b"ACGTGGACGTACGT",
+        b"ACGTGGACGTACGT",
+        b"ACGTGGACGTACGT",
+        b"ACGTGGACGTACGT",
     ];
     let mut all_bubble: Vec<&[u8]> = ref_reads.to_vec();
     all_bubble.extend_from_slice(ins_reads);
@@ -222,16 +257,16 @@ fn main() {
     //   Error 3: A inserted after A(7)   -> 1-node arm at position 7-8
     //   Error 4: CC inserted after A(11) -> 2-node arm at position 11-12
     let noisy: &[&[u8]] = &[
-        b"GCTAGCTAGCTAGCTA",  // clean ×6
+        b"GCTAGCTAGCTAGCTA", // clean ×6
         b"GCTAGCTAGCTAGCTA",
         b"GCTAGCTAGCTAGCTA",
         b"GCTAGCTAGCTAGCTA",
         b"GCTAGCTAGCTAGCTA",
         b"GCTAGCTAGCTAGCTA",
-        b"GCTTAGCTAGCTAGCTA",   // T inserted after C(1)
-        b"GCTAGGCTAGCTAGCTA",   // G inserted after G(4)
-        b"GCTAGCTAAGCTAGCTA",   // A inserted after A(7)
-        b"GCTAGCTAGCTACCGCTA",  // CC inserted after A(11) -> 2-node arm
+        b"GCTTAGCTAGCTAGCTA",  // T inserted after C(1)
+        b"GCTAGGCTAGCTAGCTA",  // G inserted after G(4)
+        b"GCTAGCTAAGCTAGCTA",  // A inserted after A(7)
+        b"GCTAGCTAGCTACCGCTA", // CC inserted after A(11) -> 2-node arm
     ];
     let mut g_noisy = PoaGraph::new(noisy[0], PoaConfig::default()).unwrap();
     for r in &noisy[1..] {
@@ -316,5 +351,8 @@ fn main() {
 
     let svg_del_ov = graph_network_svg(&g_del, Some(b"GCTAGCTAGCTAGCT"));
     write("/tmp/poa_network_deletion_overlay.svg", &svg_del_ov);
-    write("docs/src/diagrams/poa_network_deletion_overlay.svg", &svg_del_ov);
+    write(
+        "docs/src/diagrams/poa_network_deletion_overlay.svg",
+        &svg_del_ov,
+    );
 }

@@ -867,9 +867,11 @@ fn inject_arm_labels(mut svg: String, arm_labels: &[(f64, bool, String)]) -> Str
         if !chunk.contains("fill=\"#aaaaaa\"") {
             continue;
         }
-        if let (Some(cx), Some(cy), Some(r)) =
-            (svg_attr_f64(chunk, "cx=\""), svg_attr_f64(chunk, "cy=\""), svg_attr_f64(chunk, "r=\""))
-        {
+        if let (Some(cx), Some(cy), Some(r)) = (
+            svg_attr_f64(chunk, "cx=\""),
+            svg_attr_f64(chunk, "cy=\""),
+            svg_attr_f64(chunk, "r=\""),
+        ) {
             if r > 15.0 {
                 circles.push((cx, cy, r));
             }
