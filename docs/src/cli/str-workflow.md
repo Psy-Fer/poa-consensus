@@ -5,9 +5,9 @@ pipeline using [`bedpull`](https://github.com/Psy-Fer/bedpull) to extract reads 
 
 ## Prerequisites
 
-- `bedpull` -- extracts reads overlapping a BED region from a BAM
-- `samtools` -- for BAM handling
-- `poa-consensus` -- installed with `--features cli`
+- `bedpull`: extracts reads overlapping a BED region from a BAM
+- `samtools`: for BAM handling
+- `poa-consensus`: installed with `--features cli`
 
 ## Single-allele locus
 

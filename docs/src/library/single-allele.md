@@ -21,12 +21,12 @@ println!("length: {} bp, depth: {}", result.sequence.len(), result.n_reads);
 
 **Why not Global?** Global alignment has a subtle failure at homopolymer-flanked loci. If
 the seed has more leading identical bases than most reads (e.g. a 17-A seed when the majority
-have 15--16 A's), shorter reads must place their deletions somewhere inside the homopolymer
+have 15-16 A's), shorter reads must place their deletions somewhere inside the homopolymer
 run. The aligner puts them at the end of the run rather than the start, because both
-positions are equally penalised. This leaves the extra 1--2 A-nodes at the boundary of the
+positions are equally penalised. This leaves the extra 1-2 A-nodes at the boundary of the
 run on the only spine path, with no shortcut alternative for those reads. The boundary trim
-approaches from the left and stops as soon as the first node has adequate coverage -- the
-extra nodes are unreachable by the trim. The result is a consensus 1--2 bases longer than
+approaches from the left and stops as soon as the first node has adequate coverage; the
+extra nodes are unreachable by the trim. The result is a consensus 1-2 bases longer than
 the true majority length.
 
 Semi-global eliminates this: shorter reads take free terminal gaps and never traverse the
@@ -49,7 +49,7 @@ Coverage can drop below the mean at coverage gaps (see
 
 The heaviest-path consensus picks the allele length supported by the majority of reads. With
 20 reads from a heterozygous locus (10 × CAG×20, 10 × CAG×30), the single-allele consensus
-will be whichever length happened to have the seed read -- typically the seed length wins the
+will be whichever length happened to have the seed read. Typically the seed length wins the
 boundary contest. Use `consensus_multi` for genuinely diploid loci.
 
 With length variation from **errors** (reads that are ±1 repeat unit due to error), the

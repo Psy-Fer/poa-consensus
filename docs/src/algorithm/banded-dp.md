@@ -3,7 +3,7 @@
 ## Why banding
 
 The full affine-gap DP over a graph with V nodes and a read of length L requires O(V × L)
-cells. For a 150 bp read against a 160-node graph that is ~24,000 cells -- trivial. For a
+cells. For a 150 bp read against a 160-node graph that is ~24,000 cells: trivial. For a
 20 kb read against a 21,000-node graph it is ~400 million cells, requiring ~9.6 GB for three
 i32 matrices. Banding limits the DP to a corridor of width 2w + 1 around a predicted
 diagonal, reducing memory and work to O(w × L).
@@ -42,7 +42,7 @@ reads) would be too narrow for even a single wrong diagonal.
 ## Tracking band
 
 The band is not centred on the fixed diagonal (read_pos = graph_rank). Instead it tracks
-`best_j` -- the read position of the highest-scoring cell in the previous row. This
+`best_j` (the read position of the highest-scoring cell in the previous row). This
 self-corrects for:
 
 - Phase shifts (reads with a different number of leading repeat units than the seed)

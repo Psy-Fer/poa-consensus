@@ -20,8 +20,8 @@ is found the result is a single-element `Vec` equivalent to `consensus`.
 
 ## Read indices
 
-Each returned `Consensus` carries `read_indices: Vec<usize>` -- the indices into the
-original `reads` slice that contributed to that allele. This allows you to assign per-read
+Each returned `Consensus` carries `read_indices: Vec<usize>`, which holds the indices into
+the original `reads` slice that contributed to that allele. This allows you to assign per-read
 metadata to the correct haplotype without re-running alignment:
 
 ```rust
@@ -39,7 +39,7 @@ empty, meaning all reads contributed.
 
 `min_reads` (default 3) is enforced **per allele**. If the minority allele has fewer than
 `min_reads` reads after phasing it is merged into the dominant group, producing a
-single-allele result. For reliable diploid calls, plan for at least 5--10 reads per allele.
+single-allele result. For reliable diploid calls, plan for at least 5-10 reads per allele.
 
 ## Multi-allele with explicit config
 
@@ -90,5 +90,5 @@ let alleles = graph.consensus_multi()?;
    insufficient depth to see the second allele).
 2. Only one phasing group has `>= min_reads` reads after partitioning.
 3. The graph is built with a narrow band that cannot represent a large Insert-arm bubble
-   for the allele-length difference -- in this case `consensus_multi` automatically rebuilds
+   for the allele-length difference. In this case `consensus_multi` automatically rebuilds
    with unbanded alignment and tries again before falling back.

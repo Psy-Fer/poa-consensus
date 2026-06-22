@@ -7,7 +7,7 @@ inspects those stats to decide whether a second pass is needed and what form it 
 
 | Condition (checked in order) | Action | `AdaptiveAction` |
 |---|---|---|
-| 1--3 bubbles, minority arm ≥ `min_allele_freq × n` | Multi-allele split on pass-1 graph | `MultiAllele` |
+| 1-3 bubbles, minority arm ≥ `min_allele_freq × n` | Multi-allele split on pass-1 graph | `MultiAllele` |
 | Consensus < 60% of median read length (banded only) | Retry unbanded | `TruncationRetry { recovered }` |
 | `single_support_fraction > 0.30` | Rebuild with `min_coverage_fraction` raised to ≥ 0.6 | `NoisyTighten` |
 | Coverage CV > 1.5 and mode is `Global` | Rebuild with `SemiGlobal` | `SemiGlobalFallback` |
@@ -49,8 +49,8 @@ retry recovers ~106× AAAAG (vs truth ~115×, within tolerance).
 
 ## Multi-allele detection
 
-The bubble-count guard (`1--3 bubbles`) prevents accidental multi-allele splits on noisy
-single-allele data. At ONT substitution rates (4--8%), substitution errors at the same
+The bubble-count guard (`1-3 bubbles`) prevents accidental multi-allele splits on noisy
+single-allele data. At ONT substitution rates (4-8%), substitution errors at the same
 position across multiple reads can create a bubble above the 25% threshold. The upper bound
 of 3 bubbles limits the split to plausible diploid structure; a graph with 15 bubbles is
 almost certainly a noisy single allele, not 16 haplotypes.

@@ -2,12 +2,29 @@
 
 The algorithm runs in three stages for each read set:
 
-1. **Seed initialisation** -- the seed read becomes a linear chain of nodes. Every subsequent
+1. **Seed initialisation**: the seed read becomes a linear chain of nodes. Every subsequent
    read is aligned into this growing graph.
-2. **Iterative alignment** -- for each read: (a) topological sort, (b) banded DP alignment
+2. **Iterative alignment**: for each read: (a) topological sort, (b) banded DP alignment
    against the graph, (c) update the graph from the alignment traceback.
-3. **Consensus extraction** -- follow the heaviest (most-supported) path through the final
+3. **Consensus extraction**: follow the heaviest (most-supported) path through the final
    graph, trim low-coverage boundaries, and return the sequence with coverage and statistics.
+
+## Example: linear consensus graph
+
+A set of 5 identical `CATCATCAT` reads produces a 9-node linear chain. Every node is on
+the spine (blue); all edge weights equal 5. This is the simplest possible POA graph: no
+variants, no arms.
+
+![Linear 9-node chain: all reads agree at every position](../diagrams/poa_linear.svg)
+
+## Example: graph after 10 reads with one mismatch
+
+After adding 10 reads where one read has a G at position 4 instead of C, the graph gains
+a single-node arm at that position. The spine stays on the majority base (C, 9 reads);
+the arm node (G, 1 read) branches off and rejoins. This is a **bubble**: two arms through
+the same entry and exit nodes.
+
+![Graph with one mismatch bubble: spine edge weights shown; arm weight = 1](../diagrams/poa_heaviest_path.svg)
 
 ## Data structures
 
@@ -15,9 +32,9 @@ The algorithm runs in three stages for each read set:
 
 Each node carries:
 
-- `base: u8` -- the nucleotide at this position
-- `coverage: u32` -- number of reads that matched (not deleted) this node
-- `out_edges: Vec<(usize, i32)>` -- `(target_node_index, edge_weight)` pairs
+- `base: u8`: the nucleotide at this position
+- `coverage: u32`: number of reads that matched (not deleted) this node
+- `out_edges: Vec<(usize, i32)>`: `(target_node_index, edge_weight)` pairs
 
 Edge weight records how many reads traversed from this node to the target. Weights are
 updated on every alignment: a match or insert op increments the outgoing edge weight.
@@ -26,7 +43,7 @@ updated on every alignment: a match or insert op increments the outgoing edge we
 
 The graph owns all nodes in a flat `Vec<Node>`. Node indices are stable across the life of
 the graph; topological order is recomputed before each alignment. The graph also caches a
-**spine** -- the current heaviest-path consensus -- which is used by the banded aligner to
+**spine** (the current heaviest-path consensus), which is used by the banded aligner to
 centre the DP band.
 
 ## Alignment scoring
@@ -44,7 +61,7 @@ homopolymer runs than linear penalties would.
 
 ## Critical design decisions
 
-These choices are load-bearing -- changing them without understanding the tests is likely to
+These choices are load-bearing. Changing them without understanding the tests is likely to
 break things.
 
 **Delete ops do not increment coverage.** A read that skips a node via a delete traverses

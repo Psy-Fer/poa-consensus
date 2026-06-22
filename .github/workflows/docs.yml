@@ -28,6 +28,12 @@ jobs:
         with:
           mdbook-version: "latest"
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate diagrams
+        run: cargo run --example network_plot --features plot
+
       - name: Build
         run: mdbook build docs
 

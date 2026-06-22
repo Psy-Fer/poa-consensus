@@ -10,7 +10,7 @@ variation, substitution errors, or true allelic differences.
 POA aligns reads into a directed acyclic graph (DAG). Each node in the graph represents a
 base; edges represent adjacency. When reads agree they share nodes; when they disagree
 (substitution, insertion, or deletion) the graph branches. Consensus is extracted by finding
-the path through the graph with the highest total read support -- the heaviest path.
+the path through the graph with the highest total read support: the heaviest path.
 
 This is more powerful than a simple majority vote because it handles length variation
 naturally. A deletion in some reads creates a shortcut edge; an insertion creates an extra
@@ -20,7 +20,7 @@ node. The heaviest path selects whichever variant has more read support, regardl
 
 | Scenario | Recommended |
 |---|---|
-| STR loci, 50--600 bp reads, high throughput across many loci | `poa-consensus` (banded DP) |
+| STR loci, 50-600 bp reads, high throughput across many loci | `poa-consensus` (banded DP) |
 | Longer reads (>1 kb), bacterial genes, HLA loci | [`poasta`](https://crates.io/crates/poasta) (A\* alignment) |
 | Diploid STR with two distinct allele lengths | `poa-consensus` with `consensus_multi` |
 | No spanning reads, expansion too long for any single read | `poa-consensus` `bridged_consensus` |

@@ -31,4 +31,8 @@ clap = { version = "4", features = ["derive"], optional = true }
 noodles = { version = "0.109", features = ["fasta", "fastq"], optional = true }
 kuva = { version = "0.3.0", optional = true }
 
+[[example]]
+name = "network_plot"
+required-features = ["plot"]
+
 [dev-dependencies]

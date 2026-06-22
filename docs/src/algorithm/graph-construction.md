@@ -49,6 +49,20 @@ that the node's base is correct. This is the key design choice that makes bounda
 nodes that are skipped by the majority of reads have low `coverage` even if many reads
 traversed the graph position.
 
+## Example: two-allele SNV graph
+
+After building a graph from 20 reads split equally between two alleles with a SNV at
+position 11 (A vs G), the graph has a two-node bubble. Both arms are supported by 10
+reads each (plus one noisy read creating a third minor arm). The spine goes through the
+first allele's arm; the second allele's arm is shown in grey.
+
+![Two-allele SNV bubble: spine in blue, second allele arm in grey](../diagrams/poa_network.svg)
+
+The same graph with a specific allele-B read overlaid (orange nodes are the path that read
+takes):
+
+![Same graph with allele-B read path highlighted in orange](../diagrams/poa_network_with_read.svg)
+
 ## Graph growth over a read set
 
 A typical graph on a clean 20-read set of 150 bp STR reads:

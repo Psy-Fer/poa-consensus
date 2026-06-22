@@ -31,12 +31,50 @@ min_cov = ceil(n_reads * min_coverage_fraction)
 
 This filter is applied in two phases:
 
-1. **Boundary trim** -- remove leading and trailing low-coverage nodes from the path ends.
+1. **Boundary trim**: remove leading and trailing low-coverage nodes from the path ends.
    This handles partial reads that do not span the full locus: they contribute to the middle
    of the graph but not the boundaries, leaving boundary nodes with seed-only coverage.
-2. **Interior filtering** -- remove minority detour chains in the interior. A chain of nodes
+2. **Interior filtering**: remove minority detour chains in the interior. A chain of nodes
    with coverage below `min_cov` that is connected to higher-coverage nodes on both sides
    is a noise branch and is excluded.
+
+## Example: heaviest path with edge weight labels
+
+In this fixture, 9 reads are `CATCAT` and 1 read has a G at position 3 (`CATGAT`). The
+graph has a single-node arm (G) off the spine. Edge labels show the read count on each
+edge: spine edges carry weight 9-10, the arm edges carry weight 1.
+
+After `(weight - 1)` normalisation, the spine edges score 8-9 per edge and the arm edges
+score 0. The heaviest path naturally follows the spine, ignoring the single-read arm.
+
+![Graph with edge weight labels: spine weights 9-10, arm weight 1](../diagrams/poa_heaviest_path.svg)
+
+## Example: boundary trim with edge weight labels
+
+Here, 3 reads span the full sequence `GGGCATCATGGG` (12 bp) and 7 reads cover only the
+interior `CATCAT` (6 bp). With semi-global alignment (the default), the short reads take
+free terminal gaps rather than forced deletions, so the GGG flank nodes accumulate
+coverage only from the 3 spanning reads.
+
+Edge labels show the read count: interior edges carry weight 10 (all reads), while the
+flank edges carry weight 3. With min_cov = ceil(10 × 0.5) = 5, the flank nodes (weight 3)
+fall below the threshold and boundary trim removes them. The consensus is `CATCAT`.
+
+![Graph with flank/interior edge weight labels showing boundary trim effect](../diagrams/poa_boundary_trim.svg)
+
+## Example: deletion graph
+
+In this fixture, 10 reads have the full 19-base sequence and 3 reads have a 2-base
+deletion at the end. The heaviest path follows the 10-read spine (blue). The 3 deletion
+reads traverse a skip edge (arc above the spine) from position 13 to the end, adding edge
+weight but not coverage to the skipped nodes.
+
+![Graph showing majority full-length spine with minority deletion arc](../diagrams/poa_network_deletion.svg)
+
+With a deletion read overlaid (orange), you can see which nodes the deleting read traverses
+(skipping positions 15-16 via the arc edge):
+
+![Same graph with deletion read path highlighted in orange](../diagrams/poa_network_deletion_overlay.svg)
 
 ## Majority-frequency mode
 

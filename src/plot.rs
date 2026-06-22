@@ -571,19 +571,30 @@ pub fn band_with_reads_svg(graph: &PoaGraph, reads: &[&[u8]], seed_idx: usize) -
 /// SVG network diagram of the POA graph.
 ///
 /// The layout matches the standard POA paper convention: the consensus spine
-/// runs **top to bottom** down the centre, and bubble arms branch off to the
-/// **left**.  All node positions are pinned so the layout algorithm is not
-/// used — this avoids force-directed layouts that scatter arms far from the
-/// spine.
+/// runs horizontally through the centre, and bubble arms branch above or below.
+/// All node positions are pinned so the layout algorithm is not used.
 ///
 /// - Spine nodes are blue, sized by coverage.
-/// - Off-spine (bubble arm) nodes are grey, positioned left of the spine at
-///   the vertical midpoint of their entry/exit spine neighbours.
+/// - Off-spine (bubble arm) nodes are grey.
 /// - When `read` is `Some`, that sequence is aligned against the graph:
-///   Match nodes turn red, Delete nodes (traversed without consuming a base)
-///   turn orange.
+///   Match nodes turn red, Delete nodes turn orange.
 /// - Labels show `"{rank}:{base}"` (e.g. `"3:G"`) for graphs with ≤ 80 nodes.
 pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
+    graph_network_svg_inner(graph, read, false)
+}
+
+/// Same as [`graph_network_svg`] but labels each edge with its read count
+/// (edge weight). Useful for illustrating the heaviest-path DP and boundary
+/// trim in documentation or debugging.
+pub fn graph_network_svg_labeled(graph: &PoaGraph, read: Option<&[u8]>) -> String {
+    graph_network_svg_inner(graph, read, true)
+}
+
+fn graph_network_svg_inner(
+    graph: &PoaGraph,
+    read: Option<&[u8]>,
+    show_edge_weights: bool,
+) -> String {
     use std::collections::HashMap;
 
     let topology = graph.graph_topology();
@@ -615,7 +626,6 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
     let spine_len = topology.spine_ranks.len();
     let spine_set: std::collections::HashSet<usize> =
         topology.spine_ranks.iter().copied().collect();
-    // topo_rank → position along spine (0-indexed)
     let spine_idx: HashMap<usize, usize> = topology
         .spine_ranks
         .iter()
@@ -624,9 +634,6 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
         .collect();
 
     // ── Pinned layout ─────────────────────────────────────────────────────
-    // Spine: y = 0.5 (centre), x = 0.05..0.95 (left to right).
-    // Off-spine arms: x = midpoint of entry/exit spine x; y above (0.2) or
-    // below (0.8) the spine, alternating when multiple arms share a bracket.
     let pad = 0.05_f64;
     let spine_y_val = 0.5_f64;
 
@@ -644,19 +651,80 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
         positions[rank] = (spine_x(spine_idx[&rank]), spine_y_val);
     }
 
-    // Group off-spine nodes by their (entry, exit) spine bracket so multiple
-    // arms at the same bubble site alternate above / below.
-    let mut arm_slots: HashMap<(Option<usize>, Option<usize>), usize> = HashMap::new();
+    // Group arm nodes into chains: directly connected arm nodes (multi-node
+    // insertion arms) must land on the same side of the spine. We identify
+    // chains via arm-only edges, then assign one y slot per chain.
+    let arm_arm_set: std::collections::HashSet<(usize, usize)> = topology
+        .edges
+        .iter()
+        .filter(|e| !spine_set.contains(&e.from_rank) && !spine_set.contains(&e.to_rank))
+        .map(|e| (e.from_rank, e.to_rank))
+        .collect();
 
+    // chain_of[rank] = root rank of the arm chain. Nodes are visited in
+    // topological order so predecessors are already inserted.
+    let mut chain_of: HashMap<usize, usize> = HashMap::new();
     for node in &topology.nodes {
         let rank = node.topo_rank;
         if spine_set.contains(&rank) {
             continue;
         }
+        let root = chain_of
+            .iter()
+            .filter(|&(&pred, _)| arm_arm_set.contains(&(pred, rank)))
+            .map(|(_, &c)| c)
+            .next()
+            .unwrap_or(rank);
+        chain_of.insert(rank, root);
+    }
 
-        let entry = (0..rank).rev().find(|&r| spine_set.contains(&r));
-        let exit = (rank + 1..n).find(|&r| spine_set.contains(&r));
+    // chains: root → [ranks in topological order].
+    let mut chains: HashMap<usize, Vec<usize>> = HashMap::new();
+    for node in &topology.nodes {
+        let rank = node.topo_rank;
+        if spine_set.contains(&rank) {
+            continue;
+        }
+        chains.entry(chain_of[&rank]).or_default().push(rank);
+    }
 
+    // Assign a y slot per chain. Process in root-rank order for a deterministic
+    // layout. Chains at the same (entry, exit) bracket alternate above/below.
+    let mut chain_roots: Vec<usize> = chains.keys().copied().collect();
+    chain_roots.sort_unstable();
+
+    let mut arm_slots: HashMap<(Option<usize>, Option<usize>), usize> = HashMap::new();
+    let mut chain_y: HashMap<usize, f64> = HashMap::new();
+
+    for &root in &chain_roots {
+        let chain_ranks = &chains[&root];
+        let first = chain_ranks[0];
+        let last = *chain_ranks.last().unwrap();
+        let entry = (0..first).rev().find(|&r| spine_set.contains(&r));
+        let exit = (last + 1..n).find(|&r| spine_set.contains(&r));
+        let slot = arm_slots.entry((entry, exit)).or_insert(0);
+        let y = if *slot % 2 == 0 { 0.2 } else { 0.8 };
+        *slot += 1;
+        chain_y.insert(root, y);
+    }
+
+    // Position each arm node. Center the chain on the bracket midpoint and
+    // use the spine step as the horizontal increment so nodes in a tight
+    // bracket (e.g. two adjacent spine nodes) still have room to breathe.
+    let spine_step = if spine_len <= 1 {
+        0.0
+    } else {
+        (1.0 - 2.0 * pad) / (spine_len - 1) as f64
+    };
+
+    for &root in &chain_roots {
+        let chain_ranks = &chains[&root];
+        let k = chain_ranks.len();
+        let y = chain_y[&root];
+        let first = chain_ranks[0];
+        let last = *chain_ranks.last().unwrap();
+        let entry = (0..first).rev().find(|&r| spine_set.contains(&r));
+        let exit = (last + 1..n).find(|&r| spine_set.contains(&r));
         let x_entry = entry
             .and_then(|r| spine_idx.get(&r).copied())
             .map(spine_x)
@@ -665,21 +733,14 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
             .and_then(|r| spine_idx.get(&r).copied())
             .map(spine_x)
             .unwrap_or(1.0 - pad);
-        let x = (x_entry + x_exit) / 2.0;
-
-        let slot = arm_slots.entry((entry, exit)).or_insert(0);
-        // Even slots above (y=0.2), odd slots below (y=0.8).
-        let y = if *slot % 2 == 0 { 0.2 } else { 0.8 };
-        *slot += 1;
-
-        positions[rank] = (x, y);
+        let mid = (x_entry + x_exit) / 2.0;
+        for (i, &rank) in chain_ranks.iter().enumerate() {
+            let x = mid + (i as f64 - (k - 1) as f64 / 2.0) * spine_step;
+            positions[rank] = (x, y);
+        }
     }
 
     // ── Node sizing ───────────────────────────────────────────────────────
-    // SVG output is infinitely scalable, so we size for readability not pixels.
-    // Base radius is large enough that the "{rank}:{base}" label fits inside
-    // once kuva supports inside-node labels; for now the label sits beside.
-    // Coverage scales the radius slightly so high-support nodes stand out.
     let max_cov = topology
         .nodes
         .iter()
@@ -695,19 +756,25 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
     let mut net = NetworkPlot::new()
         .with_directed()
         .with_legend("type")
-        // Layout is irrelevant — every node is pinned.
         .with_layout(NetworkLayout::ForceDirected);
 
     if show_labels {
         net = net.with_labels_inside();
     }
 
-    // Pin all nodes before adding edges so isolated nodes are always present.
     for node in &topology.nodes {
         let label = fmt_label(node);
         let (x, y) = positions[node.topo_rank];
         net = net.with_node(label.clone()).with_node_position(label, x, y);
     }
+
+    // Arm nodes that have been weight-annotated (avoids double-labelling when
+    // both the entry and exit edge of an arm are iterated).
+    let mut annotated_arm_nodes: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    // (norm_x, above_spine, weight_str) — one entry per arm node, used for
+    // SVG post-processing after kuva renders the network.
+    let mut arm_labels: Vec<(f64, bool, String)> = Vec::new();
 
     for edge in &topology.edges {
         let src_rank = edge.from_rank;
@@ -717,16 +784,18 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
         let src_on_spine = spine_set.contains(&src_rank);
         let tgt_on_spine = spine_set.contains(&tgt_rank);
 
-        // Arm connections (exactly one endpoint off-spine): curve outward so the
-        // arc matches the JPEG convention — bubble arms bow away from the spine.
-        // The sign is chosen based on the arm's y-position: arms above the spine
-        // (y < 0.5) get a negative curve (arc further above); arms below get
-        // a positive curve (arc further below).
         if src_on_spine != tgt_on_spine {
             let arm_rank = if src_on_spine { tgt_rank } else { src_rank };
             let arm_y = positions[arm_rank].1;
             let curve = if arm_y < 0.5 { -0.25 } else { 0.25 };
             net = net.with_edge_curved(src, tgt, edge.weight as f64, curve);
+
+            if show_edge_weights && annotated_arm_nodes.insert(arm_rank) {
+                let (ax, _) = positions[arm_rank];
+                arm_labels.push((ax, arm_y < 0.5, edge.weight.to_string()));
+            }
+        } else if show_edge_weights {
+            net = net.with_edge_label(src, tgt, edge.weight as f64, edge.weight.to_string());
         } else {
             net = net.with_edge(src, tgt, edge.weight as f64);
         }
@@ -752,22 +821,83 @@ pub fn graph_network_svg(graph: &PoaGraph, read: Option<&[u8]>) -> String {
 
     let plots: Vec<Plot> = vec![net.into()];
     let title = if read.is_some() {
-        format!("POA graph ({n} nodes, {} spine) — read overlay", spine_len)
+        format!("POA graph ({n} nodes, {} spine) [read overlay]", spine_len)
     } else {
         format!("POA graph ({n} nodes, {} spine)", spine_len)
     };
-    // 120px per spine node gives a clear arrow stem between adjacent circles.
-    // Height 500px gives ~125px above and below the spine for arm nodes.
     let canvas_w = (spine_len as f64) * 120.0 + 200.0;
     let layout = Layout::auto_from_plots(&plots)
         .with_title(title)
         .with_width(canvas_w)
         .with_height(500.0);
-    render_to_svg(plots, layout)
+    let svg = render_to_svg(plots, layout);
+    if show_edge_weights && !arm_labels.is_empty() {
+        inject_arm_labels(svg, &arm_labels)
+    } else {
+        svg
+    }
 }
 
 fn fmt_label(node: &crate::GraphNodeInfo) -> String {
     format!("{}:{}", node.topo_rank, node.base as char)
+}
+
+// ── SVG post-processing for arm edge labels ───────────────────────────────────
+
+/// Extract a single f64 attribute value from an SVG element fragment.
+/// Looks for `attr_name` (e.g. `cx="`) and parses up to the closing `"`.
+fn svg_attr_f64(fragment: &str, attr: &str) -> Option<f64> {
+    let start = fragment.find(attr)? + attr.len();
+    let end = fragment[start..].find('"')?;
+    fragment[start..start + end].parse().ok()
+}
+
+/// Inject weight labels onto curved arm edges by parsing the rendered SVG for
+/// arm node circle positions and overlaying `<text>` elements directly.
+///
+/// `TextAnnotation` uses the chart data-axis coordinate system which does not
+/// align with the network renderer's separate pixel mapping, so post-processing
+/// is the only reliable way to place text at the correct pixel position.
+///
+/// `arm_labels`: `(norm_x, above_spine, weight_string)` per arm node.
+fn inject_arm_labels(mut svg: String, arm_labels: &[(f64, bool, String)]) -> String {
+    // Parse arm node circles: fill="#aaaaaa", radius > 15 px (excludes legend dots).
+    let mut circles: Vec<(f64, f64, f64)> = Vec::new(); // (cx, cy, r)
+    for chunk in svg.split("<circle ") {
+        if !chunk.contains("fill=\"#aaaaaa\"") {
+            continue;
+        }
+        if let (Some(cx), Some(cy), Some(r)) =
+            (svg_attr_f64(chunk, "cx=\""), svg_attr_f64(chunk, "cy=\""), svg_attr_f64(chunk, "r=\""))
+        {
+            if r > 15.0 {
+                circles.push((cx, cy, r));
+            }
+        }
+    }
+    if circles.is_empty() {
+        return svg;
+    }
+
+    // Sort circles by cx and arm_labels by norm_x — both increase monotonically
+    // in the same direction, so positional pairing is correct.
+    circles.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let mut labels: Vec<_> = arm_labels.iter().collect();
+    labels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    let mut texts = String::new();
+    for ((_norm_x, above, weight), &(cx, cy, r)) in labels.iter().zip(circles.iter()) {
+        let ty = if *above { cy - r - 4.0 } else { cy + r + 12.0 };
+        texts.push_str(&format!(
+            "<text x=\"{cx:.1}\" y=\"{ty:.1}\" text-anchor=\"middle\" \
+             font-size=\"11\" font-family=\"sans-serif\" fill=\"#444444\">{weight}</text>\n"
+        ));
+    }
+
+    if let Some(pos) = svg.rfind("</svg>") {
+        svg.insert_str(pos, &texts);
+    }
+    svg
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

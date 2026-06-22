@@ -33,6 +33,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   are rendered inside each node. An optional read slice overlays that read's alignment path in
   a distinct colour, making it easy to inspect which nodes a specific read traverses. Run the
   included example with `cargo run --example network_plot --features plot`.
+- **`graph_network_svg_labeled`** (`plot` feature) -- same as `graph_network_svg` but labels
+  each edge with its read count (edge weight). Spine edges use kuva's `with_edge_label`;
+  arm edges get a `TextAnnotation` positioned near the arm node. Useful for illustrating the
+  heaviest-path DP, boundary trim thresholds, and alignment debugging.
 - **`Consensus::read_indices: Vec<usize>`** -- indices into the original `reads` slice that
   contributed to this consensus. Populated by `consensus_multi` and `PoaGraph::consensus_multi`;
   empty for single-allele outputs (empty means "all reads contributed"). Callers can use these

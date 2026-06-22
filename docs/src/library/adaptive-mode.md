@@ -61,7 +61,7 @@ Use `consensus_multi` directly when:
 
 ## Tuning for ONT data
 
-ONT substitution rates (4--8%) cause error-driven bubbles that can look like alleles:
+ONT substitution rates (4-8%) cause error-driven bubbles that can look like alleles:
 
 ```rust
 let mut cfg = PoaConfig::default();

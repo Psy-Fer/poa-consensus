@@ -71,6 +71,65 @@ With `min_reads = 3` (the default), `consensus_multi` requires at least 3 reads 
 allele**. If a group falls below this after phasing, it is merged into the largest group and
 the result is effectively single-allele.
 
-For reliable two-allele calls, a minimum per-allele depth of 5--10 is recommended. At
+For reliable two-allele calls, a minimum per-allele depth of 5-10 is recommended. At
 depth 3, a single error read equals 33% frequency and can influence the minority-arm
 detection.
+
+## Example: two-allele SNV bubble graph
+
+The graph below was built from 20 reads split evenly between two alleles with a SNV at
+position 11. The spine (blue) follows allele A; the grey arm is allele B. A minor noise
+arm (single read with a sequencing error) is also visible.
+
+![Two-allele SNV graph: spine follows allele A, allele-B arm in grey, minor noise arm](../diagrams/poa_network.svg)
+
+With one allele-B read overlaid (orange), you can see exactly which nodes it traverses
+through the bubble and which nodes it shares with allele A:
+
+![Same graph with allele-B read highlighted: orange path diverges at the bubble and rejoins](../diagrams/poa_network_with_read.svg)
+
+## Example: repeat expansion alleles
+
+For repeat loci, alleles differ in the number of repeat units rather than a single base.
+Each allele is processed separately by `consensus_multi` after phasing. The two graphs
+below compare normal and pathogenic CAG alleles (modelled at reduced scale for clarity;
+real HTT expansions reach 36+ units for disease onset).
+
+**Normal allele: (CAG)×4 = 12 bp**
+
+![CAG normal allele: 12-node linear chain](../diagrams/poa_cag_normal.svg)
+
+**Pathogenic allele: (CAG)×7 = 21 bp (+3 units)**
+
+![CAG expanded allele: 21-node linear chain showing 3 extra repeat units](../diagrams/poa_cag_expanded.svg)
+
+The same pattern applies to the GAA repeat (Friedreich's ataxia, FXN intron 1).
+Disease range is >66 units; scaled to 4 vs 8 units here.
+
+**Normal allele: (GAA)×4 = 12 bp**
+
+![GAA normal allele: 12-node linear chain](../diagrams/poa_gaa_normal.svg)
+
+**Pathogenic allele: (GAA)×8 = 24 bp (+4 units)**
+
+![GAA expanded allele: 24-node linear chain](../diagrams/poa_gaa_expanded.svg)
+
+## Example: unphased RFC1-style mixed read set
+
+The CANVAS locus (RFC1 intron 2) is a 5-mer repeat where the normal allele is (AAAAG)×N
+and the most common pathogenic allele is (AAAGT)×N. The two motifs are 2 substitutions
+apart per 5-mer -- not a length difference -- so the aligner prefers mismatches over
+Insert/Delete pairs. The two motifs do not create bubble arms within the shared repeat
+region. However, if the pathogenic allele is also expanded (more repeat units), the extra
+units create Insert arm nodes that extend the spine.
+
+The graph below was built from 15 reads of (AAAAG)×4 (75%, normal) and 5 reads of
+(AAAGT)×6 (25%, pathogenic minority). The first 20 nodes come from the shared 4-unit region;
+the last 10 nodes are the 2 extra AAAGT units that only the pathogenic reads carry. Node
+sizes reflect coverage: the first 20 nodes are larger (depth 20) while the last 10 are
+smaller (depth 5, below min_cov = 10). The heaviest path extends through the expansion
+because each extra edge adds to the cumulative score. A single call to `consensus()` would
+return the expanded allele length; `consensus_multi` with structural phasing is required to
+recover both allele lengths correctly.
+
+![RFC1 mixed allele graph: 20 full-depth nodes then 10 low-coverage expansion nodes](../diagrams/poa_rfc1_mixed.svg)
