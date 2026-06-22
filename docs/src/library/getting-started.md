@@ -4,14 +4,14 @@
 
 ```toml
 [dependencies]
-poa-consensus = "0.1"
+poa-consensus = "0.2"
 ```
 
 For visualisation support:
 
 ```toml
 [dependencies]
-poa-consensus = { version = "0.1", features = ["plot"] }
+poa-consensus = { version = "0.2", features = ["plot"] }
 ```
 
 ## Minimal example

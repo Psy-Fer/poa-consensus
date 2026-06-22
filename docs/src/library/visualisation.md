@@ -7,7 +7,7 @@ behaviour. All functions return a `String` containing a self-contained SVG.
 
 ```toml
 [dependencies]
-poa-consensus = { version = "0.1", features = ["plot"] }
+poa-consensus = { version = "0.2", features = ["plot"] }
 ```
 
 ## Graph network

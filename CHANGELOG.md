@@ -11,10 +11,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [0.1.3] - unreleased
+## [0.2.0] - 2026-06-22
 
 ### Fixed
 
+- **Network diagram arm layout** (`plot` feature) -- multi-node insertion arms (e.g. a 2-base
+  insertion) are now grouped into chains before y-slot assignment, so all nodes in the same
+  arm land on the same side of the spine. Nodes within a chain are spaced one spine-step apart
+  horizontally so they do not overlap. Previously the slot counter incremented per node,
+  causing the second node of a 2-node arm to flip to the opposite side.
 - **Shifted minimizer anchor bug in `anchor_refine_spine`** -- k-mers that span a
   repeat/flanking boundary can appear at a different read position in shorter reads (one fewer
   repeat unit before the anchor sequence). This produced anchors whose upper bound `ahi` fell
@@ -35,8 +40,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   included example with `cargo run --example network_plot --features plot`.
 - **`graph_network_svg_labeled`** (`plot` feature) -- same as `graph_network_svg` but labels
   each edge with its read count (edge weight). Spine edges use kuva's `with_edge_label`;
-  arm edges get a `TextAnnotation` positioned near the arm node. Useful for illustrating the
-  heaviest-path DP, boundary trim thresholds, and alignment debugging.
+  arm edge weights are injected directly into the SVG after rendering, above or below each
+  arm node circle. Useful for illustrating the heaviest-path DP, boundary trim thresholds,
+  and alignment debugging.
 - **`Consensus::read_indices: Vec<usize>`** -- indices into the original `reads` slice that
   contributed to this consensus. Populated by `consensus_multi` and `PoaGraph::consensus_multi`;
   empty for single-allele outputs (empty means "all reads contributed"). Callers can use these
@@ -164,8 +170,8 @@ Initial release.
   histogram, node-coverage histogram, alignment-density heatmap, band-with-reads overlay.
 - 193 tests; 20/20 synthetic validation scenarios passing (two via adequacy signals).
 
-[Unreleased]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.3...HEAD
-[0.1.3]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.2...v0.1.3
+[Unreleased]: https://github.com/Psy-Fer/poa-consensus/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Psy-Fer/poa-consensus/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Psy-Fer/poa-consensus/releases/tag/v0.1.0
