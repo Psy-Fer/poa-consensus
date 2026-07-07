@@ -2376,27 +2376,66 @@ impl PoaGraph {
             ConsensusMode::HeaviestPath => {
                 let path = heaviest_path(&self.nodes, &topo, &rank_of);
 
-                let start = path
+                // Step 1: per-node support. A node is adequately supported
+                // if its Match coverage clears the global threshold, OR it
+                // is the locally dominant arm at its bubble: heaviest_path
+                // already picked it as the winning predecessor edge, and its
+                // own Match coverage clears a majority of its *own* bubble's
+                // vote total, even though global coverage falls short
+                // because other reads diverged at an earlier bubble (so
+                // fewer than min_cov reads even reach this point). Gated on
+                // the predecessor having 2+ out-edges (a real fork) so a
+                // plain low-coverage unbranched run -- a true minority
+                // extension, not a bubble arm -- is still governed by the
+                // global check alone. Coverage (not edge weight) is compared
+                // against the local threshold: edge weight includes reads
+                // that Delete through the node (skip it without adopting its
+                // base), which is evidence *against* keeping the base.
+                let supported: Vec<bool> = path
                     .iter()
-                    .position(|&(node_idx, _, _)| self.nodes[node_idx].coverage >= min_cov)
-                    .unwrap_or(0);
+                    .enumerate()
+                    .map(|(i, &(node_idx, _, _))| {
+                        if self.nodes[node_idx].coverage >= min_cov {
+                            return true;
+                        }
+                        let Some(&(pred_idx, _, _)) = i.checked_sub(1).and_then(|j| path.get(j))
+                        else {
+                            return false;
+                        };
+                        if self.nodes[pred_idx].out_edges.len() < 2 {
+                            return false;
+                        }
+                        let local_total: i32 = self.nodes[pred_idx]
+                            .out_edges
+                            .iter()
+                            .map(|&(_, ew)| ew)
+                            .sum();
+                        let local_min_cov = coverage_threshold(
+                            local_total.max(0) as usize,
+                            self.config.min_coverage_fraction,
+                        );
+                        self.nodes[node_idx].coverage as i32 >= local_min_cov as i32
+                    })
+                    .collect();
 
-                let end = path
+                let start = supported.iter().position(|&s| s).unwrap_or(0);
+                let end = supported
                     .iter()
-                    .rposition(|&(node_idx, _, _)| self.nodes[node_idx].coverage >= min_cov)
+                    .rposition(|&s| s)
                     .map(|i| i + 1)
                     .unwrap_or(path.len());
 
-                let effective = if start < end {
-                    &path[start..end]
+                let (effective_path, effective_supported) = if start < end {
+                    (&path[start..end], &supported[start..end])
                 } else {
-                    &path[..]
+                    (&path[..], &supported[..])
                 };
 
-                effective
+                effective_path
                     .iter()
-                    .filter(|&&(node_idx, _, _)| self.nodes[node_idx].coverage >= min_cov)
-                    .copied()
+                    .zip(effective_supported.iter())
+                    .filter(|&(_, &s)| s)
+                    .map(|(&t, _)| t)
                     .collect()
             }
             ConsensusMode::MajorityFrequency => majority_frequency(&self.nodes, &topo, min_cov),
@@ -2708,12 +2747,19 @@ impl PoaGraph {
     }
 
     fn min_coverage(&self) -> u32 {
-        if self.config.min_coverage_fraction > 0.0 {
-            ((self.n_reads as f64 * self.config.min_coverage_fraction).ceil() as u32).max(1)
-        } else if self.n_reads <= 1 {
-            1
-        } else {
-            ((self.n_reads / 2 + 1).max(2)) as u32
-        }
+        coverage_threshold(self.n_reads, self.config.min_coverage_fraction)
+    }
+}
+
+/// Minimum coverage required to keep a node, given a population size (either
+/// the full read count, or the local vote total at one bubble) and the
+/// configured `min_coverage_fraction`.
+fn coverage_threshold(population: usize, min_coverage_fraction: f64) -> u32 {
+    if min_coverage_fraction > 0.0 {
+        ((population as f64 * min_coverage_fraction).ceil() as u32).max(1)
+    } else if population <= 1 {
+        1
+    } else {
+        ((population / 2 + 1).max(2)) as u32
     }
 }

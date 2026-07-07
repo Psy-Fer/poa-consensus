@@ -42,6 +42,30 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   internally by the library) instead of a local median-read-length heuristic. The median
   heuristic had no particular basis for correctness and, before the lookahead fix above, made
   the CLI's default behaviour on the DAB1 case worse than several other seed choices.
+- **Interior filter could fabricate sequence not present in any read** -- `consensus()`'s
+  interior filter dropped any node with `coverage < min_cov`, where `min_cov` is derived from
+  the *global* read count. A node that `heaviest_path` correctly picked as the winning arm of
+  a local bubble can still have Match coverage below that global threshold, purely because
+  other reads diverged at an *earlier* bubble (so fewer than the full read count even reach
+  this point) -- the node is a clear local majority but a global minority. Dropping it spliced
+  its flanking nodes directly together, producing a junction no read ever made. This is acute
+  in periodic/tandem-repeat regions: removing one interior base of a `CTT` repeat shifts the
+  phase (`"CTTCTTC"` with the middle `C` removed reads as `"CTTTTC"`, a run length the repeat
+  unit can never actually produce). The interior filter now also keeps a node when it is the
+  locally dominant arm at its own bubble -- its Match coverage clears a majority of its
+  predecessor's total out-edge weight -- gated on the predecessor actually having 2+ out-edges
+  (a real fork), so a plain low-coverage unbranched tail is still governed by the global
+  threshold alone. Confirmed on DMD `CTT`-repeat HiFi reads (HG02968, chrX:31,284,557-613);
+  regression test: `diag_dmd_ctt_repeat_interior_filter_global_threshold_bias`.
+  **Known residual** (not fixed by the above): when the *majority* of reads reach a node via
+  Delete rather than Match -- i.e. they genuinely skip the base, not just diverge onto another
+  arm -- dropping that node can still occasionally fabricate a junction, because each deleting
+  read's own alignment still passes through the node in sequence and no single edge directly
+  connects its predecessor to its successor bypassing it. An initial attempt to also require a
+  same-length bypass edge before dropping any node fixed this case but broke the (correct)
+  removal of genuine multi-node minority insertions elsewhere (regressed
+  `diag_dab1_sca37_attttc_lookahead_arm_length_bias`), so it was not kept. Tracked by the
+  `#[ignore]`d test `diag_dmd_ctt_majority_delete_residual`.
 
 ---
 
