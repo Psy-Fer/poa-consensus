@@ -2410,6 +2410,18 @@ impl PoaGraph {
                             .iter()
                             .map(|&(_, ew)| ew)
                             .sum();
+                        // Require the bubble's own local population to clear
+                        // the *global* min_cov before trusting a local
+                        // majority within it. Without this, a fork with only
+                        // a handful of reads left (because most reads
+                        // diverged onto other bubbles well before reaching
+                        // this point) can produce a "majority" -- e.g. 2 of
+                        // 3 -- that is really just noise from a heavily
+                        // fragmented region, not a real minority allele
+                        // being unfairly suppressed by the global threshold.
+                        if (local_total.max(0) as u32) < min_cov {
+                            return false;
+                        }
                         let local_min_cov = coverage_threshold(
                             local_total.max(0) as usize,
                             self.config.min_coverage_fraction,

@@ -66,6 +66,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   removal of genuine multi-node minority insertions elsewhere (regressed
   `diag_dab1_sca37_attttc_lookahead_arm_length_bias`), so it was not kept. Tracked by the
   `#[ignore]`d test `diag_dmd_ctt_majority_delete_residual`.
+- **Local-dominance rescue (above) could itself fabricate sequence from a fragmented bubble's
+  noise** -- the rescue gates only on *relative* local majority (a node's Match coverage
+  clearing a majority of its predecessor's local out-edge weight total), not on the *absolute*
+  size of that local population. In a region with many small, closely-spaced phase-registration
+  bubbles (confirmed on RFC1 `AAAAG` pentanucleotide repeat, HG002 real data), the read pool
+  fragments rapidly bubble-by-bubble; by the time one specific fork is reached, only a handful
+  of reads may still be on that exact sub-path. A 2-of-3 split there clears the local majority
+  bar trivially even though it's statistical noise from attrition, not a real minority allele
+  the global threshold unfairly suppresses -- reported as a spurious single-base `G` interrupt
+  inserted after unit 30 of a 116-unit `AAAAG` run, with no read support at that position (2 of
+  10 reads had an `AAAAGG` anywhere in their whole sequence, both far from unit 30). Fixed by
+  additionally requiring the bubble's local population (`pred`'s total out-edge weight) to clear
+  the *global* `min_cov` before trusting a local majority within it. Regression test:
+  `diag_rfc1_aaaag_spurious_g_interrupt_local_rescue_noise` (sweeps all 10 possible seeds).
 
 ---
 
