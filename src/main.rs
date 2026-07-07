@@ -3,13 +3,17 @@ use std::process;
 
 use clap::Parser;
 
-use poa_consensus::{AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, auto_orient, diagnose};
+use poa_consensus::{
+    AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, SeedSelection, auto_orient, diagnose,
+    select_seed,
+};
 
 /// Build a consensus sequence from FASTA or FASTQ reads using Partial Order
 /// Alignment.
 ///
 /// Reads are auto-oriented to the seed strand before alignment.  The default
-/// seed is the median-length read; override with --seed.
+/// seed is chosen automatically via a terminal k-mer anchor heuristic (see
+/// `SeedSelection::Auto`); override with --seed.
 #[derive(Parser)]
 #[command(name = "poa-consensus", version)]
 struct Args {
@@ -17,7 +21,8 @@ struct Args {
     #[arg(default_value = "-")]
     input: String,
 
-    /// Seed read index (0-based). Defaults to the median-length read.
+    /// Seed read index (0-based). Defaults to an automatically chosen seed
+    /// (terminal k-mer anchor heuristic; falls back to the longest read).
     #[arg(short, long)]
     seed: Option<usize>,
 
@@ -104,7 +109,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             idx
         }
-        None => median_seed(&reads),
+        None => {
+            let slices: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            select_seed(&slices, &SeedSelection::Auto)
+                .inspect_err(|e| explain_error(e, reads.len()))?
+        }
     };
 
     let oriented = auto_orient(&reads, seed_idx);
@@ -329,11 +338,4 @@ fn first_byte<R: BufRead>(reader: &mut R) -> Result<Option<u8>, Box<dyn std::err
         }
         return Ok(Some(b));
     }
-}
-
-/// Return the index of the median-length read.
-fn median_seed(reads: &[Vec<u8>]) -> usize {
-    let mut order: Vec<usize> = (0..reads.len()).collect();
-    order.sort_unstable_by_key(|&i| reads[i].len());
-    order[order.len() / 2]
 }

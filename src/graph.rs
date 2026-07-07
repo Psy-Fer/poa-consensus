@@ -108,6 +108,24 @@ impl AlignScratch {
     }
 }
 
+/// Current weight of the edge `from -> to`, or 0 if no such edge exists yet.
+///
+/// Used to break DP score ties in favour of the already-better-supported
+/// transition.  Without this, ties are broken by `in_edges` iteration order
+/// (effectively read-arrival order), which lets content-identical repeat
+/// registers (e.g. two phase-shifted encodings of the same homopolymer run)
+/// split support roughly evenly across reads instead of converging onto one
+/// path — silently fragmenting the graph in periodic sequence.
+#[inline]
+fn edge_weight(nodes: &[Node], from: usize, to: usize) -> i32 {
+    nodes[from]
+        .out_edges
+        .iter()
+        .find(|&&(t, _)| t == to)
+        .map(|&(_, w)| w)
+        .unwrap_or(0)
+}
+
 #[inline]
 fn safe_add(a: i32, b: i32) -> i32 {
     if a == UNSET {
@@ -1172,20 +1190,28 @@ fn align(
                         best_pred = VIRTUAL;
                     }
                 }
+                // Ties across predecessors prefer the heavier-weighted edge (see
+                // `edge_weight`); ties within the same predecessor keep the
+                // Match > Insert > Delete order via the pre-existing `>` checks.
+                // MAX so a pre-loop free-start `best` is never displaced by a tie.
+                let mut best_edge_w = i32::MAX;
                 for &p in &nodes[node_idx].in_edges {
                     let pt = rank_of[p];
+                    let ew = edge_weight(nodes, p, node_idx);
                     let vm = safe_add(gs(&m, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width), sc);
-                    if vm != UNSET && vm > best {
+                    if vm != UNSET && (vm > best || (vm == best && ew > best_edge_w)) {
                         best = vm;
                         best_pred = pt as u32;
+                        best_edge_w = ew;
                     }
                     let vi = safe_add(
                         gs(&ins, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width),
                         sc,
                     );
-                    if vi != UNSET && vi > best {
+                    if vi != UNSET && (vi > best || (vi == best && ew > best_edge_w)) {
                         best = vi;
                         best_pred = pt as u32;
+                        best_edge_w = ew;
                     }
                     let vd = safe_add(
                         gsd(
@@ -1199,9 +1225,10 @@ fn align(
                         ),
                         sc,
                     );
-                    if vd != UNSET && vd > best {
+                    if vd != UNSET && (vd > best || (vd == best && ew > best_edge_w)) {
                         best = vd;
                         best_pred = pt as u32;
+                        best_edge_w = ew;
                     }
                 }
                 if best != UNSET {
@@ -1251,31 +1278,38 @@ fn align(
             // D[t][j]
             {
                 let (mut best, mut best_pred) = (UNSET, 0u32);
+                // See the M[t][j] block above: ties across predecessors prefer
+                // the heavier-weighted edge instead of in_edges iteration order.
+                let mut best_edge_w = i32::MAX;
                 for &p in &nodes[node_idx].in_edges {
                     let pt = rank_of[p];
+                    let ew = edge_weight(nodes, p, node_idx);
                     let vm = safe_add(
                         gs(&m, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
                         go + ge,
                     );
-                    if vm != UNSET && vm > best {
+                    if vm != UNSET && (vm > best || (vm == best && ew > best_edge_w)) {
                         best = vm;
                         best_pred = pt as u32;
+                        best_edge_w = ew;
                     }
                     let vi = safe_add(
                         gs(&ins, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
                         go + ge,
                     );
-                    if vi != UNSET && vi > best {
+                    if vi != UNSET && (vi > best || (vi == best && ew > best_edge_w)) {
                         best = vi;
                         best_pred = pt as u32;
+                        best_edge_w = ew;
                     }
                     let vd = safe_add(
                         gsd(&del, &del0, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
                         ge,
                     );
-                    if vd != UNSET && vd > best {
+                    if vd != UNSET && (vd > best || (vd == best && ew > best_edge_w)) {
                         best = vd;
                         best_pred = pt as u32;
+                        best_edge_w = ew;
                     }
                 }
                 if best != UNSET {
@@ -1335,20 +1369,29 @@ fn align(
 
                     if !complex && all_arms.len() >= 2 {
                         // ── 1. Lookahead ──────────────────────────────────────
-                        // Only fires when the longest arm provides all LOOKAHEAD_K
-                        // bases.  Short arms (< K) are unreliable at ONT error
-                        // rates: one read error flips the decision.
-                        let max_scored = all_arms
+                        // Only fires when EVERY arm provides all LOOKAHEAD_K bases,
+                        // so score_arm_prefix compares the same number of bases on
+                        // each arm.  Gating on the longest arm (as opposed to the
+                        // shortest) let a short arm's score — capped at its own
+                        // length — lose to a long arm's score purely because it
+                        // was compared over fewer bases, regardless of which arm
+                        // actually matched the query better.  A short arm (e.g. a
+                        // length-1 "no insertion" shortcut against a many-node
+                        // insertion arm) always lost this way, even when it was
+                        // the correct one.  Short arms (< K) fall through to
+                        // slide-and-lock's exhaustion rule or windowed DP, both of
+                        // which score fairly.
+                        let min_scored = all_arms
                             .iter()
                             .map(|arm| {
                                 arm.len()
                                     .min(LOOKAHEAD_K)
                                     .min(query.len().saturating_sub(j_entry))
                             })
-                            .max()
+                            .min()
                             .unwrap_or(0);
 
-                        let winner = if max_scored >= LOOKAHEAD_K {
+                        let winner = if min_scored >= LOOKAHEAD_K {
                             let scores: Vec<i32> = all_arms
                                 .iter()
                                 .map(|arm| {

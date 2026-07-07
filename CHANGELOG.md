@@ -9,6 +9,40 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lookahead bubble-arm scoring biased toward the longer arm** -- the lookahead resolver
+  (used at bubble entries with 2+ out-edges to pick a winning arm before windowed DP) gated
+  on whether the *longest* arm could provide `LOOKAHEAD_K` bases, then scored each arm only
+  over its own available length. A short arm (e.g. a 1-node "no insertion" shortcut) could
+  therefore only ever score up to `1 x match_score`, while a long arm (e.g. a 19-node
+  insertion detour created by one divergent read) scored over the full `LOOKAHEAD_K` bases --
+  guaranteeing the long arm won the `LOOKAHEAD_MARGIN` comparison regardless of which arm
+  actually matched the read. Once one outlier read (with a genuinely different repeat-unit
+  count) created such a bubble in a periodic homopolymer/STR run, every subsequent read
+  hitting that bubble was routed onto the same over-scored long arm, silently fragmenting
+  read support across the two arms and producing a consensus with several small deletions
+  scattered through the repeat -- with no error and only an easy-to-miss low-coverage
+  warning. The result was highly seed-index-dependent: some seeds avoided the outlier
+  entirely (correct output), others produced mild (1 bp) to severe (10+ bp) base loss.
+  `slide_lock` already guarded against this (`min_arm_len < LOOKAHEAD_K -> bail`); the
+  lookahead gate now uses the same *minimum*-arm-length check, so it only fires when every
+  arm can be scored over the same number of bases. Confirmed on DAB1 SCA37 (ATTTT/ATTTC)
+  hap2 HiFi reads.
+- **DP tie-break now prefers the heavier-weighted edge** -- in the windowed-DP fallback (used
+  when the lookahead/slide-lock arm resolvers decline), ties between candidate predecessors
+  with identical scores were broken by `in_edges` iteration order (edge creation order), not
+  by any property of the read data. Ties now prefer the predecessor edge with higher existing
+  weight, so genuinely ambiguous alignments reinforce whichever path already has more read
+  support instead of fragmenting further. This is a secondary hardening alongside the
+  lookahead fix above; it did not by itself resolve the DAB1 case but closes the same class of
+  order-dependent tie-breaking.
+- **CLI default seed selection** -- `poa-consensus` (no `--seed`) now uses
+  `select_seed(&reads, &SeedSelection::Auto)` (terminal k-mer anchor heuristic, already used
+  internally by the library) instead of a local median-read-length heuristic. The median
+  heuristic had no particular basis for correctness and, before the lookahead fix above, made
+  the CLI's default behaviour on the DAB1 case worse than several other seed choices.
+
 ---
 
 ## [0.2.0] - 2026-06-22
