@@ -130,6 +130,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   class (Known Bug #3/#4): a minority read's private insertion absorbing Match support from
   other reads' independent re-alignment, since any `A` matches any `A` node identically. Not
   addressed by this fix; flanking-anchor pre-processing remains the intended long-term fix.
+- **`bench/validate.py` used removed CLI flags** -- `run_consensus()` passed `--adaptive-band`
+  and `--semi-global`, both removed when those became the CLI defaults (see "CLI changes"
+  below). Every `validate.py` invocation was silently producing `FAILED (no consensus)` for
+  every scenario. Updated to pass `--band-width 50` (single-allele) / `--band-width 0`
+  (multi-allele, pure adaptive) with no other band/mode flags.
+
+### Added
+
+- **`bench/compare_callers.py`** -- runs the same pbsim3 -> minimap2 -> bedpull pipeline as
+  `validate.py`, but feeds the extracted reads to `poa-consensus`, abPOA (`pyabpoa`), and SPOA
+  (`pyspoa`) side by side, all in semi-global mode, and scores each against the known truth
+  allele. Restricted to single-allele scenarios: neither external tool has an equivalent to
+  this crate's bubble-based multi-allele splitting, so a fair three-way comparison needs all
+  three solving the same one-read-set-in-one-consensus-out problem. Setup: `pip install
+  pyabpoa pyspoa`. First full run against the existing scenario catalogue: 9/16 scenarios all
+  three callers agree, 3 where poa-consensus alone is correct, 4 where poa-consensus disagrees
+  with both external callers (logged in `TODO.md` under Deferred for follow-up).
 
 ---
 

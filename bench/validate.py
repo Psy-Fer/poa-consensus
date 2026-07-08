@@ -535,13 +535,15 @@ def extract_reads(scenario: Scenario, bam: Path, work: Path) -> Path:
 def run_consensus(extracted: Path, work: Path, scenario: Scenario) -> Optional[Path]:
     """Run poa-consensus CLI on extracted reads."""
     consensus = work / "consensus.fa"
-    # For single-allele scenarios, use a wider minimum band (50) so that
-    # long repetitive alleles (e.g. CAG×100) are aligned correctly.
-    # Multi-allele mode uses only the adaptive band because a fixed wider
-    # band disrupts bubble detection and allele partitioning.
-    band_args = ["--adaptive-band"] + ([] if scenario.multi else ["--band-width", "50"])
+    # Adaptive band and semi-global are the CLI defaults now (see CHANGELOG.md
+    # "CLI changes"), so neither needs to be passed explicitly. Single-allele
+    # scenarios keep the default 50 bp band-width floor so long repetitive
+    # alleles (e.g. CAG×100) align correctly. Multi-allele mode drops the
+    # floor to 0 (pure adaptive band) because a fixed wider band disrupts
+    # bubble detection and allele partitioning.
+    band_args = ["--band-width", "0"] if scenario.multi else ["--band-width", "50"]
     cmd = (
-        [str(POA_BIN)] + band_args + ["--semi-global"]
+        [str(POA_BIN)] + band_args
         + (["--multi"] if scenario.multi else [])
         + scenario.poa_flags
         + ["--min-reads", "2", str(extracted)]
