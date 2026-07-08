@@ -634,6 +634,9 @@ fn diag_rfc1_leading_interrupt_partial_read_population_accounting() {
     // rather than requiring the immediate predecessor to be one, so a
     // rescued node's own single successor can inherit its fork's
     // population instead of being judged against the global read count.
+    // A second fix in the same area (see
+    // diag_rfc1_leading_interrupt_delete_driven_forkless_gap below) covers
+    // the case where no fork exists at all anywhere nearby.
     //
     // This test covers only the *first ~230bp*, which the 4-full-reads
     // diagnostic confirmed is fully explained by clean population
@@ -672,6 +675,79 @@ fn diag_rfc1_leading_interrupt_partial_read_population_accounting() {
             gap, 4,
             "unsupported gap of {} (expected 4) between G at {} and {} in: {}",
             gap, w[0], w[1], region
+        );
+    }
+}
+
+#[test]
+fn diag_rfc1_leading_interrupt_delete_driven_forkless_gap() {
+    // Same RFC1 AAAAG hap2 read set as the test above, but covering the
+    // *whole* consensus rather than just the first ~230bp.
+    //
+    // Root cause: one read (read index 2 here) individually Deletes a
+    // single "G" out of an otherwise fully unbranched, unanimous run of
+    // matches -- no fork is ever created, because Match and Delete share
+    // the same edge; only the node's own delete_count records that one
+    // read skipped it. The backward-fork-search rescue above only fires
+    // when a fork exists somewhere nearby; here there is none at all for
+    // dozens of nodes in either direction, so the node fell through to the
+    // *global* min_cov (based on all 6 reads, including the 2 short reads
+    // that never reach this deep) and was dropped even though 3 of the 4
+    // reads that actually reach this point matched it. Removing that one
+    // "G" merged the two flanking 4-A groups into a single 8-A run in the
+    // output -- reported as an "(A)4(AAAAG)1(AAAG)1" interrupt with no
+    // read support at that position.
+    //
+    // Fixed by falling back, when no fork is found, to the node's own
+    // coverage + delete_count as the local population (every read that
+    // reaches an unforked node either matches or deletes it, so this sum
+    // is exact) -- gated on that sum itself clearing the *global* min_cov,
+    // the same way the fork branch gates on the fork's total. That gate is
+    // what keeps this fix from also pulling in a genuine trailing/leading
+    // extension (a minority of reads simply longer than the rest, with
+    // nothing downstream to reconverge with -- see
+    // edge_extreme_length_variation_majority_wins in tests/sv_analysis.rs
+    // and long_repeat_length_majority_wins above, both regressed by an
+    // earlier version of this fix that used a forward-recovery scan
+    // instead, which a stray noisy read overlapping the tail could fool).
+    let reads = vec![
+        b(
+            "AAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA",
+        ),
+        b(
+            "AAAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAGAAAGAAAGAAAAGAAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA",
+        ),
+        b(
+            "AAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAAAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA",
+        ),
+        b("AAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA"),
+        b("AAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA"),
+        b(
+            "AAAAAGAAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGA",
+        ),
+    ];
+    let result = s(&consensus(&reads, 0));
+    let bytes = result.as_bytes();
+    let g_positions: Vec<usize> = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(_, &b)| b == b'G')
+        .map(|(i, _)| i)
+        .collect();
+    // The fixed fabrication produced gaps of 8 and 3 (from dropping one G
+    // out of two adjacent 4-A groups). Assert those specific patterns are
+    // gone. A single gap of 2 elsewhere is the known, separately-tracked
+    // periodic-alignment-ambiguity residual (see CLAUDE.md Known Bugs
+    // #3/#4) and is deliberately not asserted away here.
+    for w in g_positions.windows(2) {
+        let gap = w[1] - w[0] - 1;
+        assert!(
+            gap != 8 && gap != 3,
+            "delete-driven forkless gap fabrication reappeared: gap {} between G at {} and {} in: {}",
+            gap,
+            w[0],
+            w[1],
+            result
         );
     }
 }

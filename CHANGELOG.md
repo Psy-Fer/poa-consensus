@@ -95,22 +95,41 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   judged against the global read count. Regression test:
   `diag_rfc1_leading_interrupt_partial_read_population_accounting` (checks the region confirmed
   fully explained by population accounting via a 4-full-reads-only control).
-  **Known residual** (not fixed by the above, different root cause): the same read set has a
-  second, separate class of fabrication further into the repeat -- confirmed by re-running with
-  only the 4 full-length reads, which produces a clean consensus, isolating the cause to
-  something that happens when the 2 short reads are also present, but *not* explainable by
-  population accounting: the affected nodes show unanimous, fork-free `coverage == n_reads`
-  support, yet a per-read regex check shows only one of the 4 individual full-length reads
-  actually contains the exact base run appearing in the consensus at that position. This is the
-  already-documented, already-hard "silent wrong alignment in repetitive regions" class (Known
-  Bug #3/#4 in CLAUDE.md): in a periodic `AAAAG` run, a minority read's private insertion can
-  absorb Match support from *other* reads' independent re-alignment against the evolving graph,
-  since matching any `A` to any `A` node scores identically. Not addressed by this fix; the
-  project's documented long-term direction (flanking-anchor pre-processing) is the intended fix,
-  not further interior-filter tuning. Also surfaced a pre-existing, unrelated issue while testing
-  this data: using one of the two short partial reads as the seed produces `TruncationRetry`
-  with `recovered: false` and an empty consensus (confirmed present before this session's
-  changes too); not investigated further here.
+  Also surfaced a pre-existing, unrelated issue while testing this data: using one of the two
+  short partial reads as the seed produces `TruncationRetry` with `recovered: false` and an
+  empty consensus (confirmed present before this session's changes too); not investigated
+  further here.
+- **Backward-fork-search rescue (above) still missed the case where no fork exists anywhere
+  nearby** -- confirmed on the same RFC1 `AAAAG` hap2 read set: one read individually `Delete`d
+  a single `G` out of an otherwise fully unbranched, unanimous run of matches. No fork is ever
+  created for this, because Match and Delete share the same edge -- only the node's own
+  `delete_count` records that one read skipped it. The node's own Match coverage (3 of the 4
+  reads that structurally reach this deep) fell below the *global* `min_cov` (6, sized for all
+  10 reads including the 2 short ones that never reach this point) purely because no fork
+  existed to rescue it via the previous fix. Dropping that `G` merged the two flanking 4-`A`
+  groups either side of it into one 8-`A` run, reported as an `(A)4(AAAAG)1(AAAG)1` interrupt
+  with zero read support at that position -- this was the residual reported as "the same class
+  of fabrication further into the repeat" in the previous entry; it turned out to be a third
+  instance of the same population-accounting bug, not the periodic-alignment-ambiguity issue it
+  was first mistaken for. Fixed by falling back, when no fork is found in the backward search,
+  to the node's own `coverage + delete_count` as the local population -- every read reaching an
+  unforked node either matches or deletes it, so that sum is exact -- gated on the sum itself
+  clearing the *global* `min_cov`, mirroring the fork branch's own gate.
+  **This gate is load-bearing, not optional**: an earlier version of this fix used a
+  forward-recovery scan instead (does coverage climb back above `min_cov` further along?) and
+  regressed two existing tests -- `long_repeat_length_majority_wins` and
+  `edge_extreme_length_variation_majority_wins` in `tests/sv_analysis.rs` -- both genuine
+  trailing extensions (a minority of reads simply longer than the rest, with nothing downstream
+  to reconverge with, so nothing should be rescued). The forward scan could be fooled by a
+  single stray noisy read overlapping the tail; comparing the population itself against the
+  global threshold cannot, because a genuine trailing minority's own population is, by
+  definition, still a minority. Regression test:
+  `diag_rfc1_leading_interrupt_delete_driven_forkless_gap`.
+  With this fix, the RFC1 hap2 read set is now clean end-to-end except for a single, much
+  smaller residual (`gap=2` at one position) that *is* the genuine periodic-alignment-ambiguity
+  class (Known Bug #3/#4): a minority read's private insertion absorbing Match support from
+  other reads' independent re-alignment, since any `A` matches any `A` node identically. Not
+  addressed by this fix; flanking-anchor pre-processing remains the intended long-term fix.
 
 ---
 

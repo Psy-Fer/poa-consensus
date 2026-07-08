@@ -2434,7 +2434,67 @@ impl PoaGraph {
                             hops += 1;
                         };
                         let Some(pred_idx) = fork_pred_idx else {
-                            return false;
+                            // No fork anywhere in the search window: this
+                            // node sits on a plain, unbranched chain, so
+                            // there is no competing arm whose vote could be
+                            // noise. Its own coverage + delete_count is the
+                            // *exact* count of reads that reached this exact
+                            // point -- every one of them either matched or
+                            // deleted it, both counted, neither implying a
+                            // fork. Using that as the local population
+                            // (instead of the global n_reads) correctly
+                            // covers reads that simply end here (partial
+                            // reads under semi-global alignment) *and* reads
+                            // that individually Delete through this one node
+                            // without creating a branch (Match and Delete
+                            // share the same edge, so one read quietly
+                            // skipping a base here is invisible to the fork
+                            // search above). Confirmed on RFC1 AAAAG hap2:
+                            // a single read deleting one G out of an
+                            // otherwise-unbranched run of matches dropped
+                            // that G from the consensus, merging two 4-A
+                            // units either side of it into one 8-A run --
+                            // not because of any bubble, but because
+                            // min_cov was still sized for reads that had
+                            // already ended much earlier in the graph.
+                            //
+                            // But an unforked, low-coverage run can *also*
+                            // be a genuine trailing (or leading) extension --
+                            // e.g. a minority of reads simply longer than
+                            // the rest, appended past where the majority's
+                            // own path ends, with nothing to "fork" from
+                            // because there is nothing downstream to
+                            // reconverge with. That case is a boundary tail,
+                            // not an interior dip, and boundary trim (using
+                            // the plain global check) already handles it
+                            // correctly on its own -- rescuing it here would
+                            // pull the minority's full extension back in.
+                            //
+                            // Distinguish the two the same way the fork
+                            // branch does: require self_total to itself
+                            // clear the *global* min_cov before trusting it
+                            // as the local population. In the genuine dip
+                            // case, self_total reflects the reads that are
+                            // still active -- a majority of them, since
+                            // nothing else in the graph competes for their
+                            // vote -- so it clears min_cov comfortably. In
+                            // the trailing-tail case, self_total reflects
+                            // only the minority of reads that happen to run
+                            // longer than the rest, which by definition
+                            // stays below min_cov. This is more robust than
+                            // scanning forward for a "recovery" node, which
+                            // a stray noisy read overlapping the tail can
+                            // trigger by coincidence.
+                            let self_total =
+                                self.nodes[node_idx].coverage + self.nodes[node_idx].delete_count;
+                            if self_total < min_cov {
+                                return false;
+                            }
+                            let self_min_cov = coverage_threshold(
+                                self_total as usize,
+                                self.config.min_coverage_fraction,
+                            );
+                            return self.nodes[node_idx].coverage >= self_min_cov;
                         };
                         let local_total: i32 = self.nodes[pred_idx]
                             .out_edges
