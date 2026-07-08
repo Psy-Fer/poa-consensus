@@ -2398,7 +2398,11 @@ impl PoaGraph {
                     .map(|i| i + 1)
                     .unwrap_or(path.len());
 
-                let range = if start < end { start..end } else { 0..path.len() };
+                let range = if start < end {
+                    start..end
+                } else {
+                    0..path.len()
+                };
 
                 // Interior inclusion: within the trimmed boundary, two
                 // distinct evidence axes decide whether a node survives,
@@ -2472,7 +2476,8 @@ impl PoaGraph {
                             hops += 1;
                         };
                         let Some((pred_idx, arm_idx)) = fork_info else {
-                            return self.nodes[node_idx].coverage > self.nodes[node_idx].delete_count;
+                            return self.nodes[node_idx].coverage
+                                > self.nodes[node_idx].delete_count;
                         };
                         let local_total: i32 = self.nodes[pred_idx]
                             .out_edges
