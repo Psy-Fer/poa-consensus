@@ -2391,6 +2391,12 @@ impl PoaGraph {
                 // against the local threshold: edge weight includes reads
                 // that Delete through the node (skip it without adopting its
                 // base), which is evidence *against* keeping the base.
+                // How far back to search for the nearest real fork when the
+                // immediate predecessor isn't one. Bounded to avoid O(n^2)
+                // worst case; a few repeat units is enough to see past a
+                // rescued fork's own single-successor tail.
+                const FORK_SEARCH_HOPS: usize = 64;
+
                 let supported: Vec<bool> = path
                     .iter()
                     .enumerate()
@@ -2398,13 +2404,38 @@ impl PoaGraph {
                         if self.nodes[node_idx].coverage >= min_cov {
                             return true;
                         }
-                        let Some(&(pred_idx, _, _)) = i.checked_sub(1).and_then(|j| path.get(j))
-                        else {
-                            return false;
-                        };
-                        if self.nodes[pred_idx].out_edges.len() < 2 {
+                        if i == 0 {
                             return false;
                         }
+                        // Walk backward for the nearest predecessor that is a
+                        // real fork (2+ out-edges). A node immediately
+                        // downstream of an *unforked* predecessor isn't
+                        // itself at a fork, but its reduced population may
+                        // still trace back to one a few hops earlier (e.g. a
+                        // node kept by this same local-dominance rescue,
+                        // whose own single successor just continues on).
+                        // Without looking past the immediate predecessor,
+                        // such nodes always fall through to the *global*
+                        // min_cov and get dropped purely because some reads
+                        // elsewhere in the graph ended earlier (partial
+                        // reads under semi-global alignment) -- a legitimate
+                        // reduction in local population, not noise.
+                        let mut search_idx = i - 1;
+                        let mut hops = 0usize;
+                        let fork_pred_idx = loop {
+                            let (cand_idx, _, _) = path[search_idx];
+                            if self.nodes[cand_idx].out_edges.len() >= 2 {
+                                break Some(cand_idx);
+                            }
+                            if search_idx == 0 || hops >= FORK_SEARCH_HOPS {
+                                break None;
+                            }
+                            search_idx -= 1;
+                            hops += 1;
+                        };
+                        let Some(pred_idx) = fork_pred_idx else {
+                            return false;
+                        };
                         let local_total: i32 = self.nodes[pred_idx]
                             .out_edges
                             .iter()

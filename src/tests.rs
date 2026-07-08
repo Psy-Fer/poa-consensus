@@ -608,6 +608,75 @@ fn diag_rfc1_aaaag_spurious_g_interrupt_local_rescue_noise() {
 }
 
 #[test]
+fn diag_rfc1_leading_interrupt_partial_read_population_accounting() {
+    // CANVAS_RFC1 (AAAAG pentanucleotide repeat), Hap2, chm13 real data
+    // (6 reads: 4 full-length spanning reads with independent single-base
+    // noise at scattered positions, plus 2 short partial reads covering
+    // only the first ~55-60bp). The only signal all 4 full reads agree on
+    // is a single "AAG" interrupt 12 clean units before the 3' boundary;
+    // everything else is per-read noise at different positions in each.
+    //
+    // Root cause: the interior filter's local-dominance rescue (added for
+    // the DAB1/DMD/RFC1-G-interrupt bugs above) only checked the
+    // *immediate* predecessor for a fork. Once the 2 short partial reads
+    // dropped out (their alignment simply ends there under semi-global
+    // mode -- a legitimate reduction in local population, not a bubble),
+    // `n_reads` stayed pinned at 6 for the *global* min_cov, even though
+    // only 4 reads structurally reach deeper positions. A node one hop
+    // downstream of an already-rescued fork (whose own predecessor has
+    // only one out-edge, i.e. isn't itself a fork) always fell through to
+    // the global check and got dropped, even when it was the clear
+    // majority (3 of the 4 still-active reads). Confirmed the 4-full-reads
+    // in isolation produce a perfectly clean consensus with no fabrication
+    // at all in this region.
+    //
+    // Fixed by walking backward (bounded) to find the nearest real fork
+    // rather than requiring the immediate predecessor to be one, so a
+    // rescued node's own single successor can inherit its fork's
+    // population instead of being judged against the global read count.
+    //
+    // This test covers only the *first ~230bp*, which the 4-full-reads
+    // diagnostic confirmed is fully explained by clean population
+    // accounting. Positions beyond that hit a different, deeper issue --
+    // genuine AAAAG periodic-alignment ambiguity (already documented as
+    // Known Bug #3/#4 in CLAUDE.md) -- tracked separately, not by this
+    // test.
+    let reads = vec![
+        b(
+            "AAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA",
+        ),
+        b(
+            "AAAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAGAAAGAAAGAAAAGAAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA",
+        ),
+        b(
+            "AAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAAAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA",
+        ),
+        b("AAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA"),
+        b("AAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAA"),
+        b(
+            "AAAAAGAAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGAAAAGA",
+        ),
+    ];
+    let result = s(&consensus(&reads, 0));
+    let region = &result[..230.min(result.len())];
+    let bytes = region.as_bytes();
+    let g_positions: Vec<usize> = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(_, &b)| b == b'G')
+        .map(|(i, _)| i)
+        .collect();
+    for w in g_positions.windows(2) {
+        let gap = w[1] - w[0] - 1;
+        assert_eq!(
+            gap, 4,
+            "unsupported gap of {} (expected 4) between G at {} and {} in: {}",
+            gap, w[0], w[1], region
+        );
+    }
+}
+
+#[test]
 fn diag_sca3_t3_tail_with_flank() {
     let flank = b("CCTCCTCCT");
     let make = |tail: &str| -> Vec<u8> {
