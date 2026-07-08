@@ -2452,18 +2452,26 @@ impl PoaGraph {
                         }
                         let mut search_idx = i;
                         let mut hops = 0usize;
-                        let fork_pred_idx = loop {
+                        let fork_info = loop {
                             if search_idx == range_start || hops >= FORK_SEARCH_HOPS {
                                 break None;
                             }
                             let (cand_idx, _, _) = path[search_idx - 1];
                             if self.nodes[cand_idx].out_edges.len() >= 2 {
-                                break Some(cand_idx);
+                                // `arm_idx` is the immediate child of the fork
+                                // on *this* path -- constant for every node
+                                // downstream of it on the same unbranched
+                                // arm, so the plurality comparison below
+                                // (this arm's entry weight vs every sibling's)
+                                // gives the same verdict to the whole arm,
+                                // not just its first node.
+                                let (arm_idx, _, _) = path[search_idx];
+                                break Some((cand_idx, arm_idx));
                             }
                             search_idx -= 1;
                             hops += 1;
                         };
-                        let Some(pred_idx) = fork_pred_idx else {
+                        let Some((pred_idx, arm_idx)) = fork_info else {
                             return self.nodes[node_idx].coverage > self.nodes[node_idx].delete_count;
                         };
                         let local_total: i32 = self.nodes[pred_idx]
@@ -2478,7 +2486,42 @@ impl PoaGraph {
                             local_total.max(0) as usize,
                             self.config.min_coverage_fraction,
                         );
-                        self.nodes[node_idx].coverage as i32 >= local_min_cov as i32
+                        if self.nodes[node_idx].coverage as i32 >= local_min_cov as i32 {
+                            return true;
+                        }
+                        // Plurality relaxation: trust the arm's own entry
+                        // weight against its siblings' -- but *only* when
+                        // both the fork itself and this candidate are
+                        // "clean" (zero delete_count), i.e. genuinely
+                        // undisputed populations on both ends, not entangled
+                        // with an unresolved Match-vs-Delete decision. A
+                        // fork with its own delete_count > 0 means the
+                        // arrival at the fork is itself still contested
+                        // (confirmed case: RFC1 AAAAG's fork had cov=4,
+                        // del=6 of its own -- a majority-delete decision one
+                        // level up from the 5-vs-5 split below it -- so
+                        // trusting that split's plurality independently of
+                        // the unresolved arrival fabricated a base no read
+                        // actually has). Confirmed target case: a genuine
+                        // 3-way split of the *full* population at a fork
+                        // with cov=7, del=0 of its own (cag20_d05_r10) --
+                        // no attrition, no unresolved arrival, just three
+                        // different bases competing at the same position.
+                        if self.nodes[pred_idx].delete_count != 0
+                            || self.nodes[node_idx].delete_count != 0
+                        {
+                            return false;
+                        }
+                        let arm_weight = self.nodes[pred_idx]
+                            .out_edges
+                            .iter()
+                            .find(|&&(to, _)| to == arm_idx)
+                            .map(|&(_, w)| w)
+                            .unwrap_or(0);
+                        self.nodes[pred_idx]
+                            .out_edges
+                            .iter()
+                            .all(|&(_, w)| w <= arm_weight)
                     })
                     .map(|i| path[i])
                     .collect()

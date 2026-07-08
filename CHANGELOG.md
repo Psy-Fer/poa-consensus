@@ -38,25 +38,29 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
      edge weight counts Match and Delete traversals together) both come down to.
   2. **This base vs a different base** (a real fork somewhere back along the run): needs the
      fork's own coverage to clear a *majority* of the fork's local total, gated on that local
-     total itself clearing the global floor (Known Bug #7's fragmented-fork guard, unchanged).
-     A plurality-only relaxation of this axis was tried and reverted twice: once it wrongly
-     rescued a genuine 5-vs-5 near-tie in real RFC1 AAAAG data (fabricating an unsupported
-     extra base between two branches of the same fork), and once it wrongly rescued 10-of-14
-     reads' insertion arm against a clean 4-unit-majority CAT tandem-duplication test that had
-     been passing since before this session (the rejection at the fork's first node wasn't
-     propagating to the rest of that arm's unbranched chain, which is why the search below
-     walks the whole run rather than checking one hop back). Both attempts are left undone;
-     this axis is exactly the original fork-search + local-majority logic, just no longer
-     needing its own separate self-total branch.
-  Net effect on `bench/compare_callers.py`'s 16-scenario catalogue is unchanged (15/16 all
-  three callers agree, same as before this investigation) -- `cag20_d05_r10`'s gap is a
-  genuine plurality-vs-majority ambiguity at a fully-populated fork with no attrition, and no
-  per-node/per-fork threshold rule can resolve it without also breaking one of the two
-  already-tested cases above, which need the opposite resolution despite near-identical
-  surface structure. Documented as a known, accepted limitation rather than patched further.
-  Net code change: -58 lines (135 removed, 77 added) despite fixing DAB1 by a cleaner path and
-  finding + fixing the tandem-duplication regression along the way. All 184 lib tests plus the
-  full `tests/` suite pass with zero failures.
+     total itself clearing the global floor (Known Bug #7's fragmented-fork guard, unchanged) --
+     *unless* both the fork node itself and the candidate arm have `delete_count == 0`, in which
+     case a plurality (the arm whose entry weight is at least as large as every sibling's) is
+     trusted instead. A bare plurality relaxation (no delete_count check at all) was tried and
+     reverted twice first: it wrongly rescued a genuine 5-vs-5 near-tie in real RFC1 AAAAG data
+     (fabricating an unsupported extra base between two branches of the same fork -- but that
+     fork's *own* node had `cov=4, del=6`, i.e. the arrival at the fork was itself an unresolved
+     majority-delete decision one level up), and it wrongly rescued 10-of-14 reads' insertion arm
+     against a clean 4-unit-majority CAT tandem-duplication test (the rejection at the fork's
+     first node wasn't propagating to the rest of that arm's unbranched chain, fixed separately
+     by having the backward search below track which of the fork's direct children the whole arm
+     descends from, so one verdict covers the entire arm, not just its first node). Gating the
+     plurality relaxation on `delete_count == 0` on *both* ends -- confirmed by checking the
+     RFC1 case's actual node data -- distinguishes "a fork with a genuinely undisputed arrival,
+     splitting cleanly into several different-but-real bases" (`cag20_d05_r10`: fork cov=7,
+     del=0; candidate cov=3, del=0 -- safe for plurality) from "a fork whose own arrival is still
+     contested" (RFC1: fork cov=4, del=6 -- not safe, needs strict majority regardless of the
+     split below it).
+  Net effect on `bench/compare_callers.py`'s 16-scenario catalogue: 16/16 all three callers now
+  agree (up from 15/16) -- `cag20_d05_r10` genuinely fixed, `sv_cag20_out60` unaffected. All 184
+  lib tests plus the full `tests/` suite still pass with zero failures, despite fixing DAB1 by a
+  cleaner path, finding + fixing the tandem-duplication regression, and fixing the
+  originally-targeted low-depth gap for real.
 
 ### Fixed
 
