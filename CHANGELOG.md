@@ -9,58 +9,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Changed
-
-- **Interior filter simplified: two evidence axes instead of one threshold ladder.** Prompted
-  by `bench/compare_callers.py` surfacing a low-depth gap (`cag20_d05_r10`, depth 5) where
-  abPOA and SPOA both matched truth exactly and poa-consensus did not. Reading abPOA's
-  (`abpoa_heaviest_bundling`/`abpoa_most_frequent` in `abpoa_output.c`) and SPOA's
-  (`Graph::TraverseHeaviestBundle`/`GenerateConsensus` in `graph.cpp`) actual source showed
-  neither applies any absolute population floor to a DP-selected node at all -- our own
-  `increment_or_add_edge` call site confirmed Match and Delete increment the *same* edge
-  weight identically, so `heaviest_path`'s own DP score already conflates "many reads reached
-  this point" with "many reads support this exact base," and the interior filter had grown
-  into an increasingly complex ladder (global floor, then backward fork search, then a
-  self-total fallback with its own floor) trying to patch that conflation back apart after
-  the fact. Replaced with two independent, uniform tests, applied per spine node after a
-  boundary trim unchanged from before (an absolute `coverage >= min_cov` floor is still the
-  only way to distinguish a genuine interior dip from a trailing/leading minority extension,
-  since the latter has `delete_count == 0` too -- the rest of the population simply never
-  reaches that far under semi-global alignment, so a Match-vs-Delete comparison alone can't
-  tell the two apart):
-  1. **Match vs Delete** (does this exact base have more support than "skip it"): applies
-     when no fork (2+ out-edges) exists anywhere back along the node's unbranched run, all the
-     way to the trim boundary. In that case coverage and delete_count together are the exact,
-     complete count of reads that reached this point, so plain `coverage > delete_count` is
-     sufficient -- no population floor needed. This is the axis majority-delete fabrication
-     (Known Bugs #6, #9) and a false rescue of one (traced to DAB1 SCA37 seed=0 mid-implementation:
-     a node with cov=3, del=23 was wrongly kept by an edge-weight-based plurality check, because
-     edge weight counts Match and Delete traversals together) both come down to.
-  2. **This base vs a different base** (a real fork somewhere back along the run): needs the
-     fork's own coverage to clear a *majority* of the fork's local total, gated on that local
-     total itself clearing the global floor (Known Bug #7's fragmented-fork guard, unchanged) --
-     *unless* both the fork node itself and the candidate arm have `delete_count == 0`, in which
-     case a plurality (the arm whose entry weight is at least as large as every sibling's) is
-     trusted instead. A bare plurality relaxation (no delete_count check at all) was tried and
-     reverted twice first: it wrongly rescued a genuine 5-vs-5 near-tie in real RFC1 AAAAG data
-     (fabricating an unsupported extra base between two branches of the same fork -- but that
-     fork's *own* node had `cov=4, del=6`, i.e. the arrival at the fork was itself an unresolved
-     majority-delete decision one level up), and it wrongly rescued 10-of-14 reads' insertion arm
-     against a clean 4-unit-majority CAT tandem-duplication test (the rejection at the fork's
-     first node wasn't propagating to the rest of that arm's unbranched chain, fixed separately
-     by having the backward search below track which of the fork's direct children the whole arm
-     descends from, so one verdict covers the entire arm, not just its first node). Gating the
-     plurality relaxation on `delete_count == 0` on *both* ends -- confirmed by checking the
-     RFC1 case's actual node data -- distinguishes "a fork with a genuinely undisputed arrival,
-     splitting cleanly into several different-but-real bases" (`cag20_d05_r10`: fork cov=7,
-     del=0; candidate cov=3, del=0 -- safe for plurality) from "a fork whose own arrival is still
-     contested" (RFC1: fork cov=4, del=6 -- not safe, needs strict majority regardless of the
-     split below it).
-  Net effect on `bench/compare_callers.py`'s 16-scenario catalogue: 16/16 all three callers now
-  agree (up from 15/16) -- `cag20_d05_r10` genuinely fixed, `sv_cag20_out60` unaffected. All 184
-  lib tests plus the full `tests/` suite still pass with zero failures, despite fixing DAB1 by a
-  cleaner path, finding + fixing the tandem-duplication regression, and fixing the
-  originally-targeted low-depth gap for real.
+## [0.2.1] - 2026-07-08
 
 ### Fixed
 
@@ -189,6 +138,59 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   every scenario. Updated to pass `--band-width 50` (single-allele) / `--band-width 0`
   (multi-allele, pure adaptive) with no other band/mode flags.
 
+### Changed
+
+- **Interior filter simplified: two evidence axes instead of one threshold ladder.** Prompted
+  by `bench/compare_callers.py` surfacing a low-depth gap (`cag20_d05_r10`, depth 5) where
+  abPOA and SPOA both matched truth exactly and poa-consensus did not. Reading abPOA's
+  (`abpoa_heaviest_bundling`/`abpoa_most_frequent` in `abpoa_output.c`) and SPOA's
+  (`Graph::TraverseHeaviestBundle`/`GenerateConsensus` in `graph.cpp`) actual source showed
+  neither applies any absolute population floor to a DP-selected node at all -- our own
+  `increment_or_add_edge` call site confirmed Match and Delete increment the *same* edge
+  weight identically, so `heaviest_path`'s own DP score already conflates "many reads reached
+  this point" with "many reads support this exact base," and the interior filter had grown
+  into an increasingly complex ladder (global floor, then backward fork search, then a
+  self-total fallback with its own floor) trying to patch that conflation back apart after
+  the fact. Replaced with two independent, uniform tests, applied per spine node after a
+  boundary trim unchanged from before (an absolute `coverage >= min_cov` floor is still the
+  only way to distinguish a genuine interior dip from a trailing/leading minority extension,
+  since the latter has `delete_count == 0` too -- the rest of the population simply never
+  reaches that far under semi-global alignment, so a Match-vs-Delete comparison alone can't
+  tell the two apart):
+  1. **Match vs Delete** (does this exact base have more support than "skip it"): applies
+     when no fork (2+ out-edges) exists anywhere back along the node's unbranched run, all the
+     way to the trim boundary. In that case coverage and delete_count together are the exact,
+     complete count of reads that reached this point, so plain `coverage > delete_count` is
+     sufficient -- no population floor needed. This is the axis majority-delete fabrication
+     (Known Bugs #6, #9) and a false rescue of one (traced to DAB1 SCA37 seed=0 mid-implementation:
+     a node with cov=3, del=23 was wrongly kept by an edge-weight-based plurality check, because
+     edge weight counts Match and Delete traversals together) both come down to.
+  2. **This base vs a different base** (a real fork somewhere back along the run): needs the
+     fork's own coverage to clear a *majority* of the fork's local total, gated on that local
+     total itself clearing the global floor (Known Bug #7's fragmented-fork guard, unchanged) --
+     *unless* both the fork node itself and the candidate arm have `delete_count == 0`, in which
+     case a plurality (the arm whose entry weight is at least as large as every sibling's) is
+     trusted instead. A bare plurality relaxation (no delete_count check at all) was tried and
+     reverted twice first: it wrongly rescued a genuine 5-vs-5 near-tie in real RFC1 AAAAG data
+     (fabricating an unsupported extra base between two branches of the same fork -- but that
+     fork's *own* node had `cov=4, del=6`, i.e. the arrival at the fork was itself an unresolved
+     majority-delete decision one level up), and it wrongly rescued 10-of-14 reads' insertion arm
+     against a clean 4-unit-majority CAT tandem-duplication test (the rejection at the fork's
+     first node wasn't propagating to the rest of that arm's unbranched chain, fixed separately
+     by having the backward search below track which of the fork's direct children the whole arm
+     descends from, so one verdict covers the entire arm, not just its first node). Gating the
+     plurality relaxation on `delete_count == 0` on *both* ends -- confirmed by checking the
+     RFC1 case's actual node data -- distinguishes "a fork with a genuinely undisputed arrival,
+     splitting cleanly into several different-but-real bases" (`cag20_d05_r10`: fork cov=7,
+     del=0; candidate cov=3, del=0 -- safe for plurality) from "a fork whose own arrival is still
+     contested" (RFC1: fork cov=4, del=6 -- not safe, needs strict majority regardless of the
+     split below it).
+  Net effect on `bench/compare_callers.py`'s 16-scenario catalogue: 16/16 all three callers now
+  agree (up from 15/16) -- `cag20_d05_r10` genuinely fixed, `sv_cag20_out60` unaffected. All 184
+  lib tests plus the full `tests/` suite still pass with zero failures, despite fixing DAB1 by a
+  cleaner path, finding + fixing the tandem-duplication regression, and fixing the
+  originally-targeted low-depth gap for real.
+
 ### Added
 
 - **`bench/compare_callers.py`** -- runs the same pbsim3 -> minimap2 -> bedpull pipeline as
@@ -200,10 +202,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   pyabpoa pyspoa`. Scoring went through two broken extraction-based attempts before landing on
   `fitting_edit_distance()` (semi-global alignment of the truth allele against the full
   consensus, no extraction step at all) -- see `TODO.md` Deferred for why both extraction
-  approaches failed on this benchmark's synthetic data. Full run against the existing scenario
-  catalogue with the fitting-alignment metric: 15/16 scenarios agree across all three callers;
-  one genuine disagreement remains at the lowest-depth scenario (`cag20_d05_r10`, depth 5),
-  logged in `TODO.md` under Deferred for follow-up.
+  approaches failed on this benchmark's synthetic data. The comparison surfaced the low-depth
+  gap resolved by the interior filter changes above; full run against the existing scenario
+  catalogue now agrees 16/16 across all three callers.
 
 ---
 
