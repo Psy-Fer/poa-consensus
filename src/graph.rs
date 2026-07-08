@@ -2376,140 +2376,101 @@ impl PoaGraph {
             ConsensusMode::HeaviestPath => {
                 let path = heaviest_path(&self.nodes, &topo, &rank_of);
 
-                // Step 1: per-node support. A node is adequately supported
-                // if its Match coverage clears the global threshold, OR it
-                // is the locally dominant arm at its bubble: heaviest_path
-                // already picked it as the winning predecessor edge, and its
-                // own Match coverage clears a majority of its *own* bubble's
-                // vote total, even though global coverage falls short
-                // because other reads diverged at an earlier bubble (so
-                // fewer than min_cov reads even reach this point). Gated on
-                // the predecessor having 2+ out-edges (a real fork) so a
-                // plain low-coverage unbranched run -- a true minority
-                // extension, not a bubble arm -- is still governed by the
-                // global check alone. Coverage (not edge weight) is compared
-                // against the local threshold: edge weight includes reads
-                // that Delete through the node (skip it without adopting its
-                // base), which is evidence *against* keeping the base.
-                // How far back to search for the nearest real fork when the
-                // immediate predecessor isn't one. Bounded to avoid O(n^2)
-                // worst case; a few repeat units is enough to see past a
-                // rescued fork's own single-successor tail.
-                const FORK_SEARCH_HOPS: usize = 64;
-
-                let supported: Vec<bool> = path
+                // Boundary trim: find the first/last node whose Match
+                // coverage clears the *global* population floor. This has
+                // to stay absolute, not evidence-relative -- a trailing (or
+                // leading) minority extension has delete_count == 0 at its
+                // first node (nobody deletes through it; the rest of the
+                // population simply never reaches that far under
+                // semi-global alignment), so a Match-vs-Delete comparison
+                // alone can't distinguish "real interior disagreement"
+                // from "the majority already ended here." Only an absolute
+                // floor, sized off the whole population, can.
+                let meets_floor: Vec<bool> = path
                     .iter()
-                    .enumerate()
-                    .map(|(i, &(node_idx, _, _))| {
-                        if self.nodes[node_idx].coverage >= min_cov {
+                    .map(|&(node_idx, _, _)| self.nodes[node_idx].coverage >= min_cov)
+                    .collect();
+
+                let start = meets_floor.iter().position(|&s| s).unwrap_or(0);
+                let end = meets_floor
+                    .iter()
+                    .rposition(|&s| s)
+                    .map(|i| i + 1)
+                    .unwrap_or(path.len());
+
+                let range = if start < end { start..end } else { 0..path.len() };
+
+                // Interior inclusion: within the trimmed boundary, two
+                // distinct evidence axes decide whether a node survives,
+                // and they need different tests because they answer
+                // different questions:
+                //
+                // 1. Match vs Delete -- "is this base here at all, or did
+                //    the reads that reached this exact point skip it?"
+                //    Only meaningful when NO fork (2+ out-edges) exists
+                //    anywhere back along this node's unbranched run, all
+                //    the way to the trimmed boundary: with no competing
+                //    arm anywhere in reach, a node's own coverage and
+                //    delete_count are the *exact*, complete count of reads
+                //    that reached this precise point, so a plain
+                //    `coverage > delete_count` is sufficient and needs no
+                //    population floor -- majority-delete fabrication and a
+                //    false rescue of it (Known Bugs #6, #9; DAB1 SCA37
+                //    cov=3 vs del=23) both come down to exactly this axis.
+                // 2. This base vs a *different* base -- a real fork exists
+                //    somewhere back along this node's unbranched run. Here
+                //    "coverage beats delete_count" is the wrong test: a
+                //    base can have zero deletes of its own and still be
+                //    nothing more than one arm of a genuine near-tie with
+                //    a sibling arm (confirmed regressions: RFC1 AAAAG
+                //    5-vs-5, SV tandem-duplication 10-vs-4 -- the latter
+                //    only visible several nodes downstream of the fork
+                //    itself, which is why the search below walks the whole
+                //    unbranched run rather than checking one hop back).
+                //    This axis needs the fork's own coverage to clear a
+                //    majority of the fork's local total (not merely beat
+                //    zero), gated on that local total itself clearing the
+                //    *global* min_cov so a heavily fragmented, near-empty
+                //    fork can't manufacture a "majority" out of noise
+                //    (Known Bug #7).
+                //
+                // A node several hops downstream of a fork, on an
+                // otherwise-unbranched continuation of one of its arms,
+                // still belongs to axis 2 -- the fork's accept/reject
+                // verdict has to hold for its entire arm, not just the
+                // arm's first node, so the search below walks back through
+                // any unbranched run to find the nearest real fork before
+                // falling back to axis 1. Bounded to avoid an O(n^2) worst
+                // case on long unbranched runs.
+                const FORK_SEARCH_HOPS: usize = 64;
+                let range_start = range.start;
+                range
+                    .filter(|&i| {
+                        let (node_idx, _, _) = path[i];
+                        if meets_floor[i] {
                             return true;
                         }
-                        if i == 0 {
-                            return false;
-                        }
-                        // Walk backward for the nearest predecessor that is a
-                        // real fork (2+ out-edges). A node immediately
-                        // downstream of an *unforked* predecessor isn't
-                        // itself at a fork, but its reduced population may
-                        // still trace back to one a few hops earlier (e.g. a
-                        // node kept by this same local-dominance rescue,
-                        // whose own single successor just continues on).
-                        // Without looking past the immediate predecessor,
-                        // such nodes always fall through to the *global*
-                        // min_cov and get dropped purely because some reads
-                        // elsewhere in the graph ended earlier (partial
-                        // reads under semi-global alignment) -- a legitimate
-                        // reduction in local population, not noise.
-                        let mut search_idx = i - 1;
+                        let mut search_idx = i;
                         let mut hops = 0usize;
                         let fork_pred_idx = loop {
-                            let (cand_idx, _, _) = path[search_idx];
+                            if search_idx == range_start || hops >= FORK_SEARCH_HOPS {
+                                break None;
+                            }
+                            let (cand_idx, _, _) = path[search_idx - 1];
                             if self.nodes[cand_idx].out_edges.len() >= 2 {
                                 break Some(cand_idx);
-                            }
-                            if search_idx == 0 || hops >= FORK_SEARCH_HOPS {
-                                break None;
                             }
                             search_idx -= 1;
                             hops += 1;
                         };
                         let Some(pred_idx) = fork_pred_idx else {
-                            // No fork anywhere in the search window: this
-                            // node sits on a plain, unbranched chain, so
-                            // there is no competing arm whose vote could be
-                            // noise. Its own coverage + delete_count is the
-                            // *exact* count of reads that reached this exact
-                            // point -- every one of them either matched or
-                            // deleted it, both counted, neither implying a
-                            // fork. Using that as the local population
-                            // (instead of the global n_reads) correctly
-                            // covers reads that simply end here (partial
-                            // reads under semi-global alignment) *and* reads
-                            // that individually Delete through this one node
-                            // without creating a branch (Match and Delete
-                            // share the same edge, so one read quietly
-                            // skipping a base here is invisible to the fork
-                            // search above). Confirmed on RFC1 AAAAG hap2:
-                            // a single read deleting one G out of an
-                            // otherwise-unbranched run of matches dropped
-                            // that G from the consensus, merging two 4-A
-                            // units either side of it into one 8-A run --
-                            // not because of any bubble, but because
-                            // min_cov was still sized for reads that had
-                            // already ended much earlier in the graph.
-                            //
-                            // But an unforked, low-coverage run can *also*
-                            // be a genuine trailing (or leading) extension --
-                            // e.g. a minority of reads simply longer than
-                            // the rest, appended past where the majority's
-                            // own path ends, with nothing to "fork" from
-                            // because there is nothing downstream to
-                            // reconverge with. That case is a boundary tail,
-                            // not an interior dip, and boundary trim (using
-                            // the plain global check) already handles it
-                            // correctly on its own -- rescuing it here would
-                            // pull the minority's full extension back in.
-                            //
-                            // Distinguish the two the same way the fork
-                            // branch does: require self_total to itself
-                            // clear the *global* min_cov before trusting it
-                            // as the local population. In the genuine dip
-                            // case, self_total reflects the reads that are
-                            // still active -- a majority of them, since
-                            // nothing else in the graph competes for their
-                            // vote -- so it clears min_cov comfortably. In
-                            // the trailing-tail case, self_total reflects
-                            // only the minority of reads that happen to run
-                            // longer than the rest, which by definition
-                            // stays below min_cov. This is more robust than
-                            // scanning forward for a "recovery" node, which
-                            // a stray noisy read overlapping the tail can
-                            // trigger by coincidence.
-                            let self_total =
-                                self.nodes[node_idx].coverage + self.nodes[node_idx].delete_count;
-                            if self_total < min_cov {
-                                return false;
-                            }
-                            let self_min_cov = coverage_threshold(
-                                self_total as usize,
-                                self.config.min_coverage_fraction,
-                            );
-                            return self.nodes[node_idx].coverage >= self_min_cov;
+                            return self.nodes[node_idx].coverage > self.nodes[node_idx].delete_count;
                         };
                         let local_total: i32 = self.nodes[pred_idx]
                             .out_edges
                             .iter()
                             .map(|&(_, ew)| ew)
                             .sum();
-                        // Require the bubble's own local population to clear
-                        // the *global* min_cov before trusting a local
-                        // majority within it. Without this, a fork with only
-                        // a handful of reads left (because most reads
-                        // diverged onto other bubbles well before reaching
-                        // this point) can produce a "majority" -- e.g. 2 of
-                        // 3 -- that is really just noise from a heavily
-                        // fragmented region, not a real minority allele
-                        // being unfairly suppressed by the global threshold.
                         if (local_total.max(0) as u32) < min_cov {
                             return false;
                         }
@@ -2519,26 +2480,7 @@ impl PoaGraph {
                         );
                         self.nodes[node_idx].coverage as i32 >= local_min_cov as i32
                     })
-                    .collect();
-
-                let start = supported.iter().position(|&s| s).unwrap_or(0);
-                let end = supported
-                    .iter()
-                    .rposition(|&s| s)
-                    .map(|i| i + 1)
-                    .unwrap_or(path.len());
-
-                let (effective_path, effective_supported) = if start < end {
-                    (&path[start..end], &supported[start..end])
-                } else {
-                    (&path[..], &supported[..])
-                };
-
-                effective_path
-                    .iter()
-                    .zip(effective_supported.iter())
-                    .filter(|&(_, &s)| s)
-                    .map(|(&t, _)| t)
+                    .map(|i| path[i])
                     .collect()
             }
             ConsensusMode::MajorityFrequency => majority_frequency(&self.nodes, &topo, min_cov),

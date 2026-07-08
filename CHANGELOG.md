@@ -9,6 +9,55 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- **Interior filter simplified: two evidence axes instead of one threshold ladder.** Prompted
+  by `bench/compare_callers.py` surfacing a low-depth gap (`cag20_d05_r10`, depth 5) where
+  abPOA and SPOA both matched truth exactly and poa-consensus did not. Reading abPOA's
+  (`abpoa_heaviest_bundling`/`abpoa_most_frequent` in `abpoa_output.c`) and SPOA's
+  (`Graph::TraverseHeaviestBundle`/`GenerateConsensus` in `graph.cpp`) actual source showed
+  neither applies any absolute population floor to a DP-selected node at all -- our own
+  `increment_or_add_edge` call site confirmed Match and Delete increment the *same* edge
+  weight identically, so `heaviest_path`'s own DP score already conflates "many reads reached
+  this point" with "many reads support this exact base," and the interior filter had grown
+  into an increasingly complex ladder (global floor, then backward fork search, then a
+  self-total fallback with its own floor) trying to patch that conflation back apart after
+  the fact. Replaced with two independent, uniform tests, applied per spine node after a
+  boundary trim unchanged from before (an absolute `coverage >= min_cov` floor is still the
+  only way to distinguish a genuine interior dip from a trailing/leading minority extension,
+  since the latter has `delete_count == 0` too -- the rest of the population simply never
+  reaches that far under semi-global alignment, so a Match-vs-Delete comparison alone can't
+  tell the two apart):
+  1. **Match vs Delete** (does this exact base have more support than "skip it"): applies
+     when no fork (2+ out-edges) exists anywhere back along the node's unbranched run, all the
+     way to the trim boundary. In that case coverage and delete_count together are the exact,
+     complete count of reads that reached this point, so plain `coverage > delete_count` is
+     sufficient -- no population floor needed. This is the axis majority-delete fabrication
+     (Known Bugs #6, #9) and a false rescue of one (traced to DAB1 SCA37 seed=0 mid-implementation:
+     a node with cov=3, del=23 was wrongly kept by an edge-weight-based plurality check, because
+     edge weight counts Match and Delete traversals together) both come down to.
+  2. **This base vs a different base** (a real fork somewhere back along the run): needs the
+     fork's own coverage to clear a *majority* of the fork's local total, gated on that local
+     total itself clearing the global floor (Known Bug #7's fragmented-fork guard, unchanged).
+     A plurality-only relaxation of this axis was tried and reverted twice: once it wrongly
+     rescued a genuine 5-vs-5 near-tie in real RFC1 AAAAG data (fabricating an unsupported
+     extra base between two branches of the same fork), and once it wrongly rescued 10-of-14
+     reads' insertion arm against a clean 4-unit-majority CAT tandem-duplication test that had
+     been passing since before this session (the rejection at the fork's first node wasn't
+     propagating to the rest of that arm's unbranched chain, which is why the search below
+     walks the whole run rather than checking one hop back). Both attempts are left undone;
+     this axis is exactly the original fork-search + local-majority logic, just no longer
+     needing its own separate self-total branch.
+  Net effect on `bench/compare_callers.py`'s 16-scenario catalogue is unchanged (15/16 all
+  three callers agree, same as before this investigation) -- `cag20_d05_r10`'s gap is a
+  genuine plurality-vs-majority ambiguity at a fully-populated fork with no attrition, and no
+  per-node/per-fork threshold rule can resolve it without also breaking one of the two
+  already-tested cases above, which need the opposite resolution despite near-identical
+  surface structure. Documented as a known, accepted limitation rather than patched further.
+  Net code change: -58 lines (135 removed, 77 added) despite fixing DAB1 by a cleaner path and
+  finding + fixing the tandem-duplication regression along the way. All 184 lib tests plus the
+  full `tests/` suite pass with zero failures.
+
 ### Fixed
 
 - **Lookahead bubble-arm scoring biased toward the longer arm** -- the lookahead resolver
@@ -144,9 +193,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   allele. Restricted to single-allele scenarios: neither external tool has an equivalent to
   this crate's bubble-based multi-allele splitting, so a fair three-way comparison needs all
   three solving the same one-read-set-in-one-consensus-out problem. Setup: `pip install
-  pyabpoa pyspoa`. First full run against the existing scenario catalogue: 9/16 scenarios all
-  three callers agree, 3 where poa-consensus alone is correct, 4 where poa-consensus disagrees
-  with both external callers (logged in `TODO.md` under Deferred for follow-up).
+  pyabpoa pyspoa`. Scoring went through two broken extraction-based attempts before landing on
+  `fitting_edit_distance()` (semi-global alignment of the truth allele against the full
+  consensus, no extraction step at all) -- see `TODO.md` Deferred for why both extraction
+  approaches failed on this benchmark's synthetic data. Full run against the existing scenario
+  catalogue with the fitting-alignment metric: 15/16 scenarios agree across all three callers;
+  one genuine disagreement remains at the lowest-depth scenario (`cag20_d05_r10`, depth 5),
+  logged in `TODO.md` under Deferred for follow-up.
 
 ---
 

@@ -42,6 +42,34 @@ from typing import Optional
 
 import validate as v
 
+
+def fitting_edit_distance(query: bytes, target: bytes) -> int:
+    """Minimum edit distance to align all of `query` against some substring of `target`.
+
+    Standard "fitting" alignment: free leading/trailing gaps in `target`, but
+    `query` must be fully consumed. This deliberately avoids any extraction
+    heuristic (locating flank anchors, clustering literal repeat-unit matches)
+    -- both were tried here and both have real failure modes on this benchmark's
+    synthetic data: anchor extraction can lock onto the wrong occurrence of a
+    k-mer when the flank is itself periodic (as this benchmark's flanks are, by
+    design, to keep the flank free of the repeat unit); literal-unit clustering
+    discards an entire side of the repeat when a single small indel disrupts the
+    reading frame partway through. Fitting alignment sidesteps both: it just asks
+    "how close is the best-matching region of the caller's output to the known
+    truth allele," with no assumption about where that region starts or ends.
+    """
+    n, m = len(query), len(target)
+    prev = [0] * (m + 1)
+    for i in range(1, n + 1):
+        cur = [i] + [0] * m
+        qi = query[i - 1]
+        for j in range(1, m + 1):
+            cost = 0 if qi == target[j - 1] else 1
+            cur[j] = min(prev[j - 1] + cost, prev[j] + 1, cur[j - 1] + 1)
+        prev = cur
+    return min(prev)
+
+
 # ── External caller wrappers ─────────────────────────────────────────────────
 # Both run in semi-global mode to match this crate's own documented default
 # recommendation for extracted STR reads (see CLAUDE.md "Alignment Mode").
@@ -79,25 +107,27 @@ CALLERS = [
 def evaluate_caller(caller: str, cons_bytes: Optional[bytes], truth: "v.Allele") -> dict:
     """Score one caller's consensus against the known truth allele.
 
-    Mirrors the single-allele branch of validate.evaluate(), trimmed to just
-    the fields needed for a side-by-side comparison row.
+    Scores by `fitting_edit_distance()` against the FULL consensus -- no
+    extraction step at all. Two extraction-based approaches were tried and
+    both broke on this benchmark's synthetic data: literal repeat-unit
+    clustering discards an entire side of the repeat when one small indel
+    disrupts the reading frame partway through; anchor-based flank extraction
+    can lock onto the wrong occurrence of its k-mer because the flank is
+    itself periodic. `units_found` (via literal clustering) is kept purely as
+    an informational display field -- it can still misreport on a disrupted
+    repeat, so don't trust it over `edit_dist` for the pass/fail call.
     """
     if cons_bytes is None:
         return {"caller": caller, "status": "N/A", "units_found": None, "delta_units": None}
 
-    extracted = v.extract_allele_by_unit(cons_bytes, truth.unit)
-    if extracted is None:
-        return {
-            "caller": caller, "status": "FAIL (no anchor)",
-            "units_found": 0, "delta_units": -truth.count, "edit_dist": None,
-        }
-
-    units_found = v.count_repeat(extracted, truth.unit)
-    delta = units_found - truth.count
-    edit = v.levenshtein(extracted.upper(), truth.seq.upper().encode())
-    unit_tol = max(1, truth.count // 50)
+    edit = fitting_edit_distance(truth.seq.upper().encode(), cons_bytes.upper())
     edit_tol = max(3, len(truth.seq) // 25)
-    ok = abs(delta) <= unit_tol and edit <= edit_tol
+    ok = edit <= edit_tol
+
+    cluster = v.extract_allele_by_unit(cons_bytes, truth.unit)
+    units_found = v.count_repeat(cluster, truth.unit) if cluster else 0
+    delta = units_found - truth.count
+
     return {
         "caller": caller,
         "status": "OK" if ok else "FAIL",
@@ -112,7 +142,7 @@ def cell(r: dict) -> str:
         return "N/A (not installed)"
     if r["units_found"] is None:
         return r["status"]
-    return f"{r['units_found']:>4} (Δ{r['delta_units']:+d})  {r['status']}"
+    return f"units={r['units_found']:>3}(Δ{r['delta_units']:+d}) edit={r['edit_dist']:>2}  {r['status']}"
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -150,9 +180,9 @@ def main():
     print(f"  orthogonal consensus-caller comparison  ({len(to_run)} scenarios; "
           f"{len(skipped_multi)} multi-allele scenarios not applicable, skipped: {', '.join(skipped_multi)})")
     print(f"{'='*100}")
-    header = f"  {'SCENARIO':<28} {'MODEL':<9} {'TRUTH':<6} {'poa-consensus':<24} {'abPOA':<24} {'SPOA':<24}"
+    header = f"  {'SCENARIO':<28} {'MODEL':<9} {'TRUTH':<6} {'poa-consensus':<30} {'abPOA':<30} {'SPOA':<30}"
     print(header)
-    print(f"  {'-'*28} {'-'*9} {'-'*5} {'-'*24} {'-'*24} {'-'*24}")
+    print(f"  {'-'*28} {'-'*9} {'-'*5} {'-'*30} {'-'*30} {'-'*30}")
 
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -207,7 +237,7 @@ def main():
 
         alleles_str = f"{truth.unit}×{truth.count}"
         print(f"  {scenario.name:<28} {scenario.model:<9} {alleles_str:<6} "
-              f"{cell(results[0]):<24} {cell(results[1]):<24} {cell(results[2]):<24}")
+              f"{cell(results[0]):<30} {cell(results[1]):<30} {cell(results[2]):<30}")
 
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
