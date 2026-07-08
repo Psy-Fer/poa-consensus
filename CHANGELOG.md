@@ -80,6 +80,37 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   additionally requiring the bubble's local population (`pred`'s total out-edge weight) to clear
   the *global* `min_cov` before trusting a local majority within it. Regression test:
   `diag_rfc1_aaaag_spurious_g_interrupt_local_rescue_noise` (sweeps all 10 possible seeds).
+- **Local-dominance rescue only checked the *immediate* predecessor for a fork, missing the
+  case one hop downstream of an already-rescued node** -- confirmed on RFC1 `AAAAG`, HG002
+  real data, hap2: a read set with 4 full-length spanning reads plus 2 short partial reads that
+  only cover the first ~55-60bp. Once the 2 partial reads' alignments ended (a legitimate
+  termination under semi-global mode, not a bubble), `n_reads` stayed pinned at 6 for the
+  *global* `min_cov`, even though only 4 reads structurally reach deeper positions. A node
+  immediately downstream of an already-rescued fork -- whose own predecessor has only one
+  out-edge, i.e. isn't itself a fork -- always fell through to the global check and got dropped
+  purely because some reads elsewhere in the graph ended earlier, even when it was the clear
+  majority (3 of the 4 still-active reads). Fixed by walking backward (bounded to 64 hops) to
+  find the nearest real fork rather than requiring the immediate predecessor to be one, so a
+  rescued node's own single-successor chain inherits its fork's population instead of being
+  judged against the global read count. Regression test:
+  `diag_rfc1_leading_interrupt_partial_read_population_accounting` (checks the region confirmed
+  fully explained by population accounting via a 4-full-reads-only control).
+  **Known residual** (not fixed by the above, different root cause): the same read set has a
+  second, separate class of fabrication further into the repeat -- confirmed by re-running with
+  only the 4 full-length reads, which produces a clean consensus, isolating the cause to
+  something that happens when the 2 short reads are also present, but *not* explainable by
+  population accounting: the affected nodes show unanimous, fork-free `coverage == n_reads`
+  support, yet a per-read regex check shows only one of the 4 individual full-length reads
+  actually contains the exact base run appearing in the consensus at that position. This is the
+  already-documented, already-hard "silent wrong alignment in repetitive regions" class (Known
+  Bug #3/#4 in CLAUDE.md): in a periodic `AAAAG` run, a minority read's private insertion can
+  absorb Match support from *other* reads' independent re-alignment against the evolving graph,
+  since matching any `A` to any `A` node scores identically. Not addressed by this fix; the
+  project's documented long-term direction (flanking-anchor pre-processing) is the intended fix,
+  not further interior-filter tuning. Also surfaced a pre-existing, unrelated issue while testing
+  this data: using one of the two short partial reads as the seed produces `TruncationRetry`
+  with `recovered: false` and an empty consensus (confirmed present before this session's
+  changes too); not investigated further here.
 
 ---
 
