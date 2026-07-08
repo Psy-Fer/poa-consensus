@@ -32,6 +32,7 @@ design/
 ref/
 test_plots/
 bench/work/
+bench/work*/
 *.pyc
 
 # mdBook build output
