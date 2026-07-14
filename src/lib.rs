@@ -427,7 +427,7 @@ pub fn consensus_multi(
 /// | Condition | Pass-2 action |
 /// |---|---|
 /// | 1-3 bubbles, minority arm ≥ `min_allele_freq × n` | `consensus_multi` on pass-1 graph |
-/// | Consensus < 60% of median input read length (banded only) | Retry with `band_width = 0` |
+/// | Consensus < 60% of median input read length (banded, median ≤ 5000 bp) | Retry with `band_width = 0` |
 /// | `single_support_fraction > 0.3` | Tighten `min_coverage_fraction` to ≥ 0.6, rebuild |
 /// | Coverage CV > 1.5 and mode is `Global` | Switch to `SemiGlobal`, rebuild |
 /// | Otherwise | Return pass-1 single consensus; no rebuild |
@@ -444,8 +444,12 @@ pub fn consensus_multi(
 /// shorter diagonal without approaching the band edge, producing a truncated
 /// consensus with no error.  `consensus_adaptive` detects this by comparing the
 /// pass-1 consensus length to the median input read length.  If the ratio is
-/// below 0.60, it retries with unbanded alignment (`band_width = 0`), which
-/// forces the traceback to reach the correct endpoint.
+/// below 0.60 and the median read length is at most 5000 bp, it retries with
+/// unbanded alignment (`band_width = 0`), which forces the traceback to reach
+/// the correct endpoint.  `band_width = 0` is genuinely O(read_len ×
+/// graph_len) DP (see `PoaConfig::band_width`), so the retry is capped to
+/// 5000 bp median read length -- the same cap the CLI's own truncation retry
+/// uses -- rather than unconditionally retrying on arbitrarily long reads.
 pub fn consensus_adaptive(
     reads: &[&[u8]],
     seed_idx: usize,
@@ -482,10 +486,19 @@ pub fn consensus_adaptive(
     // degenerate scoring landscape in highly repetitive sequence means the band
     // can snap to an off-by-N×period diagonal without approaching the edge).
     // Unbanded forces the traceback to terminate at the correct graph endpoint.
+    //
+    // band_width=0 (paired with adaptive_band=false below) is genuinely
+    // unbanded O(read_len * graph_len) DP, so the retry is gated on read length
+    // the same way the CLI gates its own truncation retry: above 5000 bp the
+    // memory/time cost is no longer a safe unconditional fallback, so this
+    // returns the (still truncated) pass-1 result rather than retrying.
     let was_banded = config.band_width > 0 || config.adaptive_band;
     if was_banded {
         let median_len = c1.graph_stats.median_input_read_len;
-        if median_len > 0 && (c1.sequence.len() as f64) < 0.6 * median_len as f64 {
+        if median_len > 0
+            && median_len <= 5_000
+            && (c1.sequence.len() as f64) < 0.6 * median_len as f64
+        {
             let mut cfg2 = config.clone();
             cfg2.band_width = 0;
             cfg2.adaptive_band = false;

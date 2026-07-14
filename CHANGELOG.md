@@ -9,6 +9,35 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **`PoaConfig::band_width = 0` was not actually unbanded.** Documented as "unbanded
+  (full NW over DAG)", but `align()`'s spine-margin computation silently fell back to
+  a fixed 50-column window whenever `band_width = 0` and `adaptive_band = false` --
+  identical in practice to `band_width = 50`. There was no way to reach the documented
+  correctness-baseline behavior through the public API. Found while investigating a
+  long-VNTR locus (multi-kb reads, tens-of-bp repeat unit) where the CLI default
+  (banded, adaptive on) silently fabricated an extra copy of the repeat unit beyond
+  what any input read, abPOA, or SPOA supported on the same reads (a concrete instance
+  of the already-documented "silent wrong alignment on narrow band in repetitive
+  regions" failure mode: the adaptive formula's band at this read length was just
+  wide enough to reach an adjacent, equally-scoring but wrong repeat-phase diagonal,
+  while the ~50-wide fallback "unbanded" was actually using was not). `align()`'s
+  spine margin now uses the full query length when `band_width = 0` and
+  `adaptive_band = false`, matching the documented O(read_len × graph_len) cost and
+  recovering the correct repeat count when explicitly requested via
+  `--band-width 0 --no-adaptive-band` (the CLI *default* banded behavior on this class
+  of locus is unchanged and is tracked separately). `PoaConfig::warn_on_long_unbanded`
+  -- documented but never actually checked anywhere -- is now wired up: `align()`
+  emits a stderr warning once per read when unbanded DP runs on a read over 1 kb,
+  since this is now genuinely expensive rather than silently cheap.
+  `consensus_adaptive`'s truncation-retry (which rebuilds with `band_width = 0` when
+  the pass-1 consensus looks truncated) gained the same `median_read_len ≤ 5000` cap
+  the CLI's own truncation retry already had, so it can no longer trigger an
+  unbounded-cost rebuild on long reads now that the retry's fallback is real.
+  Regression: `tests/band_width_zero_unbanded.rs` (synthetic fixture; no real patient
+  data).
+
 ## [0.2.1] - 2026-07-08
 
 ### Fixed

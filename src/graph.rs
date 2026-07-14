@@ -817,11 +817,6 @@ fn anchor_refine_spine(
 
 // ─── Bubble-aware DP alignment ────────────────────────────────────────────────
 
-/// Half-width of the DP band applied to spine (non-bubble) nodes.
-/// Minimum SPINE_MARGIN when nothing else constrains it (no band specified).
-/// Covers ±SPINE_MARGIN_MIN query positions for unbanded or wide-band configs.
-const SPINE_MARGIN_MIN: usize = 50;
-
 /// Align `query` against the graph using spine-guided affine-gap DAG DP.
 ///
 /// **Diagonal skip** — O(1) fast path for consecutive exact matches along the
@@ -880,6 +875,20 @@ fn align(
     scratch.clear();
     let n = topo.len();
     let l = query.len();
+
+    // band_width=0 with adaptive_band=false is genuinely unbanded (O(V*L) DP,
+    // see spine_margin below) -- warn once per call on long reads so callers
+    // aren't surprised by the memory/time cost.  Never blocks the call; set
+    // PoaConfig::warn_on_long_unbanded = false to suppress.
+    if cfg.warn_on_long_unbanded && cfg.band_width == 0 && !cfg.adaptive_band && l > 1000 {
+        eprintln!(
+            "poa-consensus: warning: unbanded alignment (band_width=0, \
+             adaptive_band=false) on a {l} bp read -- this scales as \
+             O(read_len * graph_len); consider a banded or adaptive PoaConfig \
+             for large graphs, or set warn_on_long_unbanded=false to suppress"
+        );
+    }
+
     let go = cfg.gap_open;
     let ge = cfg.gap_extend;
     let semi = cfg.alignment_mode == AlignmentMode::SemiGlobal;
@@ -911,8 +920,13 @@ fn align(
 
     // Spine margin: matches the DP band width so memory usage scales with the
     // configured band rather than always allocating SPINE_MARGIN_MIN columns.
-    // Uses the same adaptive formula as main (b + f*L), floored at SPINE_MARGIN_MIN
-    // only when band_width=0 and adaptive_band=false (unbanded / no guidance).
+    // Uses the same adaptive formula as main (b + f*L).  band_width=0 with
+    // adaptive_band=false is the documented "unbanded / full NW over DAG" case
+    // (see PoaConfig::band_width): spine_margin is set to the full query length
+    // so row_width below covers [1, l] for every row, with no artificial cap.
+    // This is deliberately expensive at long read lengths (see CLAUDE.md scale
+    // table) -- callers who explicitly ask for unbanded get real O(V*L) DP, not
+    // a silently narrow fallback band.
     let spine_margin: usize = if cfg.adaptive_band {
         let w = cfg.adaptive_band_b + (cfg.adaptive_band_f * l as f32).ceil() as usize;
         let w = if cfg.band_width > 0 {
@@ -924,7 +938,7 @@ fn align(
     } else if cfg.band_width > 0 {
         cfg.band_width
     } else {
-        SPINE_MARGIN_MIN
+        l
     };
 
     // Banded DP tables.  Each row stores j = j_lo_arr[t]..=j_hi_arr[t] (j >= 1).
