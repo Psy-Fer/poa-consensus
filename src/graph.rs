@@ -1116,6 +1116,33 @@ fn align(
                                             for &(s, _) in &nodes[node_idx].out_edges {
                                                 if s != ss && !lookahead_skip[s] {
                                                     lookahead_skip[s] = true;
+                                                    // Walk the rest of this losing arm, not
+                                                    // just its first node: a multi-node
+                                                    // insertion (e.g. a 2+ base indel) left
+                                                    // every node past the first one neither
+                                                    // on-spine nor marked, so it fell through
+                                                    // to real windowed DP on every subsequent
+                                                    // read, and -- worse -- kept the arm's
+                                                    // reconvergence node's active_pred_ok
+                                                    // check failing (it's still a live,
+                                                    // unresolved in-edge), forcing the entire
+                                                    // rest of that read into full DP too.
+                                                    // Stops at the spine (correct
+                                                    // reconvergence) or a further branch
+                                                    // (left to its own resolution).
+                                                    let mut cur = s;
+                                                    for _ in 0..ARM_MAX_DEPTH {
+                                                        match nodes[cur].out_edges.as_slice() {
+                                                            [(next, _)]
+                                                                if !on_spine[*next]
+                                                                    && !lookahead_skip[*next] =>
+                                                            {
+                                                                lookahead_skip[*next] = true;
+                                                                cur = *next;
+                                                            }
+                                                            _ => break,
+                                                        }
+                                                    }
                                                 }
                                             }
                                             true

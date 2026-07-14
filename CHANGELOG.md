@@ -11,6 +11,24 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Diagonal-skip bubble pre-resolve only marked a losing arm's first node as a dead
+  end, not the rest of the arm.** When the fast spine-diagonal-skip resolves a fork
+  (e.g. a read-supported substitution or short indel creating an alternate node),
+  it marks the losing arm's nodes as safe to bypass on future reads. For a 1-node
+  arm (a plain substitution) this is the whole arm, so it worked correctly. For a
+  2+-node arm (e.g. a 1bp insertion, which creates a two-node detour before
+  rejoining the spine), only the arm's first node was ever marked -- every node
+  past it was left neither on-spine nor marked, so it silently fell through to a
+  real windowed DP computation on every subsequent read, forever, for a branch that
+  read will never take. Worse, the arm's reconvergence node kept seeing an
+  unresolved incoming edge from the dangling remainder, which failed its own
+  fast-path eligibility check and forced every position for the rest of that read
+  into full DP too, even when nothing about the rest of the read was ambiguous.
+  Fixed by walking the entire losing arm (stopping at the spine or a further
+  branch) instead of just its first node, matching what the separate, more
+  expensive slide-and-lock bubble resolver already does via `collect_arm_nodes`.
+  Regression: `multi_node_minority_arm_fully_marked_as_dead_end`.
+
 - **`PoaConfig::band_width = 0` was not actually unbanded.** Documented as "unbanded
   (full NW over DAG)", but `align()`'s spine-margin computation silently fell back to
   a fixed 50-column window whenever `band_width = 0` and `adaptive_band = false` --

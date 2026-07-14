@@ -2703,6 +2703,62 @@ fn diagonal_skip_rate_increases_with_read_count() {
     );
 }
 
+/// A 2+-node minority arm (here: one read with a 1bp insertion, creating a
+/// 2-node detour before rejoining the spine) must be fully marked as a dead
+/// end, not just its first node.
+///
+/// The diagonal skip's bubble pre-resolve only ever marked a losing arm's
+/// *first* node as resolved. A 1-node arm (e.g. a plain substitution) is
+/// therefore fully handled, but a longer arm left every node past the first
+/// neither on-spine nor marked -- so a later, perfectly clean read fell
+/// through to real windowed DP for that node, and (worse) the arm's
+/// reconvergence node kept seeing an unresolved incoming edge from the
+/// dangling remainder, forcing every position for the rest of that read into
+/// full DP too, even though nothing about the rest of the read was ambiguous.
+#[test]
+fn multi_node_minority_arm_fully_marked_as_dead_end() {
+    use crate::graph::{reset_skip_counters, skip_rate};
+
+    let reads: Vec<Vec<u8>> = vec![
+        b("ACTGGATCGATATGCGATTCAGTCGA").to_vec(),
+        b("ACTGGATCGATATGCGATTCAGTCGA").to_vec(),
+        b("ACTGGATCGATATGCGATTCAGTCGA").to_vec(),
+        b("ACTGGATCGATATGCGATTCAGTCGA").to_vec(),
+        b("ACCGGATCGATATGCGATTCAGTCGA").to_vec(), // T->C substitution (1-node arm)
+        b("ACAGGATCGATATGCGATTCAGTCGA").to_vec(), // T->A substitution (1-node arm)
+        b("ACGGGATCGATATGCGATTCAGTCGA").to_vec(), // T->G substitution (1-node arm)
+        b("ACGGATCGATATGCGATTCAGTCGA").to_vec(),  // T deletion
+        b("ACTTGGATCGATATGCGATTCAGTCGA").to_vec(), // extra T insertion (2-node arm)
+        b("ACTGGATCGATATGCGATTCAGTCGA").to_vec(), // back to the plain sequence
+    ];
+
+    let cfg = PoaConfig {
+        band_width: 50,
+        adaptive_band: true,
+        min_reads: 2,
+        alignment_mode: AlignmentMode::SemiGlobal,
+        ..Default::default()
+    };
+    let mut graph = PoaGraph::new(&reads[0], cfg).unwrap();
+    let mut last_rate = 0.0;
+    for read in &reads[1..] {
+        reset_skip_counters();
+        graph.add_read(read).unwrap();
+        last_rate = skip_rate();
+    }
+
+    // The final read is byte-identical to the seed and has no divergence of
+    // its own; it should skip almost entirely, same as the earlier clean
+    // repeats of this sequence (reads 3-4 above hit ~96%).
+    assert!(
+        last_rate > 0.9,
+        "a clean read following a multi-node minority arm should skip nearly \
+         entirely; got {:.1}% (this fails if only an arm's first node gets \
+         marked as a dead end instead of the whole arm)",
+        last_rate * 100.0,
+    );
+}
+
 /// Stale-spine correctness: building a graph with the adaptive stale-spine
 /// policy must produce the same consensus as always recomputing.
 ///
