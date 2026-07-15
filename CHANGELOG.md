@@ -11,6 +11,77 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`heaviest_path` conflated Match and Delete traversal when scoring the consensus
+  spine, letting a node reached mostly by reads *skipping past it* out-compete a
+  genuinely Match-confirmed alternative arm at the same fork.** `Node.out_edges`
+  stored a single `i32` weight incremented identically by `Match` and `Delete`
+  (`increment_or_add_edge` didn't distinguish them), and only node-level
+  `coverage`/`delete_count` preserved any Match/Delete split -- as an aggregate
+  across *all* of a node's in-edges, losing which specific edge deserved the
+  credit. Confirmed on real RFC1 CANVAS data during an architectural audit
+  (`design/graph_data_model_rework.md`): nodes reached by one pure-delete in-edge
+  and one pure-match in-edge to the same target are not a hypothetical, e.g.
+  `(1253, 0 match, 3 delete)` vs. `(2480, 1 match, 0 delete)` both feeding node
+  1254. `Node.out_edges` is now `Vec<(usize, EdgeWeight)>` with
+  `EdgeWeight { matched: i32, deleted: i32 }` (`Insert`'s founding traversal is
+  accounting-identical to a `Match`, so no third bucket is needed); every consumer
+  the type change touched got an explicit, documented projection decision rather
+  than a blanket behavior change -- `heaviest_path` and the multi-allele bubble
+  gates (`find_bubbles`, `find_structural_bubbles`) now score on `matched` only,
+  while `GraphStats`, the interior filter (Known Bugs #6-#10), and the public
+  diagnostic/visualization APIs (`edge_weights()`, `node_out_edge_info()`,
+  `graph_topology()`'s `GraphEdgeInfo.weight`, `bubble_arm_lengths()`) are
+  unchanged, still reading total (matched + deleted) weight, deferred to a later
+  pass. Matched-only scoring alone was *necessary but not sufficient*: it
+  correctly favors the better-evidenced arm at the fork itself, but that local
+  advantage can be exactly cancelled at the arms' reconvergence point, because
+  reads that Delete through the weak node still genuinely Match whatever follows
+  it, and that next edge's own matched weight is real and gets summed in
+  regardless -- confirmed by hand on the regression case below, where both arms'
+  cumulative scores tied exactly (6 = 6) without an additional fix. Closed by
+  also penalizing forward propagation, once per node on the path, by however much
+  a node's own `delete_count` exceeds its `coverage` (zero, and so a no-op, for
+  the vast majority of ordinary Match-dominant nodes) -- mirroring the interior
+  filter's own `coverage > delete_count` philosophy, applied earlier, at
+  spine-construction time, rather than only at final-consensus time. Regression:
+  `heaviest_path_prefers_matched_over_delete_inflated_arm` (a forced case with
+  non-repetitive flanks so semi-global's free boundary gap can't explain the
+  length deficit for free: 6 reads with a true deletion allele vs. 4 reads with a
+  true SNP allele at the same position). `edge_weight()` (the separate, live
+  `align()` M/D-state DP tie-break) was A/B tested both ways against the full
+  suite and `bench/validate.py`; neither discriminated, so it stays on total
+  weight pending future evidence. Full data-model audit and phased rollout plan
+  in `design/graph_data_model_rework.md`; this is Phase 1 of that plan.
+
+- **Multi-allele phasing (`partition_reads_by_bubble`, `phasing_groups`) and
+  `BubbleSite.arm_read_counts` inherited the same Match/Delete conflation as
+  `heaviest_path` (Phase 1 above), via `PoaGraph.edge_reads`.** `edge_reads`
+  recorded read membership for *any* traversal of an edge -- Match, founding
+  Insert, or Delete -- with no way to tell them apart, so a read that merely
+  deleted through a bubble arm's starting node (skipped it, confirming nothing)
+  was indistinguishable from a read that genuinely matched that arm. Both
+  `partition_reads_by_bubble` (SNP-bubble allele splitting) and `phasing_groups`
+  (structural-bubble cross-compatibility grouping) build each read's per-bubble
+  arm signature straight from `edge_reads`, so both inherited the blindness;
+  `collect_bubble_sites` reads the same map to populate `BubbleSite.arm_read_counts`.
+  `PoaGraph.edge_reads` now records only genuine confirmations (Match, or the
+  founding Insert); Delete traversals go into a new, separate
+  `edge_delete_reads` map instead -- two parallel maps mirroring the existing
+  `coverage`/`delete_count` idiom, rather than one map with a tagged value, so
+  every existing call site that reads `edge_reads` for "which reads support this
+  arm" gets the corrected meaning with no signature change. Regression:
+  `partition_reads_by_bubble_excludes_delete_only_reads` (a forced near-tied
+  SNP bubble -- 4 reads confirming each of two arms -- plus one more read
+  missing the contested base entirely; before this fix that read was wrongly
+  attributed to the arm it deleted through instead of correctly falling
+  through as unassigned and folding into the larger group) and
+  `bubble_site_arm_read_counts_excludes_delete_only_reads` (same setup,
+  confirming `arm_read_counts` no longer counts that read towards either arm).
+  Phase 2 of the plan in `design/graph_data_model_rework.md`; Phase 1's
+  deferral list (`find_bubbles`/`find_structural_bubbles` weight threshold,
+  `GraphStats`, the interior filter, the public diagnostic/visualization APIs)
+  is unchanged by this pass.
+
 - **Diagonal-skip bubble pre-resolve only marked a losing arm's first node as a dead
   end, not the rest of the arm.** When the fast spine-diagonal-skip resolves a fork
   (e.g. a read-supported substitution or short indel creating an alternate node),
@@ -55,6 +126,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   unbounded-cost rebuild on long reads now that the retry's fallback is real.
   Regression: `tests/band_width_zero_unbanded.rs` (synthetic fixture; no real patient
   data).
+
+### Breaking
+
+- **`BubbleSite.arm_read_counts` now counts only reads that genuinely confirmed
+  an arm (Match, or the founding Insert), not reads that merely deleted through
+  its entry node.** The field's type is unchanged (`Vec<u32>`), but its value
+  can differ from earlier versions for any bubble where a read skipped past an
+  arm's starting node without confirming it -- such a read no longer inflates
+  that arm's count. Counting only genuine confirmations is the corrected
+  behavior (see the Match/Delete conflation entry under Fixed above); callers
+  relying on the old "any traversal" semantics, e.g. to sum `arm_read_counts`
+  as a proxy for total depth at a bubble, should account for the reduced
+  counts.
 
 ## [0.2.1] - 2026-07-08
 

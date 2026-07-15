@@ -1453,6 +1453,272 @@ fn semi_global_spanning_read_matches_global() {
     );
 }
 
+// ── heaviest_path: Match/Delete edge-weight conflation ───────────────────────
+//
+// `Node.out_edges` used to store one conflated `i32` weight incremented
+// identically by Match and Delete traversals (see `increment_or_add_edge`),
+// and `heaviest_path`'s cumulative-weight DP summed that raw total. A node
+// reached mostly by Delete (reads that skip past it, confirming nothing
+// about its base) could therefore out-compete a genuinely Match-confirmed
+// alternative arm at the same fork, purely on raw traffic. Confirmed on real
+// RFC1 CANVAS data during the architectural audit (see
+// design/graph_data_model_rework.md); this test is the minimal, permanent,
+// forced reproduction of that same mechanism.
+#[test]
+fn heaviest_path_prefers_matched_over_delete_inflated_arm() {
+    // Non-repetitive flanks: semi-global's free leading/trailing gap can't
+    // "explain away" the length deficit of the deletion allele by shifting
+    // a homopolymer-adjacent frame for free (that alternative alignment
+    // would incur many mismatches against this flank), so the aligner is
+    // forced to represent the deletion allele's reads as a genuine interior
+    // Delete rather than a boundary-shift mismatch.
+    let left = b"ACGTGCAT";
+    let right = b"TACGATCG";
+    let mut seed = Vec::new();
+    seed.extend_from_slice(left);
+    seed.push(b'G'); // "reference" base at the contested position
+    seed.extend_from_slice(right);
+
+    let mut del_read = Vec::new(); // true deletion allele: missing the middle base
+    del_read.extend_from_slice(left);
+    del_read.extend_from_slice(right);
+
+    let mut snp_read = Vec::new(); // true SNP allele: G -> C at the same position
+    snp_read.extend_from_slice(left);
+    snp_read.push(b'C');
+    snp_read.extend_from_slice(right);
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        band_width: 0,
+        adaptive_band: false,
+        warn_on_long_unbanded: false,
+        ..Default::default()
+    };
+    let mut g = PoaGraph::new(&seed, cfg).unwrap();
+    // 6 reads: true deletion allele -- should register as genuine interior
+    // Delete ops against the seed's 'G' node, not as Match.
+    for _ in 0..6 {
+        g.add_read(&del_read).unwrap();
+    }
+    // 4 reads: true SNP allele -- genuine Match confirmation of a 'C' node.
+    for _ in 0..4 {
+        g.add_read(&snp_read).unwrap();
+    }
+
+    let topo = g.graph_topology();
+    let g_node = topo
+        .nodes
+        .iter()
+        .find(|n| n.base == b'G' && n.coverage == 1 && n.delete_count == 6)
+        .expect("expected the reference 'G' node with cov=1, delete_count=6 (6 genuine interior deletes)");
+    let c_node = topo
+        .nodes
+        .iter()
+        .find(|n| n.base == b'C' && n.coverage == 4 && n.delete_count == 0)
+        .expect("expected the SNP 'C' node with cov=4, delete_count=0 (4 genuine matches)");
+
+    // Sanity: confirm the setup itself is what it claims to be before
+    // asserting anything about which one heaviest_path picked. If this
+    // fails, the *test* is wrong (e.g. the aligner took a different path
+    // than the forced-delete design assumes), not the fix.
+    assert_eq!(
+        g_node.coverage, 1,
+        "'G' should have only the seed's own match"
+    );
+    assert_eq!(
+        g_node.delete_count, 6,
+        "'G' should be deleted-through by all 6 deletion-allele reads"
+    );
+    assert_eq!(
+        c_node.coverage, 4,
+        "'C' should be matched by all 4 SNP-allele reads"
+    );
+    assert_eq!(c_node.delete_count, 0, "'C' is never deleted through");
+
+    let spine_ranks: std::collections::HashSet<usize> = topo.spine_ranks.iter().copied().collect();
+    assert!(
+        spine_ranks.contains(&c_node.topo_rank),
+        "heaviest_path should select the genuinely Match-confirmed 'C' node (4 real \
+         confirmations) over the Delete-inflated 'G' node (1 real confirmation, 6 skips) -- \
+         it did not, meaning delete traffic is still winning the routing decision"
+    );
+    assert!(
+        !spine_ranks.contains(&g_node.topo_rank),
+        "'G' -- confirmed by only the seed itself, with 6 reads skipping past it -- \
+         should not be on the heaviest-path spine ahead of the better-evidenced 'C'"
+    );
+}
+
+// ── edge_reads: Match/Delete traversal-type split (Phase 2) ─────────────────
+//
+// `PoaGraph.edge_reads` used to record read membership for ANY traversal type
+// (Match, founding Insert, or Delete) with no distinction -- so a read that
+// merely deleted through a bubble arm's starting node (skipped it, confirming
+// nothing) was indistinguishable from a read that genuinely matched that arm.
+// `partition_reads_by_bubble`, `phasing_groups`, and `BubbleSite.arm_read_counts`
+// all read `edge_reads` to decide "which reads support which arm" -- so all
+// three inherited the same blindness. Delete traversals now go into a separate
+// `edge_delete_reads` map instead (see design/graph_data_model_rework.md Phase 2).
+//
+// Both tests below share the same forced setup: non-repetitive flanks (so
+// semi-global's free boundary gap can't explain the length deficit for free,
+// forcing a genuine interior Delete -- see the Phase 1 regression test for the
+// same technique), a SNP-style 1-node bubble (G vs C) with the two arms' raw
+// read counts deliberately near-tied (3 `g_read`s + the seed's own base = 4
+// total for G; 4 `c_read`s = 4 total for C) before adding one more read that
+// is missing the contested base entirely. Read indices: seed=0, g_reads=1-3,
+// c_reads=4-7, the deletion read=8.
+
+fn phase2_bubble_setup() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let left = b"ACGTGCAT";
+    let right = b"TACGATCG";
+    let mut seed = Vec::new();
+    seed.extend_from_slice(left);
+    seed.push(b'G'); // "reference" base at the contested position
+    seed.extend_from_slice(right);
+
+    let mut g_read = Vec::new();
+    g_read.extend_from_slice(left);
+    g_read.push(b'G');
+    g_read.extend_from_slice(right);
+
+    let mut c_read = Vec::new();
+    c_read.extend_from_slice(left);
+    c_read.push(b'C'); // true SNP allele
+    c_read.extend_from_slice(right);
+
+    let mut del_read = Vec::new(); // missing the contested base entirely
+    del_read.extend_from_slice(left);
+    del_read.extend_from_slice(right);
+
+    (seed, g_read, c_read, del_read)
+}
+
+fn phase2_bubble_graph() -> PoaGraph {
+    let (seed, g_read, c_read, del_read) = phase2_bubble_setup();
+    let cfg = PoaConfig {
+        min_reads: 3,
+        min_allele_freq: 0.2,
+        band_width: 0,
+        adaptive_band: false,
+        warn_on_long_unbanded: false,
+        ..Default::default()
+    };
+    let mut g = PoaGraph::new(&seed, cfg).unwrap();
+    for _ in 0..3 {
+        g.add_read(&g_read).unwrap();
+    }
+    for _ in 0..4 {
+        g.add_read(&c_read).unwrap();
+    }
+    g.add_read(&del_read).unwrap();
+    g
+}
+
+/// `partition_reads_by_bubble` / `phasing_groups` (exercised here via
+/// `consensus_multi`) must not attribute a read to an arm it merely deleted
+/// through -- only reads that genuinely confirmed an arm's base should
+/// determine group membership.
+#[test]
+fn partition_reads_by_bubble_excludes_delete_only_reads() {
+    let g = phase2_bubble_graph();
+
+    // Sanity: confirm the setup produced the fork shape this test assumes,
+    // before asserting anything about the fix. If this fails, the *test* is
+    // wrong (e.g. the aligner didn't force a genuine interior Delete the way
+    // the non-repetitive-flank design assumes), not the fix.
+    let topo = g.graph_topology();
+    let g_node = topo
+        .nodes
+        .iter()
+        .find(|n| n.base == b'G' && n.coverage == 4 && n.delete_count == 1)
+        .expect(
+            "expected 'G' with coverage=4 (seed + 3 g_reads), delete_count=1 (the deletion read)",
+        );
+    let c_node = topo
+        .nodes
+        .iter()
+        .find(|n| n.base == b'C' && n.coverage == 4 && n.delete_count == 0)
+        .expect("expected 'C' with coverage=4 (4 c_reads), delete_count=0");
+    assert_eq!(g_node.coverage, 4);
+    assert_eq!(c_node.coverage, 4);
+
+    let multi = g.consensus_multi().unwrap();
+    assert_eq!(multi.len(), 2, "expected two allele consensuses (G and C)");
+
+    let g_allele = multi
+        .iter()
+        .find(|c| c.sequence.contains(&b'G') && c.read_indices.contains(&1))
+        .expect("expected to find the G-allele consensus (contains read 1, a g_read)");
+    let c_allele = multi
+        .iter()
+        .find(|c| c.read_indices.contains(&4))
+        .expect("expected to find the C-allele consensus (contains read 4, a c_read)");
+
+    assert!(
+        !g_allele.read_indices.contains(&8),
+        "read 8 deleted through 'G' -- it must not be attributed to the G arm's group just \
+         because it structurally traversed the same edge; got read_indices={:?}",
+        g_allele.read_indices
+    );
+    // Read 8 has no genuine confirmation of either arm, so it is legitimately
+    // "unassigned" and folds into whichever group is largest (C, at 4 reads
+    // vs G's 3) -- that's a defensible default for an ambiguous read, not a
+    // wrong attribution the way counting it as a G-confirmation would be.
+    assert!(
+        c_allele.read_indices.contains(&8),
+        "expected the unassigned deletion read (8) to fold into the larger (C) group; \
+         got read_indices={:?}",
+        c_allele.read_indices
+    );
+    assert_eq!(
+        g_allele.read_indices,
+        vec![0, 1, 2, 3],
+        "G's group should be exactly the seed + 3 g_reads, no more"
+    );
+}
+
+/// `BubbleSite.arm_read_counts` must reflect only genuine Match-confirmed
+/// reads for each arm, not reads that merely deleted through its entry node.
+#[test]
+fn bubble_site_arm_read_counts_excludes_delete_only_reads() {
+    let g = phase2_bubble_graph();
+    let cons = g.consensus().unwrap();
+
+    assert_eq!(
+        cons.bubble_sites.len(),
+        1,
+        "expected exactly one bubble site"
+    );
+    let site = &cons.bubble_sites[0];
+    assert_eq!(site.arm_sequences.len(), 2);
+
+    let g_idx = site
+        .arm_sequences
+        .iter()
+        .position(|s| s == b"G")
+        .expect("expected a 'G' arm");
+    let c_idx = site
+        .arm_sequences
+        .iter()
+        .position(|s| s == b"C")
+        .expect("expected a 'C' arm");
+
+    assert_eq!(
+        site.arm_read_counts[g_idx], 4,
+        "'G' arm should count only its 4 genuine confirmations (seed + 3 g_reads), \
+         not the 1 additional read that merely deleted through it (would be 5 if \
+         still conflated); got {:?}",
+        site.arm_read_counts
+    );
+    assert_eq!(
+        site.arm_read_counts[c_idx], 4,
+        "'C' arm's count is unaffected either way (no deletes through it); got {:?}",
+        site.arm_read_counts
+    );
+}
+
 // ── Reverse complement / orientation ─────────────────────────────────────────
 
 #[test]

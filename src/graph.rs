@@ -116,13 +116,25 @@ impl AlignScratch {
 /// registers (e.g. two phase-shifted encodings of the same homopolymer run)
 /// split support roughly evenly across reads instead of converging onto one
 /// path — silently fragmenting the graph in periodic sequence.
+///
+/// Returns the *total* (matched + deleted) traversal count, not matched-only.
+/// This is a live-alignment tie-break ("which predecessor is more
+/// established"), a different question from `heaviest_path`'s final
+/// path-selection scoring. Open Question #2 (design/graph_data_model_rework.md
+/// Phase 1): tried both matched-only and total here, A/B against the full
+/// `cargo test` suite and `bench/validate.py` -- neither discriminated between
+/// them (every currently-passing case stayed passing, and the 3 scenarios
+/// `bench/validate.py` fails are pre-existing, present identically at the
+/// unmodified `HEAD` in an isolated worktree, unrelated to this choice). With
+/// no evidence favouring a change, kept at total weight -- unchanged from
+/// before the Match/Delete edge-weight split.
 #[inline]
 fn edge_weight(nodes: &[Node], from: usize, to: usize) -> i32 {
     nodes[from]
         .out_edges
         .iter()
         .find(|&&(t, _)| t == to)
-        .map(|&(_, w)| w)
+        .map(|&(_, ew)| ew.total())
         .unwrap_or(0)
 }
 
@@ -137,10 +149,39 @@ fn safe_add(a: i32, b: i32) -> i32 {
 
 // ─── Graph types ─────────────────────────────────────────────────────────────
 
+/// Per-edge traversal weight, split by how the read traversed it.
+///
+/// A single conflated `i32` weight cannot tell "N reads confirmed this base"
+/// (`Match`) apart from "N reads skipped past whatever's here" (`Delete`) --
+/// and both increment the *same* edge when they share a predecessor. See
+/// `design/graph_data_model_rework.md` for the audit that motivated this
+/// split (confirmed on real RFC1 data: nodes reached by one pure-delete
+/// in-edge and one pure-match in-edge to the same target).
+///
+/// `Insert` traffic is folded into `matched`, not tracked separately: once a
+/// node exists (whether created by `Insert` or already present), every later
+/// read that agrees with its base routes through `Match`, so `Insert`'s own
+/// founding traversal is accounting-identical to a `Match` -- both mean "a
+/// read confirms this exact base occurs here." A three-way split would add a
+/// bucket that never needs to be read differently from `matched`.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct EdgeWeight {
+    /// Match traversals, plus the founding Insert that created the target node.
+    matched: i32,
+    /// Delete traversals (read skipped past the target node without consuming a base).
+    deleted: i32,
+}
+
+impl EdgeWeight {
+    fn total(&self) -> i32 {
+        self.matched + self.deleted
+    }
+}
+
 struct Node {
     base: u8,
     /// (successor_node_index, edge_weight)
-    out_edges: Vec<(usize, i32)>,
+    out_edges: Vec<(usize, EdgeWeight)>,
     /// predecessor node indices
     in_edges: Vec<usize>,
     /// reads that produced a Match op at this node (not Delete ops)
@@ -156,8 +197,17 @@ pub struct PoaGraph {
     n_reads: usize,
     /// original reads stored for per-allele sub-graph reconstruction
     reads: Vec<Vec<u8>>,
-    /// (from_node, to_node) → sorted list of read indices that traversed that edge
+    /// (from_node, to_node) → sorted list of read indices that genuinely
+    /// confirmed this edge's target (Match, or the founding Insert that
+    /// created it). Does NOT include reads that merely deleted through the
+    /// target -- see `edge_delete_reads` for those. Two parallel maps rather
+    /// than one map with a tagged value, mirroring the existing `coverage`/
+    /// `delete_count` idiom at the node level (see
+    /// design/graph_data_model_rework.md Phase 2).
     edge_reads: HashMap<(usize, usize), Vec<u32>>,
+    /// (from_node, to_node) → sorted list of read indices that Deleted
+    /// through this edge's target (skipped it without consuming a base).
+    edge_delete_reads: HashMap<(usize, usize), Vec<u32>>,
     /// number of times the long-unbanded warning was emitted
     warnings: usize,
     /// Cached heaviest-path spine, recomputed adaptively rather than every read.
@@ -230,19 +280,46 @@ fn push_node(nodes: &mut Vec<Node>, base: u8) -> usize {
     idx
 }
 
+/// Adds a brand-new edge with weight 1, attributed as genuine confirmation
+/// (`matched: 1, deleted: 0`). Used only for the seed's initial linear chain,
+/// where the seed read's own bases are by definition confirmed.
 fn add_edge(nodes: &mut [Node], from: usize, to: usize) {
-    nodes[from].out_edges.push((to, 1));
+    nodes[from].out_edges.push((
+        to,
+        EdgeWeight {
+            matched: 1,
+            deleted: 0,
+        },
+    ));
     nodes[to].in_edges.push(from);
 }
 
-fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize) {
-    for (succ, w) in nodes[from].out_edges.iter_mut() {
+/// Increments an existing edge's weight, or creates it at weight 1, routing
+/// the `+1` to `.matched` or `.deleted` depending on how this read traversed
+/// it (`is_delete`).
+fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize, is_delete: bool) {
+    for (succ, ew) in nodes[from].out_edges.iter_mut() {
         if *succ == to {
-            *w += 1;
+            if is_delete {
+                ew.deleted += 1;
+            } else {
+                ew.matched += 1;
+            }
             return;
         }
     }
-    nodes[from].out_edges.push((to, 1));
+    let ew = if is_delete {
+        EdgeWeight {
+            matched: 0,
+            deleted: 1,
+        }
+    } else {
+        EdgeWeight {
+            matched: 1,
+            deleted: 0,
+        }
+    };
+    nodes[from].out_edges.push((to, ew));
     nodes[to].in_edges.push(from);
 }
 
@@ -1662,6 +1739,7 @@ fn best_prev_state_banded(
 fn add_to_graph(
     nodes: &mut Vec<Node>,
     edge_reads: &mut HashMap<(usize, usize), Vec<u32>>,
+    edge_delete_reads: &mut HashMap<(usize, usize), Vec<u32>>,
     query: &[u8],
     ops: &[AlignOp],
     read_idx: u32,
@@ -1677,7 +1755,7 @@ fn add_to_graph(
                 let cur = if nodes[node_idx].base == q_base {
                     nodes[node_idx].coverage += 1;
                     if let Some(p) = prev {
-                        increment_or_add_edge(nodes, p, node_idx);
+                        increment_or_add_edge(nodes, p, node_idx, false);
                         edge_reads.entry((p, node_idx)).or_default().push(read_idx);
                     }
                     node_idx
@@ -1685,7 +1763,13 @@ fn add_to_graph(
                     let new_idx = push_node(nodes, q_base);
                     nodes[new_idx].coverage = 1;
                     if let Some(p) = prev {
-                        nodes[p].out_edges.push((new_idx, 1));
+                        nodes[p].out_edges.push((
+                            new_idx,
+                            EdgeWeight {
+                                matched: 1,
+                                deleted: 0,
+                            },
+                        ));
                         nodes[new_idx].in_edges.push(p);
                         edge_reads.entry((p, new_idx)).or_default().push(read_idx);
                     }
@@ -1698,7 +1782,13 @@ fn add_to_graph(
                 let new_idx = push_node(nodes, q_base);
                 nodes[new_idx].coverage = 1;
                 if let Some(p) = prev {
-                    nodes[p].out_edges.push((new_idx, 1));
+                    nodes[p].out_edges.push((
+                        new_idx,
+                        EdgeWeight {
+                            matched: 1,
+                            deleted: 0,
+                        },
+                    ));
                     nodes[new_idx].in_edges.push(p);
                     edge_reads.entry((p, new_idx)).or_default().push(read_idx);
                 }
@@ -1707,8 +1797,11 @@ fn add_to_graph(
             AlignOp::Delete(node_idx) => {
                 nodes[node_idx].delete_count += 1;
                 if let Some(p) = prev {
-                    increment_or_add_edge(nodes, p, node_idx);
-                    edge_reads.entry((p, node_idx)).or_default().push(read_idx);
+                    increment_or_add_edge(nodes, p, node_idx, true);
+                    edge_delete_reads
+                        .entry((p, node_idx))
+                        .or_default()
+                        .push(read_idx);
                 }
                 prev = Some(node_idx);
             }
@@ -1718,18 +1811,52 @@ fn add_to_graph(
 
 // ─── Heaviest path ────────────────────────────────────────────────────────────
 
+/// Cumulative-weight DP over the DAG, picking the heaviest incoming edge at
+/// each node to build the consensus spine.
+///
+/// Scores on `edge.matched` only -- `deleted` traversals contribute nothing,
+/// not even a discount. A read that deletes through a node provides zero
+/// evidence that the node's *base* is correct (it skipped confirming it
+/// entirely); scoring on total (matched + deleted) traffic let a node reached
+/// mostly by Delete out-compete a genuinely-Match-confirmed alternative arm
+/// at the same fork, confirmed on a forced case (6 reads deleting through a
+/// reference base vs. 4 reads genuinely matching a SNP base at the same
+/// position -- see `heaviest_path_prefers_matched_over_delete_inflated_arm`
+/// in src/tests.rs). This mirrors the interior filter's own existing
+/// philosophy (`coverage > delete_count`): Delete already counts as zero
+/// evidence for node inclusion there, so it would be inconsistent for this
+/// function's arm-*selection* to treat it as partial evidence instead.
+///
+/// Matched-only scoring alone is *necessary but not sufficient*: it correctly
+/// favours the better-evidenced arm at the fork itself, but that local
+/// advantage can be exactly cancelled at the arms' reconvergence point. A
+/// node reached mostly by Delete still genuinely gets Matched by those same
+/// reads on its *next* edge (they skip this node, but truly do match
+/// whatever follows) -- so that next edge's own matched weight is real, and
+/// once summed downstream it can "launder" the weak node's arm back to
+/// parity with a genuinely-stronger competing arm (worked example, and why
+/// it isn't a coincidence of specific numbers, in
+/// design/graph_data_model_rework.md's Phase 1 implementation notes / the
+/// CHANGELOG entry for this fix). `credibility_penalty` closes that gap:
+/// subtract, once per node on the path, however much a node's own
+/// `delete_count` exceeds its `coverage` -- zero for the vast majority of
+/// (legitimately Match-dominant) nodes, so ordinary spine construction is
+/// unaffected; only nodes that are themselves net-Delete-dominant are
+/// penalised, stopping their downstream edge from re-inflating their case.
 fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usize, u8, i32)> {
     let n = topo.len();
     let mut cum: Vec<(i64, Option<usize>, i32)> = vec![(0, None, 0); n];
 
     for t in 0..n {
         let node_idx = topo[t];
+        let node = &nodes[node_idx];
         let curr = cum[t].0;
-        for &(succ_idx, weight) in &nodes[node_idx].out_edges {
+        let credibility_penalty = (node.delete_count as i64 - node.coverage as i64).max(0);
+        for &(succ_idx, ew) in &node.out_edges {
             let succ_t = rank_of[succ_idx];
-            let candidate = curr + (weight - 1) as i64;
+            let candidate = curr + (ew.matched - 1) as i64 - credibility_penalty;
             if candidate > cum[succ_t].0 {
-                cum[succ_t] = (candidate, Some(t), weight);
+                cum[succ_t] = (candidate, Some(t), ew.matched);
             }
         }
     }
@@ -1800,9 +1927,13 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
         single_support as f64 / node_count as f64
     };
 
+    // Phase 2 territory (design/graph_data_model_rework.md): kept on total
+    // (matched + deleted) weight here, unchanged from pre-split behaviour.
+    // Splitting this by traversal type is deferred to the GraphStats/
+    // find_bubbles rework, not part of this pass.
     let mut weights: Vec<f64> = nodes
         .iter()
-        .flat_map(|nd| nd.out_edges.iter().map(|&(_, w)| w as f64))
+        .flat_map(|nd| nd.out_edges.iter().map(|&(_, ew)| ew.total() as f64))
         .collect();
     weights.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let edge_weight_gini = if weights.len() < 2 {
@@ -1826,12 +1957,13 @@ fn compute_stats(nodes: &[Node], min_allele_freq: f64, n_reads: usize) -> GraphS
     let mut bubble_count = 0usize;
     let mut max_bubble_depth = 0usize;
     let mut longest_bubble_span = 0usize;
+    // Phase 2 territory: same total-weight threshold as before the split.
     for nd in nodes {
         let qualifying: Vec<(usize, i32)> = nd
             .out_edges
             .iter()
-            .filter(|&&(_, w)| w >= threshold)
-            .map(|&(to, w)| (to, w))
+            .filter(|&&(_, ew)| ew.total() >= threshold)
+            .map(|&(to, ew)| (to, ew.total()))
             .collect();
         if qualifying.len() >= 2 {
             bubble_count += 1;
@@ -1941,13 +2073,16 @@ fn find_bubbles(
     min_allele_freq: f64,
 ) -> Vec<(usize, Vec<usize>)> {
     let threshold = ((n_reads as f64 * min_allele_freq).ceil() as i32).max(1);
+    // Thresholded on matched-only weight: a delete-heavy pseudo-arm (reads
+    // that skip past this position, not reads that confirm a different
+    // base) should not qualify as a competing allele candidate.
     topo.iter()
         .copied()
         .filter_map(|node_idx| {
             let arms: Vec<usize> = nodes[node_idx]
                 .out_edges
                 .iter()
-                .filter(|&&(_, w)| w >= threshold)
+                .filter(|&&(_, ew)| ew.matched >= threshold)
                 .map(|&(to, _)| to)
                 .collect();
             if arms.len() >= 2 {
@@ -1974,10 +2109,11 @@ fn find_structural_bubbles(
     topo.iter()
         .copied()
         .filter_map(|entry_node| {
+            // Matched-only, same reasoning as find_bubbles above.
             let arms: Vec<usize> = nodes[entry_node]
                 .out_edges
                 .iter()
-                .filter(|&&(_, w)| w >= threshold)
+                .filter(|&&(_, ew)| ew.matched >= threshold)
                 .map(|&(to, _)| to)
                 .collect();
 
@@ -2292,6 +2428,7 @@ impl PoaGraph {
         let mut edge_reads: HashMap<(usize, usize), Vec<u32>> = HashMap::new();
         for i in 0..n.saturating_sub(1) {
             add_edge(&mut nodes, i, i + 1);
+            // Seed's own bases are genuine confirmation, not a skip-through.
             edge_reads.insert((i, i + 1), vec![0u32]);
         }
 
@@ -2301,6 +2438,7 @@ impl PoaGraph {
             n_reads: 1,
             reads: vec![seed.to_vec()],
             edge_reads,
+            edge_delete_reads: HashMap::new(),
             warnings: 0,
             cached_spine: Vec::new(),
             spine_updated_at: 0,
@@ -2376,7 +2514,14 @@ impl PoaGraph {
             &anchors,
         )?;
         let read_idx = self.n_reads as u32;
-        add_to_graph(&mut self.nodes, &mut self.edge_reads, read, &ops, read_idx);
+        add_to_graph(
+            &mut self.nodes,
+            &mut self.edge_reads,
+            &mut self.edge_delete_reads,
+            read,
+            &ops,
+            read_idx,
+        );
         self.reads.push(read.to_vec());
         self.n_reads += 1;
         Ok(())
@@ -2520,10 +2665,15 @@ impl PoaGraph {
                             return self.nodes[node_idx].coverage
                                 > self.nodes[node_idx].delete_count;
                         };
+                        // Phase 4 territory (design/graph_data_model_rework.md):
+                        // this is the interior filter's fork-population/
+                        // plurality logic (Known Bugs #6-#10). Kept on total
+                        // (matched + deleted) weight, byte-identical to
+                        // pre-split behaviour -- not part of this pass.
                         let local_total: i32 = self.nodes[pred_idx]
                             .out_edges
                             .iter()
-                            .map(|&(_, ew)| ew)
+                            .map(|&(_, ew)| ew.total())
                             .sum();
                         if (local_total.max(0) as u32) < min_cov {
                             return false;
@@ -2562,12 +2712,12 @@ impl PoaGraph {
                             .out_edges
                             .iter()
                             .find(|&&(to, _)| to == arm_idx)
-                            .map(|&(_, w)| w)
+                            .map(|&(_, ew)| ew.total())
                             .unwrap_or(0);
                         self.nodes[pred_idx]
                             .out_edges
                             .iter()
-                            .all(|&(_, w)| w <= arm_weight)
+                            .all(|&(_, ew)| ew.total() <= arm_weight)
                     })
                     .map(|i| path[i])
                     .collect()
@@ -2620,10 +2770,15 @@ impl PoaGraph {
     }
 
     /// Return all edge weights in the graph (one entry per directed edge).
+    ///
+    /// Total (matched + deleted) traversal count, unchanged in meaning from
+    /// before the Match/Delete edge-weight split -- this is a general
+    /// diagnostic/visualization API (see `src/plot.rs`), not a consensus
+    /// decision point, so its contract is preserved as-is.
     pub fn edge_weights(&self) -> Vec<i32> {
         self.nodes
             .iter()
-            .flat_map(|n| n.out_edges.iter().map(|&(_, w)| w))
+            .flat_map(|n| n.out_edges.iter().map(|&(_, ew)| ew.total()))
             .collect()
     }
 
@@ -2705,6 +2860,9 @@ impl PoaGraph {
             })
             .collect();
 
+        // GraphEdgeInfo.weight is documented as "number of reads that
+        // traversed this edge" -- total (matched + deleted), unchanged from
+        // before the split.
         let edges: Vec<GraphEdgeInfo> = topo
             .iter()
             .enumerate()
@@ -2712,7 +2870,7 @@ impl PoaGraph {
                 self.nodes[node_idx]
                     .out_edges
                     .iter()
-                    .map(move |&(succ_idx, weight)| (from_rank, succ_idx, weight))
+                    .map(move |&(succ_idx, ew)| (from_rank, succ_idx, ew.total()))
                     .collect::<Vec<_>>()
             })
             .map(|(from_rank, succ_idx, weight)| GraphEdgeInfo {
@@ -2735,13 +2893,25 @@ impl PoaGraph {
     }
 
     /// For each node, return `(out_edges_count, max_out_edge_weight, min_out_edge_weight)`.
+    ///
+    /// Total (matched + deleted) weight, same reasoning as `edge_weights()`.
     pub fn node_out_edge_info(&self) -> Vec<(usize, i32, i32)> {
         self.nodes
             .iter()
             .map(|n| {
                 let count = n.out_edges.len();
-                let max_w = n.out_edges.iter().map(|&(_, w)| w).max().unwrap_or(0);
-                let min_w = n.out_edges.iter().map(|&(_, w)| w).min().unwrap_or(0);
+                let max_w = n
+                    .out_edges
+                    .iter()
+                    .map(|&(_, ew)| ew.total())
+                    .max()
+                    .unwrap_or(0);
+                let min_w = n
+                    .out_edges
+                    .iter()
+                    .map(|&(_, ew)| ew.total())
+                    .min()
+                    .unwrap_or(0);
                 (count, max_w, min_w)
             })
             .collect()
@@ -2751,6 +2921,10 @@ impl PoaGraph {
     ///
     /// Arm length is measured by walking the single-successor chain from each arm start,
     /// stopping at reconvergence points (nodes with multiple in-edges after the first step).
+    ///
+    /// `weight_threshold` is compared against total (matched + deleted) weight,
+    /// unchanged from before the Match/Delete edge-weight split -- a general
+    /// diagnostic API (see `tests/rfc1_real_data.rs`), not a consensus decision point.
     pub fn bubble_arm_lengths(
         &self,
         weight_threshold: i32,
@@ -2762,7 +2936,7 @@ impl PoaGraph {
             let qualifying: Vec<usize> = self.nodes[node_idx]
                 .out_edges
                 .iter()
-                .filter(|&&(_, w)| w >= weight_threshold)
+                .filter(|&&(_, ew)| ew.total() >= weight_threshold)
                 .map(|&(succ, _)| succ)
                 .collect();
             if qualifying.len() >= 2 {

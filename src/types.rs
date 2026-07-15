@@ -83,8 +83,18 @@ pub struct BubbleSite {
     /// Position in the consensus sequence (0-indexed) of the entry node just
     /// before the bubble branches.  Use this to locate the site in the output.
     pub consensus_pos: usize,
-    /// Number of reads that traversed each arm, in arm order.  The arm with the
+    /// Number of reads that genuinely confirmed each arm (Match, or the
+    /// founding Insert that created it), in arm order.  The arm with the
     /// highest count is the one chosen for the consensus sequence.
+    ///
+    /// A read that merely *deleted through* an arm's starting node -- skipped
+    /// it without confirming any base there -- is **not** counted here, even
+    /// though it structurally traversed the same edge. Before this crate's
+    /// `EdgeWeight`/`edge_reads` Match/Delete split (see
+    /// `design/graph_data_model_rework.md`), this field conflated the two, so
+    /// a delete-heavy skip-through could inflate an arm's apparent support.
+    /// Counting only genuine confirmations is a behavior change from earlier
+    /// versions, even though the field's type is unchanged (`Vec<u32>`).
     pub arm_read_counts: Vec<u32>,
     /// Sequence of each arm (from the first arm node up to but not including the
     /// exit/reconvergence node).  Empty `Vec` when the arm exceeds 256 bp or is
