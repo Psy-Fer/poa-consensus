@@ -2633,7 +2633,10 @@ fn adaptive_snv_bubble_splits_alleles() {
 fn adaptive_noisy_tightens_coverage() {
     // 5 correct reads + 7 reads each with a unique single-base error.
     // 7 singleton nodes out of 22 total → single_support_fraction ≈ 0.32 > 0.30.
-    // Adaptive mode should tighten coverage and return a single clean consensus.
+    // Adaptive mode should return a single clean consensus either way (see
+    // below for why the *action* is no longer guaranteed to be
+    // NoisyTighten specifically -- the sequence correctness is what this
+    // test actually cares about).
     let correct: Vec<u8> = b("CATCATCATCATCAT");
     let mut r1 = correct.clone();
     r1[0] = b'G';
@@ -2653,7 +2656,25 @@ fn adaptive_noisy_tightens_coverage() {
         &correct, &correct, &correct, &correct, &correct, &r1, &r2, &r3, &r4, &r5, &r6, &r7,
     ];
     let r = poa_consensus::consensus_adaptive(&reads, 0, &PoaConfig::default()).unwrap();
-    assert_eq!(r.action, poa_consensus::AdaptiveAction::NoisyTighten);
+    // Since the seed-sensitivity retry (design/graph_data_model_rework.md
+    // follow-up; see CHANGELOG) was added, `single_support_fraction > 0.3`
+    // no longer guarantees `NoisyTighten` specifically -- it now scores
+    // several candidate remedies (including the untouched pass-1 result)
+    // against the actual reads and keeps whichever fits best.  In this
+    // scenario the scattered single-base errors are already resolved
+    // correctly by the ordinary majority vote on pass-1 itself (no coverage
+    // tightening needed), so `consensus_fit` correctly finds pass-1 to be
+    // at least as good as the tightened rebuild, and `action` is
+    // `PassThrough` rather than `NoisyTighten`.  Confirmed this is a
+    // legitimate consequence of the new design, not a regression: verified
+    // directly (outside the test suite) that pre-fix behavior also produced
+    // this exact `correct` sequence, just via unconditional tightening
+    // rather than the empirical comparison used now.  The sequence
+    // assertion below is the one this test is actually about.
+    assert!(matches!(
+        r.action,
+        poa_consensus::AdaptiveAction::PassThrough | poa_consensus::AdaptiveAction::NoisyTighten
+    ));
     assert_eq!(r.consensuses.len(), 1);
     assert_eq!(
         r.consensuses[0].sequence, correct,

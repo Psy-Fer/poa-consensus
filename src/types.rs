@@ -222,7 +222,11 @@ pub struct Consensus {
 /// [`diagnose`]: crate::diagnose
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdaptiveAction {
-    /// Pass-1 result was returned unchanged; no second pass was needed.
+    /// Pass-1 result was returned unchanged. Either no second-pass trigger
+    /// fired at all, or the singleton-support trigger fired but the pass-1
+    /// consensus itself scored best among the candidate remedies compared
+    /// (see [`NoisyTighten`](AdaptiveAction::NoisyTighten)) -- i.e. the
+    /// pass-1 result was already trustworthy despite the trigger.
     PassThrough,
     /// Competing bubble(s) above `min_allele_freq` triggered multi-allele
     /// partitioning.  The `consensuses` vec has one element per detected allele.
@@ -236,9 +240,44 @@ pub enum AdaptiveAction {
         /// review.
         recovered: bool,
     },
-    /// High singleton-support fraction triggered a tighter coverage floor; the
-    /// graph was rebuilt with `min_coverage_fraction` raised to ≥ 0.6.
+    /// High singleton-support fraction triggered a comparison of several
+    /// candidate remedies, scored empirically against the actual read
+    /// population (see [`consensus_fit`](crate::analysis::consensus_fit)),
+    /// and the pass-1 consensus rebuilt with `min_coverage_fraction` raised
+    /// to ≥ 0.6 scored best.
+    ///
+    /// Before the seed-sensitivity retry (below) was added, this variant
+    /// was returned unconditionally whenever the trigger fired; it is now
+    /// one of several scored candidates, so the trigger firing no longer
+    /// guarantees this specific action -- see
+    /// [`AlternateSeedRetry`](AdaptiveAction::AlternateSeedRetry) and
+    /// [`MajorityFrequencyRetry`](AdaptiveAction::MajorityFrequencyRetry)
+    /// for the other possible outcomes, and
+    /// [`PassThrough`](AdaptiveAction::PassThrough) for the case where the
+    /// pass-1 consensus itself was already the best-scoring candidate.
     NoisyTighten,
+    /// High singleton-support fraction triggered the same empirical
+    /// candidate comparison as [`NoisyTighten`](AdaptiveAction::NoisyTighten),
+    /// and re-seeding on a different read (one near the read population's
+    /// median length, rather than the auto-selected seed) scored best.
+    ///
+    /// Confirmed root cause this targets: an auto-selected seed that is
+    /// atypically short relative to the true read population can cause
+    /// `heaviest_path`/the interior filter to systematically under-call a
+    /// periodic/homogeneous repeat's length, because the extra content the
+    /// majority of reads carry (relative to the short seed) gets inserted at
+    /// ambiguous, scattered positions and no single insertion accumulates
+    /// enough coverage to survive on its own. Re-seeding on a more
+    /// representative-length read avoids the problem outright rather than
+    /// trying to recover from it after the fact.
+    AlternateSeedRetry,
+    /// High singleton-support fraction triggered the same empirical
+    /// candidate comparison as [`NoisyTighten`](AdaptiveAction::NoisyTighten),
+    /// and rebuilding with [`ConsensusMode::MajorityFrequency`] (same seed)
+    /// scored best.
+    ///
+    /// [`ConsensusMode::MajorityFrequency`]: crate::ConsensusMode::MajorityFrequency
+    MajorityFrequencyRetry,
     /// High coverage coefficient of variation in `Global` mode triggered a
     /// rebuild with [`AlignmentMode::SemiGlobal`].
     ///

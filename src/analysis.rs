@@ -709,6 +709,68 @@ impl ConsensusWarnings {
     }
 }
 
+/// Empirical fit score: how well `reads` are actually explained by
+/// `consensus_seq`, independent of how that sequence was produced.
+///
+/// Builds a throwaway graph seeded on `consensus_seq` alone and aligns every
+/// read against it (the same alignment machinery and `config` used to build
+/// consensuses in the first place), then reports the mean, length-normalised
+/// total of `Insert` ops (read content the consensus doesn't explain) plus
+/// `Delete` ops (consensus content the read doesn't confirm) per read.
+/// **Lower is a better fit; 0.0 means every read matches `consensus_seq`
+/// exactly.**
+///
+/// This is a *relative* scorer, meant to compare several candidate
+/// consensuses built from the same read population against each other (see
+/// [`consensus_adaptive`](crate::consensus_adaptive)'s seed-sensitivity
+/// retry) — not an absolute, scenario-independent "this consensus is wrong"
+/// threshold. Empirical investigation (see CHANGELOG) found no single
+/// graph-level statistic (`GraphStats::single_support_fraction`,
+/// `bubble_count`, `edge_weight_gini`, seed length relative to the read
+/// population, ...) reliably separated genuinely-too-short consensuses from
+/// ordinary sequencing-noise-heavy ones across scenario families (CAG/GAA at
+/// various lengths and depths, ONT R9/R10, HiFi); comparing this score
+/// *across candidates built from the same reads* discriminated far better in
+/// that investigation, though even it is not perfectly reliable in isolation
+/// (see the seed-sensitivity retry's own doc comment for the specific,
+/// confirmed failure mode this does not fully solve).
+///
+/// Cost: one graph build plus one alignment per read — comparable to
+/// building one more candidate consensus, not a cheap O(1) check. Reserve it
+/// for a handful of candidates already flagged for closer comparison (e.g.
+/// by `GraphStats::single_support_fraction`), not for routine per-call use.
+pub fn consensus_fit(
+    consensus_seq: &[u8],
+    reads: &[&[u8]],
+    config: &crate::config::PoaConfig,
+) -> f64 {
+    if reads.is_empty() || consensus_seq.is_empty() {
+        return 0.0;
+    }
+    let graph = match crate::graph::PoaGraph::new(consensus_seq, config.clone()) {
+        Ok(g) => g,
+        Err(_) => return 0.0,
+    };
+    let mut total = 0.0;
+    let mut n = 0usize;
+    for &read in reads {
+        if let Ok((ops, _, _)) = graph.align_read_ops(read) {
+            let n_insert = ops
+                .iter()
+                .filter(|o| matches!(o, crate::graph::AlignOp::Insert(_)))
+                .count();
+            let n_delete = ops
+                .iter()
+                .filter(|o| matches!(o, crate::graph::AlignOp::Delete(_)))
+                .count();
+            let denom = (read.len() + consensus_seq.len()) as f64 / 2.0;
+            total += (n_insert + n_delete) as f64 / denom.max(1.0);
+            n += 1;
+        }
+    }
+    if n == 0 { 0.0 } else { total / n as f64 }
+}
+
 /// Compute actionable diagnostic warnings for a [`Consensus`].
 ///
 /// Checks four independent signals:

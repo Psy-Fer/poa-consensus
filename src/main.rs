@@ -4,8 +4,8 @@ use std::process;
 use clap::Parser;
 
 use poa_consensus::{
-    AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, SeedSelection, auto_orient, diagnose,
-    select_seed,
+    AdaptiveAction, AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, SeedSelection, auto_orient,
+    consensus_fit_scored, diagnose, select_seed,
 };
 
 /// Build a consensus sequence from FASTA or FASTQ reads using Partial Order
@@ -173,22 +173,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(out)?;
         }
     } else {
-        // Single-allele path with truncation retry.
+        // Single-allele path with seed-sensitivity retry, then truncation retry.
         //
-        // After getting the initial consensus, diagnose() checks whether it is
-        // suspiciously short relative to the median input read length (ratio <
+        // Pass 1 goes through `consensus_fit_scored` rather than the plain
+        // `consensus()`: when the pass-1 graph looks noisy/fragmented
+        // (`single_support_fraction > 0.3` -- common on genuinely repetitive
+        // loci, not just broken ones), it builds a few candidate remedies
+        // (tightened coverage floor, a different seed near the read
+        // population's median length, MajorityFrequency mode) and empirically
+        // scores each against the actual reads, keeping whichever fits best
+        // (see `consensus_fit_scored`'s doc comment for the full mechanism and
+        // validated limitations -- it is not a complete fix). Otherwise it is
+        // exactly equivalent to `consensus()`.
+        //
+        // After that, `diagnose()` checks whether the result is suspiciously
+        // short relative to the median input read length (ratio <
         // DiagnoseConfig::truncation_ratio_threshold, default 0.60).  When that
         // fires AND banded DP was used AND median_read_len <= 5000 bp, rebuild
         // with band_width = 0.  Unbanded forces the traceback to the correct
-        // graph endpoint, recovering from the wrong-diagonal failure mode.
+        // graph endpoint, recovering from the wrong-diagonal failure mode. This
+        // targets a different, more severe failure mode (catastrophic band
+        // truncation) than the seed-sensitivity retry above (a few missing
+        // repeat units), so both stay in place independently.
         //
         // Note: consensus_adaptive is intentionally NOT used here.  That function
         // also checks for multi-allele bubbles, which can fire on het SNPs in
         // non-repetitive controls and produce unexpected results in a caller that
-        // expects single-allele output.
+        // expects single-allele output.  `consensus_fit_scored` is the standalone
+        // entry point that gives the seed-sensitivity retry without that.
         let was_banded = config.band_width > 0 || config.adaptive_band;
-        let mut result = poa_consensus::consensus(&slices, seed_idx, &config)
+        let fit_scored = consensus_fit_scored(&slices, seed_idx, &config)
             .inspect_err(|e| explain_error(e, n))?;
+        if !args.quiet {
+            match fit_scored.action {
+                AdaptiveAction::PassThrough => {}
+                ref a => eprintln!(
+                    "poa-consensus: note: consensus looked noisy (fragmented graph evidence); \
+                     seed-sensitivity retry chose an alternate rebuild ({a:?})"
+                ),
+            }
+        }
+        let mut result = fit_scored.consensuses.into_iter().next().expect(
+            "consensus_fit_scored always returns exactly one consensus in single-allele mode",
+        );
         if was_banded {
             let diag = diagnose(&result, &DiagnoseConfig::default());
             if let Some(ref t) = diag.truncation_suspected {

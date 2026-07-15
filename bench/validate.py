@@ -47,6 +47,32 @@ FLANK_LEN      = 2_048   # default for short-read scenarios
 LONG_FLANK_LEN = 8_000   # for 15 k long-read scenarios
 LEFT_FLANK     = _LEFT_FLANK_FULL[:FLANK_LEN]    # backward compat alias
 RIGHT_FLANK    = _RIGHT_FLANK_FULL[:FLANK_LEN]   # backward compat alias
+
+# _U has period 32; a per-allele rotation offset that isn't a multiple of 32
+# gives every allele record in a multi-allele/SV scenario genuinely distinct
+# flanking sequence (still built from the same CAG/GAA/CTTTT/AAAAG-free pool,
+# just phase-shifted) instead of byte-identical flanks.  allele index 0 always
+# gets offset 0, so single-allele scenarios (the overwhelming majority, and
+# every allele_0 in every scenario) are completely unaffected -- this only
+# changes alleles at index >= 1.
+#
+# Confirmed root cause (see investigation notes): identical flanks let
+# minimap2 cross-map a read that genuinely originated from one allele's own
+# pbsim simulation onto the *other* allele's reference contig when the read
+# doesn't fully resolve the length-differentiating repeat, and bedpull then
+# extracts it under the wrong allele label -- e.g. sv_cag20_out60 extracted
+# 8 reads tagged allele_1 (CAG×60) when only 2 were genuinely CAG×60-length;
+# the other 6 were ordinary CAG×20 reads that cross-mapped purely because
+# both contigs shared identical flanks.
+_FLANK_ROTATE_STEP = 11   # not a multiple of 32; verified CAG/GAA/CTTTT/AAAAG-free at every offset
+
+
+def _rotated_flank(pool: str, flank_len: int, allele_idx: int) -> str:
+    """Slice `flank_len` bases out of `pool` (a repeated-_U pool), starting at
+    an allele-index-dependent rotation offset. `allele_idx == 0` always gives
+    offset 0 -- i.e. byte-identical to the pre-fix `pool[:flank_len]` slice."""
+    offset = allele_idx * _FLANK_ROTATE_STEP
+    return pool[offset: offset + flank_len]
 ANCHOR_PAD     = 100   # bp of flanking context included on each side of the STR locus
 
 # ── Error models ────────────────────────────────────────────────────────────
@@ -371,13 +397,21 @@ def parse_fasta(path: Path) -> list[tuple[str, bytes]]:
 # ── Pipeline steps ───────────────────────────────────────────────────────────
 
 def build_reference(scenario: Scenario, work: Path) -> Path:
-    """Write one FASTA record per allele: left_flank + allele + right_flank."""
+    """Write one FASTA record per allele: left_flank + allele + right_flank.
+
+    Each allele gets its own rotated flank (see `_rotated_flank`) so that
+    multi-allele/SV scenarios' reference contigs don't share identical
+    flanking sequence -- identical flanks let minimap2 cross-map a read from
+    one allele's simulation onto another allele's contig.  Allele index 0
+    always gets offset 0, so single-allele scenarios are byte-for-byte
+    unaffected.
+    """
     fl = scenario.flank_len
-    left  = _LEFT_FLANK_FULL[:fl]
-    right = _RIGHT_FLANK_FULL[:fl]
     ref = work / "reference.fa"
     with open(ref, "w") as fh:
         for i, allele in enumerate(scenario.alleles):
+            left  = _rotated_flank(_LEFT_FLANK_FULL, fl, i)
+            right = _rotated_flank(_RIGHT_FLANK_FULL, fl, i)
             seq = left + allele.seq + right
             fh.write(f">allele_{i}  unit={allele.unit} count={allele.count}\n{seq}\n")
     return ref
@@ -420,7 +454,13 @@ def simulate_reads(scenario: Scenario, ref: Path, work: Path, model: dict) -> Pa
         for i, allele in enumerate(scenario.alleles):
             single_ref = work / f"ref_allele{i}.fa"
             with open(single_ref, "w") as fh:
-                seq = LEFT_FLANK + allele.seq + RIGHT_FLANK
+                # Same per-allele rotation as build_reference (see
+                # _rotated_flank) so the read each allele's own pbsim run
+                # produces stays consistent with the flank it will actually
+                # be aligned against; allele index 0 is unaffected (offset 0).
+                left  = _rotated_flank(_LEFT_FLANK_FULL, FLANK_LEN, i)
+                right = _rotated_flank(_RIGHT_FLANK_FULL, FLANK_LEN, i)
+                seq = left + allele.seq + right
                 fh.write(f">allele_{i}\n{seq}\n")
 
             ap = str(work / f"sim_a{i}")

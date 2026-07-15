@@ -250,6 +250,148 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     "unproven" concern (staleness) turned out to be a real bug, not a false
     alarm.
 
+- **`sv_cag20_out60` (bench validation) failure was almost entirely a test-harness
+  artifact, not a `poa-consensus` bug.** `bench/validate.py`'s `build_reference`
+  and `simulate_reads` gave every allele in a multi-allele/SV scenario
+  byte-identical flanking sequence (both sides sliced from the same offset into
+  `_LEFT_FLANK_FULL`/`_RIGHT_FLANK_FULL`), so a read genuinely simulated from one
+  allele could cross-map (via `minimap2`) onto a *different* allele's reference
+  contig whenever it didn't fully resolve the length-differentiating repeat, and
+  `bedpull` would then extract it under the wrong allele label. Confirmed
+  concretely: `sv_cag20_out60` (intended: 20 reads of CAG×20 plus a 2-read CAG×60
+  outlier) extracted **8** reads tagged `allele_1`, not 2 -- direct inspection
+  (read length, and the underlying pbsim read names via `samtools view`) showed
+  only 2 were genuinely CAG×60-length; the other 6 were ordinary CAG×20 reads
+  that cross-mapped purely because both reference contigs shared identical
+  flanks. One of those 6 was short enough that `select_seed(Auto)`'s
+  "shortest spanning candidate" heuristic picked it as seed once it entered the
+  pool, triggering the same seed-length-sensitivity mechanism described below --
+  i.e. the harness bug was what let a spurious short seed into an otherwise
+  clean single-allele read set. Fixed by giving each allele index a distinct,
+  non-zero rotation offset into the same flank pool (`_rotated_flank`,
+  `_FLANK_ROTATE_STEP = 11`, not a multiple of the pool's 32 bp period; verified
+  CAG/GAA/CTTTT/AAAAG-free at every offset in range) in both `build_reference`
+  and `simulate_reads`'s per-allele pbsim reference. Allele index 0 always gets
+  offset 0, so every single-allele scenario (the large majority of the suite)
+  and every scenario's first allele are byte-for-byte unaffected. `bench/compare_callers.py`
+  imports `build_reference`/`simulate_reads` from `validate.py` directly, so it
+  inherits the fix with no separate change needed. Re-running confirmed the
+  fix in isolation, with no other change: `sv_cag20_out60` extracts exactly 4
+  reads under `allele_1` (matching pbsim's own actual per-allele read count for
+  that depth, not the harness's earlier inflated 8), and the CLI's *default*
+  auto-seed behavior on the corrected read set alone -- no seed-selection code
+  change -- now produces the exact correct CAG×20 consensus (Δ+0, edit=0),
+  confirming this specific scenario's failure was **entirely** a harness
+  artifact. `bench/validate.py` moved from 17/20 to 18/20 (the remaining 2
+  failures, `cag50_d20` and `multi_gaa30_100`, are unrelated -- see the next
+  entry for `cag50_d20`'s root cause); `bench/compare_callers.py` stayed 16/16
+  with `sv_cag20_out60`/`sv_gaa50_out200` both now showing clean Δ+0 agreement
+  across all three callers. Bench-tooling only (`bench/validate.py`); no Rust
+  crate changes.
+
+- **Seed-length sensitivity in periodic/homogeneous tandem repeats: an
+  auto-selected seed that happens to be atypically short relative to the true
+  read population can make the consensus systematically under-call the
+  repeat's true length, confirmed on synthetic CAG/GAA data independent of
+  band width and independent of the graph-model rework above.** Root-caused via
+  ground-truth comparison against pbsim3's own `.maf` simulated-read alignments
+  (not fragile substring counting): for a failing `cag50_d20` draw, the actual
+  per-read repeat lengths clustered tightly around a true median of 148 bp
+  (truth 150 bp), but the consensus recovered only 135 bp (45 of 50 units) --
+  13 bp short of *every* read's own true length except the two most
+  deletion-heavy outliers. Reproduces identically fully unbanded
+  (`band_width = 0, adaptive_band = false`) and at `band_width = 200`, ruling out
+  Known Bug #3 (narrow-band diagonal drift) as the mechanism despite the
+  superficial resemblance. Mechanism: `select_seed(Auto)` deliberately picks the
+  *shortest* spanning candidate (documented, tested behavior -- maximises
+  Insert-type bubble visibility); when that read is short relative to the
+  population, the majority's extra content has to be inserted somewhere, and in
+  a homogeneous repeat any position is an equally valid place to insert it, so
+  different reads scatter their inserts across different positions and no
+  single insertion position accumulates enough coverage to survive the
+  majority/coverage floor on its own. Forcing the same read set to seed on an
+  ordinary-length read instead recovered the correct length outright (confirmed
+  on multiple independent scenarios and random-seed draws, including through
+  the actual CLI binary, not just the library).
+  - **Investigated as a candidate absolute "is this consensus suspicious"
+    signal, and rejected, with the negative results being the useful part of
+    this entry:** `GraphStats::single_support_fraction`, `bubble_count`,
+    `edge_weight_gini`, `mean_column_entropy`, chosen-seed length relative to
+    the read population's median/longest read, and a new aggregate "off-spine
+    fork mass" measure (built for this investigation: for every spine fork,
+    what fraction of its total traffic goes to a losing arm, aggregated across
+    the graph) were all tested across every confirmed-failing case and 21
+    confirmed-passing scenarios spanning CAG/GAA at multiple lengths and
+    depths, ONT R9/R10, and HiFi. None separated cleanly: e.g.
+    `single_support_fraction` sits in the same 0.29-0.46 range for essentially
+    every periodic-repeat scenario tested, whether anything is wrong or not,
+    and a passing scenario (`cag50_d30_s42`) had a *higher*
+    `single_support_fraction` (0.458) than any of the three confirmed-failing
+    cases. This confirms the *existing* `consensus_adaptive` trigger on this
+    same statistic (`single_support_fraction > 0.3`) was never actually
+    detecting "this consensus is wrong" -- only "this locus looks
+    noisy/repetitive," which is true of nearly all of them.
+  - **What did discriminate, empirically: comparing several candidate
+    consensuses built from the *same* reads against each other**, scored by a
+    new function, `analysis::consensus_fit(consensus_seq, reads, config)` --
+    builds a throwaway graph on `consensus_seq` alone, aligns every read
+    against it, and reports the mean per-read total of Insert ops (content the
+    candidate doesn't explain) plus Delete ops (candidate content the read
+    doesn't confirm), normalised by length. Lower is a better fit. This is
+    explicitly a *relative* scorer across candidates from one read population,
+    not an absolute per-scenario threshold -- validated as such, not as a
+    standalone "is this wrong" check. Two variants were tried: `mean_insert_frac`
+    alone (more aggressive: fixed all 3 known failures in testing, but
+    regressed 2 of 21 passing scenarios, one catastrophically -- a
+    longest-length seed candidate scored deceptively well because a long,
+    error-inflated seed reduces how much *other* reads need to insert, without
+    reducing how much they need to *delete*, which this variant doesn't
+    penalise); and the symmetric Insert+Delete version actually shipped, which
+    never chose a worse candidate than pass-1 for any of 21 tested passing
+    scenarios in this investigation.
+  - **Wired into `consensus_adaptive`'s existing `single_support_fraction > 0.3`
+    branch** (`src/lib.rs`), replacing its previous unconditional remedy
+    (tighten `min_coverage_fraction` to >= 0.6 and rebuild on the same seed --
+    kept as one candidate, since it does help in some cases, e.g.
+    `cag60_d20_s42` in this investigation) with a scored comparison across four
+    candidates: pass-1 unchanged, the pre-existing tightened-coverage rebuild,
+    a rebuild re-seeded on a read near the population's median length
+    (`median_length_read_index`, new), and a `ConsensusMode::MajorityFrequency`
+    rebuild (same seed) -- keeping whichever scores best by `consensus_fit`.
+    Extracted the scoring logic into a private `seed_sensitivity_retry` helper
+    shared with a new standalone public entry point,
+    `consensus_fit_scored(reads, seed_idx, config)`, for callers that want just
+    this retry without `consensus_adaptive`'s other passes (multi-allele bubble
+    detection, truncation retry, semi-global fallback) -- this crate's own CLI
+    (`src/main.rs`) now calls it for its single-allele path instead of plain
+    `consensus()`, since the CLI already had a documented reason to avoid
+    `consensus_adaptive` itself (multi-allele bubbles firing unexpectedly on a
+    het SNP in a caller that expects single-allele output).
+  - **Validated end to end, including through the compiled CLI binary, not just
+    the library:** full `cargo test --release --features cli` (one existing
+    test, `adaptive_noisy_tightens_coverage`, needed its `action` assertion
+    relaxed from asserting `NoisyTighten` unconditionally to accepting either
+    `NoisyTighten` or `PassThrough` -- confirmed this is the new design working
+    as intended, not a regression: the scattered single-base-error scenario it
+    constructs was already correctly resolved by pass-1's ordinary majority
+    vote with no tightening needed, and `consensus_fit` now correctly detects
+    that and returns pass-1 unchanged instead of needlessly rebuilding; the
+    *sequence* assertion, which is what the test actually cares about, is
+    unchanged and still passes). `cargo clippy --all-features --tests` and
+    `cargo fmt --check` clean, matching the pre-change warning baseline
+    exactly. `bench/validate.py`: 18/20, unchanged from the harness-fix-only
+    baseline -- `cag60_d20_s42` (an ad hoc seed-sweep case from this
+    investigation, not a tracked scenario) went from Δ-8 to Δ+0 through the
+    real CLI; `cag50_d20` (tracked, named scenario) is unaffected either way,
+    since its own best-scoring candidate ties with pass-1; one ad hoc sweep
+    case (`cag50_d20_s2`) that was *already* failing before this change went
+    from Δ-7 to Δ-10 -- confirmed not a regression of a previously-passing
+    scenario, but reported plainly since it is a real, acknowledged limit of
+    this fix, not swept under the rug. `bench/compare_callers.py`: 16/16,
+    unchanged. Not a complete fix for the underlying seed-length sensitivity --
+    see `consensus_adaptive`'s doc comment for the full, honest account of what
+    this does and does not solve.
+
 ### Breaking
 
 - **`BubbleSite.arm_read_counts` now counts only reads that genuinely confirmed
@@ -262,6 +404,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   relying on the old "any traversal" semantics, e.g. to sum `arm_read_counts`
   as a proxy for total depth at a bubble, should account for the reduced
   counts.
+
+- **`AdaptiveAction` gained two new variants, `AlternateSeedRetry` and
+  `MajorityFrequencyRetry`, and `single_support_fraction > 0.3` no longer
+  guarantees `NoisyTighten`.** The enum is not `#[non_exhaustive]`, so an
+  exhaustive `match` on `AdaptiveAction` in downstream code will fail to
+  compile until the two new arms are added. Semantically: before this change,
+  `consensus_adaptive` returned `NoisyTighten` unconditionally whenever
+  `single_support_fraction > 0.3` fired; it now builds several candidate
+  remedies (see the seed-length-sensitivity entry under Fixed above), scores
+  them against the actual reads, and returns whichever action produced the
+  best-scoring candidate -- which may be `PassThrough` (pass-1 was already
+  best), the pre-existing `NoisyTighten`, or one of the two new variants.
+  Callers that specifically branched on `action == NoisyTighten` to mean
+  "the trigger fired" should check for all four outcomes (or none, and just
+  use `consensuses[0]`) instead.
 
 ## [0.2.1] - 2026-07-08
 
