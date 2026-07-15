@@ -224,6 +224,17 @@ pub struct PoaGraph {
     /// `cached_spine`).  Only hashes that appear exactly once in the spine are
     /// stored — duplicate k-mers cannot serve as unambiguous anchors.
     spine_mers: HashMap<u64, u32>,
+    /// Per-fork content-addressable arm index: fork node index → (full
+    /// characterized edit's bases → existing arm's start node index).
+    /// Populated in `add_to_graph` whenever a new divergence arm is created;
+    /// consulted before creating a new arm so an exact-duplicate edit (same
+    /// fork, same complete base sequence) reuses the existing node chain
+    /// instead of fragmenting into a new one. Scoped per-fork (not global) so
+    /// reuse can only ever happen among arms of the *same* divergence point;
+    /// see design/graph_data_model_rework.md Phase 3. Does NOT solve fuzzy
+    /// near-duplicates (edits with the same effect but different incidental
+    /// length/shape) -- only byte-identical edits hash-match.
+    fork_arm_index: HashMap<usize, HashMap<Vec<u8>, usize>>,
 }
 
 // ─── DP cell ─────────────────────────────────────────────────────────────────
@@ -1736,19 +1747,124 @@ fn best_prev_state_banded(
 
 // ─── Graph update ─────────────────────────────────────────────────────────────
 
+/// Verifies (read-only) that the existing chain recorded at `start` still
+/// spells exactly `edit`: every one of the `edit.len() - 1` remaining hops
+/// must follow a single out-edge (no internal branching since the chain was
+/// recorded) to a node whose base matches the corresponding byte of `edit`.
+/// Returns the full chain of node indices on success, or `None` if the chain
+/// has since branched or drifted -- the caller falls back to creating a
+/// fresh arm exactly as before this phase existed.
+fn verify_reuse_chain(nodes: &[Node], edit: &[u8], start: usize) -> Option<Vec<usize>> {
+    debug_assert!(!edit.is_empty());
+    let mut chain = Vec::with_capacity(edit.len());
+    let mut cur = start;
+    if nodes[cur].base != edit[0] {
+        return None;
+    }
+    chain.push(cur);
+    for &b in &edit[1..] {
+        match nodes[cur].out_edges.as_slice() {
+            [(next, _)] if nodes[*next].base == b => {
+                cur = *next;
+                chain.push(cur);
+            }
+            _ => return None,
+        }
+    }
+    Some(chain)
+}
+
+/// Returns `true` if any node in `chain` is referenced again anywhere in
+/// `rest` (as a `Match` or `Delete` target).
+///
+/// This is the safety check that closes the gap the naive first attempt at
+/// this feature missed and this phase's own first implementation attempt
+/// also missed: `align()` computes the *entire* traceback for a read in one
+/// pass, before `add_to_graph` runs at all, and its `Match`/`Delete` ops
+/// reference specific existing node indices that the DP decided this read
+/// visits -- independently of whatever `add_to_graph` does. If content-address
+/// reuse redirects `prev` to an existing node, and that *same* node is also
+/// named later in this read's own traceback (which was computed without any
+/// knowledge that reuse would happen), committing the reuse creates a second,
+/// unrelated edge into that node from `prev` -- up to and including a literal
+/// self-loop when the very next op names the node reuse just landed on.
+/// Confirmed concretely on real data (DAB1 SCA37, seed=25): node 49 ended up
+/// with `in_edges=[17, 49]` and `out_edges=[18, 99, 49]`, a genuine self-loop,
+/// which corrupts `topological_order`'s Kahn's-algorithm bookkeeping (in-degree
+/// can never reach zero) and hangs `heaviest_path`'s traceback (an unbounded
+/// walk over a predecessor-pointer array that develops its own cycle once
+/// `rank_of` assigns the same rank to two different nodes). Skipping reuse
+/// whenever the candidate chain reappears later in this same read's ops is a
+/// cheap (bounded by `ops.len()`), always-correct guard against exactly this.
+fn reuse_would_collide(chain: &[usize], rest: &[AlignOp]) -> bool {
+    rest.iter().any(|op| match *op {
+        AlignOp::Match(idx) | AlignOp::Delete(idx) => chain.contains(&idx),
+        AlignOp::Insert(_) => false,
+    })
+}
+
+/// Commits a verified reuse chain: increments edge weight/`edge_reads` and
+/// bumps `coverage` on every reused node -- the same effect a genuine `Match`
+/// against each of these nodes would have had. Only ever called after both
+/// `verify_reuse_chain` and `reuse_would_collide` have cleared the chain.
+fn commit_reuse_chain(
+    nodes: &mut [Node],
+    edge_reads: &mut HashMap<(usize, usize), Vec<u32>>,
+    fork: usize,
+    chain: &[usize],
+    read_idx: u32,
+) -> usize {
+    let mut prev_node = fork;
+    for &node in chain {
+        increment_or_add_edge(nodes, prev_node, node, false);
+        edge_reads
+            .entry((prev_node, node))
+            .or_default()
+            .push(read_idx);
+        nodes[node].coverage += 1;
+        prev_node = node;
+    }
+    *chain.last().unwrap()
+}
+
+/// Looks up, verifies, and safety-checks a candidate reuse in one call;
+/// returns the reused chain's last node index on success. See
+/// `verify_reuse_chain` and `reuse_would_collide` for what "success" means.
+#[allow(clippy::too_many_arguments)]
+fn try_reuse_arm(
+    nodes: &mut [Node],
+    edge_reads: &mut HashMap<(usize, usize), Vec<u32>>,
+    fork_arm_index: &HashMap<usize, HashMap<Vec<u8>, usize>>,
+    fork: usize,
+    edit: &[u8],
+    rest_ops: &[AlignOp],
+    read_idx: u32,
+) -> Option<usize> {
+    let start = *fork_arm_index.get(&fork)?.get(edit)?;
+    let chain = verify_reuse_chain(nodes, edit, start)?;
+    if reuse_would_collide(&chain, rest_ops) {
+        return None;
+    }
+    Some(commit_reuse_chain(
+        nodes, edge_reads, fork, &chain, read_idx,
+    ))
+}
+
 fn add_to_graph(
     nodes: &mut Vec<Node>,
     edge_reads: &mut HashMap<(usize, usize), Vec<u32>>,
     edge_delete_reads: &mut HashMap<(usize, usize), Vec<u32>>,
+    fork_arm_index: &mut HashMap<usize, HashMap<Vec<u8>, usize>>,
     query: &[u8],
     ops: &[AlignOp],
     read_idx: u32,
 ) {
     let mut prev: Option<usize> = None;
     let mut q_idx: usize = 0;
+    let mut i = 0usize;
 
-    for &op in ops {
-        match op {
+    while i < ops.len() {
+        match ops[i] {
             AlignOp::Match(node_idx) => {
                 let q_base = query[q_idx];
                 q_idx += 1;
@@ -1760,39 +1876,106 @@ fn add_to_graph(
                     }
                     node_idx
                 } else {
-                    let new_idx = push_node(nodes, q_base);
-                    nodes[new_idx].coverage = 1;
-                    if let Some(p) = prev {
-                        nodes[p].out_edges.push((
-                            new_idx,
-                            EdgeWeight {
-                                matched: 1,
-                                deleted: 0,
-                            },
-                        ));
-                        nodes[new_idx].in_edges.push(p);
-                        edge_reads.entry((p, new_idx)).or_default().push(read_idx);
+                    // Single-base substitution edit. Try exact-duplicate reuse
+                    // at this fork before creating a new node.
+                    let edit = [q_base];
+                    let reused = prev.and_then(|p| {
+                        try_reuse_arm(
+                            nodes,
+                            edge_reads,
+                            fork_arm_index,
+                            p,
+                            &edit,
+                            &ops[i + 1..],
+                            read_idx,
+                        )
+                    });
+                    if let Some(reused_idx) = reused {
+                        reused_idx
+                    } else {
+                        let new_idx = push_node(nodes, q_base);
+                        nodes[new_idx].coverage = 1;
+                        if let Some(p) = prev {
+                            nodes[p].out_edges.push((
+                                new_idx,
+                                EdgeWeight {
+                                    matched: 1,
+                                    deleted: 0,
+                                },
+                            ));
+                            nodes[new_idx].in_edges.push(p);
+                            edge_reads.entry((p, new_idx)).or_default().push(read_idx);
+                            fork_arm_index
+                                .entry(p)
+                                .or_default()
+                                .insert(edit.to_vec(), new_idx);
+                        }
+                        new_idx
                     }
-                    new_idx
                 };
                 prev = Some(cur);
+                i += 1;
             }
-            AlignOp::Insert(q_base) => {
-                q_idx += 1;
-                let new_idx = push_node(nodes, q_base);
-                nodes[new_idx].coverage = 1;
-                if let Some(p) = prev {
-                    nodes[p].out_edges.push((
-                        new_idx,
-                        EdgeWeight {
-                            matched: 1,
-                            deleted: 0,
-                        },
-                    ));
-                    nodes[new_idx].in_edges.push(p);
-                    edge_reads.entry((p, new_idx)).or_default().push(read_idx);
+            AlignOp::Insert(first_base) => {
+                // Collect the full run of consecutive Insert ops: the
+                // "characterized edit" is only fully known once the run
+                // ends, so the content-address lookup/insert has to happen
+                // for the whole run at once, not per base.
+                let run_start = i;
+                let mut edit = vec![first_base];
+                let mut j = i + 1;
+                while j < ops.len() {
+                    if let AlignOp::Insert(b) = ops[j] {
+                        edit.push(b);
+                        j += 1;
+                    } else {
+                        break;
+                    }
                 }
-                prev = Some(new_idx);
+
+                let reused = prev.and_then(|p| {
+                    try_reuse_arm(
+                        nodes,
+                        edge_reads,
+                        fork_arm_index,
+                        p,
+                        &edit,
+                        &ops[j..],
+                        read_idx,
+                    )
+                });
+                if let Some(reused_idx) = reused {
+                    prev = Some(reused_idx);
+                } else {
+                    let fork = prev;
+                    let mut chain_start = None;
+                    for &b in &edit {
+                        let new_idx = push_node(nodes, b);
+                        nodes[new_idx].coverage = 1;
+                        if let Some(p) = prev {
+                            nodes[p].out_edges.push((
+                                new_idx,
+                                EdgeWeight {
+                                    matched: 1,
+                                    deleted: 0,
+                                },
+                            ));
+                            nodes[new_idx].in_edges.push(p);
+                            edge_reads.entry((p, new_idx)).or_default().push(read_idx);
+                        }
+                        chain_start.get_or_insert(new_idx);
+                        prev = Some(new_idx);
+                    }
+                    if let (Some(f), Some(start)) = (fork, chain_start) {
+                        fork_arm_index
+                            .entry(f)
+                            .or_default()
+                            .insert(edit.clone(), start);
+                    }
+                }
+                q_idx += edit.len();
+                i = run_start + edit.len();
+                let _ = j; // j == i; kept named for clarity above
             }
             AlignOp::Delete(node_idx) => {
                 nodes[node_idx].delete_count += 1;
@@ -1804,6 +1987,7 @@ fn add_to_graph(
                         .push(read_idx);
                 }
                 prev = Some(node_idx);
+                i += 1;
             }
         }
     }
@@ -2445,6 +2629,7 @@ impl PoaGraph {
             spine_interval: 1,
             align_scratch: AlignScratch::new(),
             spine_mers: HashMap::new(),
+            fork_arm_index: HashMap::new(),
         })
     }
 
@@ -2518,6 +2703,7 @@ impl PoaGraph {
             &mut self.nodes,
             &mut self.edge_reads,
             &mut self.edge_delete_reads,
+            &mut self.fork_arm_index,
             read,
             &ops,
             read_idx,

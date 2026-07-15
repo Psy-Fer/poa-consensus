@@ -1719,6 +1719,149 @@ fn bubble_site_arm_read_counts_excludes_delete_only_reads() {
     );
 }
 
+// ── Arm content-addressing (Phase 3) ─────────────────────────────────────────
+//
+// Re-run of the period-7 (`GCTAGCT`x10) duplicate-fork audit from the
+// architectural investigation that motivated design/graph_data_model_rework.md.
+// A tandem-repeat context produces many small, per-read insertion/substitution
+// arms; before Phase 3, exact-duplicate arms at the same fork (same base(s),
+// same position) still fragmented into separate `coverage=1` singleton nodes
+// unless ordinary DP happened to notice the match on its own. Content
+// addressing (a per-fork `HashMap<Vec<u8>, node_idx>` keyed by the *full*
+// characterized edit, checked before creating a new node) collapses genuine
+// exact duplicates into one shared, higher-coverage node.
+//
+// Measured directly (apples-to-apples: identical simulated read set, same
+// unbanded config, compared against an isolated build of the Phase 1+2 commit
+// with no Phase 3 code at all):
+//   before (Phase 1+2 only): 166 nodes, 71 singleton(cov=1) nodes, 14 duplicate-fork positions
+//   after  (Phase 3):        163 nodes, 67 singleton(cov=1) nodes, 12 duplicate-fork positions
+//
+// This is a real but modest reduction, not a collapse -- consistent with the
+// design doc's own prediction that this specific scenario is dominated by
+// *fuzzy* near-duplicate arms (same effective edit, different incidental
+// length/shape, e.g. a 4-base vs. a 5-base insertion reconverging at the same
+// point) rather than byte-identical exact duplicates. Fuzzy near-duplicates
+// are explicitly out of scope for Phase 3 (would need canonicalization, a
+// follow-on problem per the design doc) and are NOT expected to merge here.
+// The consensus itself stays at 77bp (one extra repeat unit over the 70bp
+// truth) both before and after -- Phase 3 does not fix this scenario's
+// overall accuracy, only reduces (not eliminates) the underlying
+// fragmentation, exactly as scoped.
+#[test]
+fn period7_content_addressing_reduces_duplicate_forks() {
+    let template = repeat_unit(b"GCTAGCT", 10); // 70 bp
+    let reads = simulate_reads(&template, 20, 0.05, 0.02, 0.02, 18);
+    let cfg = PoaConfig {
+        band_width: 0,
+        adaptive_band: false,
+        warn_on_long_unbanded: false,
+        ..Default::default()
+    };
+    let mut g = PoaGraph::new(&reads[0], cfg).unwrap();
+    for read in &reads[1..] {
+        g.add_read(read).unwrap();
+    }
+    let topo = g.graph_topology();
+
+    use std::collections::HashMap;
+    let base_of: HashMap<usize, u8> = topo.nodes.iter().map(|n| (n.topo_rank, n.base)).collect();
+    let cov_of: HashMap<usize, u32> = topo
+        .nodes
+        .iter()
+        .map(|n| (n.topo_rank, n.coverage))
+        .collect();
+    let mut by_from: HashMap<usize, Vec<(u8, u32)>> = HashMap::new();
+    for e in &topo.edges {
+        by_from
+            .entry(e.from_rank)
+            .or_default()
+            .push((base_of[&e.to_rank], cov_of[&e.to_rank]));
+    }
+    let mut dup_fork_positions = 0usize;
+    for succs in by_from.values() {
+        if succs.len() < 2 {
+            continue;
+        }
+        let mut by_base: HashMap<u8, usize> = HashMap::new();
+        for &(b, _) in succs {
+            *by_base.entry(b).or_default() += 1;
+        }
+        dup_fork_positions += by_base.values().filter(|&&count| count >= 2).count();
+    }
+    let singletons = topo.nodes.iter().filter(|n| n.coverage == 1).count();
+
+    assert_eq!(
+        topo.nodes.len(),
+        163,
+        "node count drifted from the measured Phase 3 baseline (166 before, 163 after)"
+    );
+    assert_eq!(
+        singletons, 67,
+        "singleton(cov=1) node count drifted from the measured Phase 3 baseline (71 before, 67 after)"
+    );
+    assert_eq!(
+        dup_fork_positions, 12,
+        "duplicate-fork-position count drifted from the measured Phase 3 baseline (14 before, 12 after)"
+    );
+}
+
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+fn rand_f64(state: &mut u64) -> f64 {
+    xorshift(state) as f64 / u64::MAX as f64
+}
+fn random_base(state: &mut u64) -> u8 {
+    b"ACGT"[(xorshift(state) % 4) as usize]
+}
+fn random_base_not(exclude: u8, state: &mut u64) -> u8 {
+    let opts: [u8; 3] = match exclude {
+        b'A' => [b'C', b'G', b'T'],
+        b'C' => [b'A', b'G', b'T'],
+        b'G' => [b'A', b'C', b'T'],
+        _ => [b'A', b'C', b'G'],
+    };
+    opts[(xorshift(state) % 3) as usize]
+}
+fn simulate_reads(
+    template: &[u8],
+    n_reads: usize,
+    sub: f64,
+    ins: f64,
+    del: f64,
+    seed: u64,
+) -> Vec<Vec<u8>> {
+    let mut state = seed;
+    let mut reads = Vec::with_capacity(n_reads);
+    for _ in 0..n_reads {
+        let mut read = Vec::with_capacity(template.len());
+        for &base in template {
+            if rand_f64(&mut state) < ins {
+                read.push(random_base(&mut state));
+            }
+            if rand_f64(&mut state) < del {
+                continue;
+            }
+            if rand_f64(&mut state) < sub {
+                read.push(random_base_not(base, &mut state));
+            } else {
+                read.push(base);
+            }
+        }
+        if !read.is_empty() {
+            reads.push(read);
+        }
+    }
+    reads
+}
+fn repeat_unit(unit: &[u8], n: usize) -> Vec<u8> {
+    unit.iter().cycle().take(unit.len() * n).copied().collect()
+}
+
 // ── Reverse complement / orientation ─────────────────────────────────────────
 
 #[test]

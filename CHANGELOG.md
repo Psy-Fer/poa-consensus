@@ -82,6 +82,61 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `GraphStats`, the interior filter, the public diagnostic/visualization APIs)
   is unchanged by this pass.
 
+- **Exact-duplicate divergent arms (a substitution or insertion identical to
+  one already created by an earlier read at the same fork) still fragmented
+  into separate single-read nodes instead of merging, because nothing indexed
+  "the exact sequence of bases this divergence represents" against existing
+  arms -- reuse only ever happened by accident, via ordinary DP scoring a
+  match against an existing node higher than creating a new one, which does
+  not reliably fire in repetitive sequence (see the `LOOKAHEAD_K` finding in
+  `design/graph_data_model_rework.md`).** Added a per-fork content-addressable
+  arm index, `PoaGraph.fork_arm_index: HashMap<usize, HashMap<Vec<u8>, usize>>`
+  (fork node index -> full characterized edit's bases -> existing arm's start
+  node index), consulted in `add_to_graph` before creating a new node for a
+  `Match` mismatch or an `Insert` run. Keyed by the *complete* edit, not a
+  short prefix, specifically to avoid reintroducing the false-merge risk
+  `LOOKAHEAD_K`'s own length floor already guards against for the scoring
+  path. This is Phase 3 of the plan in `design/graph_data_model_rework.md`;
+  it does not replace `LOOKAHEAD_K`/`slide_lock`, and does not attempt
+  canonicalization, so fuzzy near-duplicates (the same effective edit
+  expressed through incidentally different node chains) are unaffected by
+  design, not by oversight.
+  - **A naive first version of this idea, tried earlier in the investigation
+    that produced the design doc, reused an existing sibling out-edge on a
+    matching *first* base alone and caused real hangs (SIGKILL) on real-data
+    regression tests** by letting nodes accumulate far more in-degree/fan-in
+    than the bounded-depth arm-walking machinery elsewhere in this file
+    assumes. This phase's design mitigates that specific failure mode by
+    requiring the *entire* edit to match, verified read-only before any
+    mutation, before ever reusing a node -- confirmed safe by running the
+    same tests that hung before individually, with a bounded timeout, before
+    running the full suite.
+  - **That mitigation was necessary but not sufficient on its own.** A second,
+    different bug surfaced empirically (not assumed fixed by the design):
+    reusing an existing node for an `Insert` run redirects the read's
+    "current position" to that existing node -- but `align()` computes a
+    read's entire traceback in one pass, before `add_to_graph` runs at all,
+    and a later `Match`/`Delete` op in that *same* traceback can independently
+    name the very node reuse just redirected onto, since the DP had no idea
+    reuse would happen. Confirmed concretely on real data (DAB1 SCA37,
+    seed=25): node 49 ended up with `in_edges=[17, 49]` and
+    `out_edges=[18, 99, 49]`, a literal self-loop, which corrupted
+    `topological_order`'s Kahn's-algorithm bookkeeping (in-degree could never
+    reach zero) and hung `heaviest_path`'s traceback (an unbounded walk over a
+    predecessor-pointer array that develops its own cycle once two different
+    nodes end up assigned the same topological rank). Fixed by checking, before
+    committing any reuse, whether the candidate chain's nodes are referenced
+    again anywhere later in that read's own remaining ops; if so, reuse is
+    skipped and a fresh arm is created exactly as before this phase existed.
+  - Regression: `period7_content_addressing_reduces_duplicate_forks` (the
+    period-7 `GCTAGCT`x10 duplicate-fork audit from the earlier investigation,
+    re-measured, not assumed: 166 nodes / 71 singleton(cov=1) nodes / 14
+    duplicate-fork positions before this phase, 163 / 67 / 12 after -- a real
+    but modest reduction, consistent with this scenario being dominated by
+    fuzzy near-duplicates rather than exact ones). All 5 of the bug #6-#10
+    `diag_*` regression tests pass individually under a bounded timeout before
+    the full suite was run, per the investigation's fail-fast validation order.
+
 - **Diagonal-skip bubble pre-resolve only marked a losing arm's first node as a dead
   end, not the rest of the arm.** When the fast spine-diagonal-skip resolves a fork
   (e.g. a read-supported substitution or short indel creating an alternate node),
