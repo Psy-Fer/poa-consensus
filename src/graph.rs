@@ -188,6 +188,25 @@ struct Node {
     coverage: u32,
     /// reads that produced a Delete op at this node (traversed without consuming a base)
     delete_count: u32,
+    /// Cached `(fork, arm_entry)`: the nearest ancestor with 2+ out-edges (a
+    /// real fork) and the specific child of that fork this node's own
+    /// single-successor chain descends from -- `None` if no such ancestor
+    /// exists (this node has never had a fork anywhere back along its
+    /// creation chain). `arm_entry` is cached alongside `fork` because the
+    /// interior filter's plurality comparison needs to know *which* of the
+    /// fork's out-edges this node's arm belongs to, not just that a fork
+    /// exists.
+    ///
+    /// Populated incrementally in `add_to_graph`/`propagate_fork_if_new` --
+    /// see design/graph_data_model_rework.md Phase 4. Can go *stale in one
+    /// direction only*: pointing farther back than the true nearest fork,
+    /// never invalid (a node that is a fork never stops being one, since
+    /// out-edges are only ever added, and `arm_entry` is only ever set
+    /// alongside a `fork` that was genuinely a fork when set). Reconvergence
+    /// points (2+ in-edges) and anything past them are deliberately left
+    /// untouched by propagation -- ambiguous which incoming arm "owns" them,
+    /// so whatever was established at their own creation stays authoritative.
+    nearest_fork: Option<(usize, usize)>,
 }
 
 pub struct PoaGraph {
@@ -287,13 +306,82 @@ fn push_node(nodes: &mut Vec<Node>, base: u8) -> usize {
         in_edges: Vec::new(),
         coverage: 0,
         delete_count: 0,
+        nearest_fork: None,
     });
     idx
 }
 
+/// Bounded depth for forward propagation when a predecessor transitions from
+/// a single out-edge to a fork (2+ out-edges), fixing up the *pre-existing*
+/// arm's descendants whose cached `nearest_fork` now points farther back than
+/// this newly-forked predecessor. Mirrors `ARM_MAX_DEPTH`'s existing bound
+/// (the same order of magnitude already accepted elsewhere in this file for
+/// walking a single-successor chain) rather than inventing a new, unproven
+/// limit -- see design/graph_data_model_rework.md Phase 4 for why an
+/// *unbounded* walk here would repeat the exact class of mistake Phase 3
+/// found (nodes/walks with no depth limit blowing up on long unbranched runs).
+const FORK_PROPAGATE_MAX_DEPTH: usize = ARM_MAX_DEPTH;
+
+/// Called immediately after a new out-edge is added from `from` to some
+/// node, whether that node is brand new or already existed. If this is
+/// `from`'s *second* out-edge (a fresh 1 -> 2 transition, i.e. `from` just
+/// became a fork), walks forward along `from`'s *original* out-edge (the one
+/// that existed before this new one -- `out_edges[0]`) updating every
+/// descendant's cached `nearest_fork` to `Some((from, orig_target))`, until
+/// hitting a node that is itself already a fork (anything past it already
+/// has a closer fork of its own to be attributed to) or a reconvergence
+/// point (2+ in-edges -- ambiguous which incoming arm "owns" it, left
+/// untouched), or the depth bound. A no-op if `from` was already a fork
+/// before this edge (its pre-existing arms' descendants are already
+/// correctly attributed) or is still not one (this was its first edge).
+fn propagate_fork_if_new(nodes: &mut [Node], from: usize) {
+    if nodes[from].out_edges.len() != 2 {
+        return;
+    }
+    let orig_target = nodes[from].out_edges[0].0;
+    let mut cur = orig_target;
+    for _ in 0..FORK_PROPAGATE_MAX_DEPTH {
+        if nodes[cur].in_edges.len() > 1 {
+            break;
+        }
+        nodes[cur].nearest_fork = Some((from, orig_target));
+        match nodes[cur].out_edges.as_slice() {
+            [(next, _)] => cur = *next,
+            _ => break,
+        }
+    }
+}
+
+/// Sets a freshly-created node's own `nearest_fork`. Does NOT propagate to
+/// `p`'s *pre-existing* arm -- that has to be deferred until the current
+/// read's entire traceback has been processed (see `add_to_graph`'s
+/// `to_propagate` list), not run eagerly here. Confirmed empirically (not
+/// assumed) that eager, mid-read propagation is wrong: a single read's own
+/// later ops can turn a node the propagation already updated into a
+/// reconvergence point (2+ in-edges) a few steps later in that *same*
+/// read's own processing -- at the moment of the eager update, that
+/// downstream node still looks like an ordinary single-predecessor node, so
+/// the "don't touch reconvergence points" guard in `propagate_fork_if_new`
+/// can't see the problem coming. Running propagation only after the whole
+/// read is processed avoids this: by then, its own reconvergence, if any, has
+/// already happened, so `in_edges.len()` reflects the read's final effect.
+fn set_new_node_own_fork(nodes: &mut [Node], p: usize, new_idx: usize) {
+    if nodes[p].out_edges.len() >= 2 {
+        // p is a fork (whether it just became one or already was) --
+        // new_idx starts a fresh arm directly off it.
+        nodes[new_idx].nearest_fork = Some((p, new_idx));
+    } else {
+        nodes[new_idx].nearest_fork = nodes[p].nearest_fork;
+    }
+}
+
 /// Adds a brand-new edge with weight 1, attributed as genuine confirmation
 /// (`matched: 1, deleted: 0`). Used only for the seed's initial linear chain,
-/// where the seed read's own bases are by definition confirmed.
+/// where the seed read's own bases are by definition confirmed. Calls
+/// `propagate_fork_if_new` directly (not deferred): the seed's entire chain
+/// is built in one uninterrupted pass with exactly one out-edge per node, so
+/// there is no "this read's own later ops" to race against -- the deferred-
+/// propagation subtlety only applies within a single `add_to_graph` call.
 fn add_edge(nodes: &mut [Node], from: usize, to: usize) {
     nodes[from].out_edges.push((
         to,
@@ -303,12 +391,17 @@ fn add_edge(nodes: &mut [Node], from: usize, to: usize) {
         },
     ));
     nodes[to].in_edges.push(from);
+    propagate_fork_if_new(nodes, from);
 }
 
 /// Increments an existing edge's weight, or creates it at weight 1, routing
 /// the `+1` to `.matched` or `.deleted` depending on how this read traversed
-/// it (`is_delete`).
-fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize, is_delete: bool) {
+/// it (`is_delete`). Returns `true` if a genuinely new edge was created (as
+/// opposed to an existing one being incremented) -- callers in `add_to_graph`
+/// use this to defer `propagate_fork_if_new(nodes, from)` until the current
+/// read's traceback has been fully processed, not run it immediately.
+#[must_use]
+fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize, is_delete: bool) -> bool {
     for (succ, ew) in nodes[from].out_edges.iter_mut() {
         if *succ == to {
             if is_delete {
@@ -316,7 +409,7 @@ fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize, is_delete: 
             } else {
                 ew.matched += 1;
             }
-            return;
+            return false;
         }
     }
     let ew = if is_delete {
@@ -332,6 +425,7 @@ fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize, is_delete: 
     };
     nodes[from].out_edges.push((to, ew));
     nodes[to].in_edges.push(from);
+    true
 }
 
 // ─── Topological sort ────────────────────────────────────────────────────────
@@ -1816,7 +1910,17 @@ fn commit_reuse_chain(
 ) -> usize {
     let mut prev_node = fork;
     for &node in chain {
-        increment_or_add_edge(nodes, prev_node, node, false);
+        // Reuse only ever traverses an edge that `verify_reuse_chain` already
+        // confirmed exists (that's what makes it a "reuse" and not a fresh
+        // node creation) -- this call should always increment, never create.
+        // A brand-new edge appearing here would mean a reused arm's fork
+        // propagation was never run when the arm was first built, which
+        // would be a real bug elsewhere, not something to paper over here.
+        let created = increment_or_add_edge(nodes, prev_node, node, false);
+        debug_assert!(
+            !created,
+            "reuse chain traversed an edge that did not already exist"
+        );
         edge_reads
             .entry((prev_node, node))
             .or_default()
@@ -1863,6 +1967,18 @@ fn add_to_graph(
     let mut q_idx: usize = 0;
     let mut i = 0usize;
 
+    // Nodes that gained a new out-edge while processing *this* read.
+    // `propagate_fork_if_new` is deliberately NOT called inline as each edge
+    // is added -- confirmed empirically (see `set_new_node_own_fork`'s doc
+    // comment) that doing so races against this same read's own later ops:
+    // a node can look like an ordinary single-predecessor node at the moment
+    // a fork upstream is created, then gain a second in-edge (reconvergence)
+    // a few ops later in this exact read's own traceback. Collecting
+    // candidates here and propagating once, after the whole read's ops are
+    // processed, means `in_edges.len()` already reflects this read's final
+    // effect on the graph by the time any propagation walk inspects it.
+    let mut newly_forked: Vec<usize> = Vec::new();
+
     while i < ops.len() {
         match ops[i] {
             AlignOp::Match(node_idx) => {
@@ -1871,7 +1987,9 @@ fn add_to_graph(
                 let cur = if nodes[node_idx].base == q_base {
                     nodes[node_idx].coverage += 1;
                     if let Some(p) = prev {
-                        increment_or_add_edge(nodes, p, node_idx, false);
+                        if increment_or_add_edge(nodes, p, node_idx, false) {
+                            newly_forked.push(p);
+                        }
                         edge_reads.entry((p, node_idx)).or_default().push(read_idx);
                     }
                     node_idx
@@ -1909,6 +2027,8 @@ fn add_to_graph(
                                 .entry(p)
                                 .or_default()
                                 .insert(edit.to_vec(), new_idx);
+                            set_new_node_own_fork(nodes, p, new_idx);
+                            newly_forked.push(p);
                         }
                         new_idx
                     }
@@ -1962,6 +2082,8 @@ fn add_to_graph(
                             ));
                             nodes[new_idx].in_edges.push(p);
                             edge_reads.entry((p, new_idx)).or_default().push(read_idx);
+                            set_new_node_own_fork(nodes, p, new_idx);
+                            newly_forked.push(p);
                         }
                         chain_start.get_or_insert(new_idx);
                         prev = Some(new_idx);
@@ -1980,7 +2102,9 @@ fn add_to_graph(
             AlignOp::Delete(node_idx) => {
                 nodes[node_idx].delete_count += 1;
                 if let Some(p) = prev {
-                    increment_or_add_edge(nodes, p, node_idx, true);
+                    if increment_or_add_edge(nodes, p, node_idx, true) {
+                        newly_forked.push(p);
+                    }
                     edge_delete_reads
                         .entry((p, node_idx))
                         .or_default()
@@ -1990,6 +2114,20 @@ fn add_to_graph(
                 i += 1;
             }
         }
+    }
+
+    // Now that this read's entire traceback has been applied and the graph
+    // reflects its final shape (including any reconvergence this same read
+    // itself created), it's safe to propagate fork-context to descendants.
+    // Dedup first: a fork can appear multiple times (e.g. an Insert run's
+    // per-base loop calls this for the same `p` only once, but a read could
+    // still revisit the same fork node as `p` more than once via separate
+    // ops), and `propagate_fork_if_new` is cheap but there's no reason to
+    // redo the same walk twice.
+    newly_forked.sort_unstable();
+    newly_forked.dedup();
+    for p in newly_forked {
+        propagate_fork_if_new(nodes, p);
     }
 }
 
@@ -2814,39 +2952,35 @@ impl PoaGraph {
                 // otherwise-unbranched continuation of one of its arms,
                 // still belongs to axis 2 -- the fork's accept/reject
                 // verdict has to hold for its entire arm, not just the
-                // arm's first node, so the search below walks back through
-                // any unbranched run to find the nearest real fork before
-                // falling back to axis 1. Bounded to avoid an O(n^2) worst
-                // case on long unbranched runs.
-                const FORK_SEARCH_HOPS: usize = 64;
+                // arm's first node. Bug #8 originally found this via a
+                // bounded (64-hop) backward walk over `path[]` re-derived on
+                // every call; Phase 4 (design/graph_data_model_rework.md)
+                // replaces that re-derivation with `Node.nearest_fork`, a
+                // cache populated incrementally as the graph is built (see
+                // `propagate_fork_if_new`) instead of walked fresh here.
+                // Judgment is unchanged -- same two axes, same tests below --
+                // only how the fork-context lookup happens.
+                //
+                // One boundary-compatibility check is still needed: the old
+                // walk refused to look further back than `range_start` (the
+                // start of *this call's* boundary-trimmed region), so a
+                // fork sitting entirely within the trimmed-away leading
+                // section was treated as "none found," falling back to
+                // axis 1. `nearest_fork` is a graph-level cache with no
+                // notion of any particular call's boundary trim, so that
+                // check is reproduced explicitly via `rank_of` to keep the
+                // exact same behaviour at that edge.
                 let range_start = range.start;
+                let range_start_rank = rank_of[path[range_start].0];
                 range
                     .filter(|&i| {
                         let (node_idx, _, _) = path[i];
                         if meets_floor[i] {
                             return true;
                         }
-                        let mut search_idx = i;
-                        let mut hops = 0usize;
-                        let fork_info = loop {
-                            if search_idx == range_start || hops >= FORK_SEARCH_HOPS {
-                                break None;
-                            }
-                            let (cand_idx, _, _) = path[search_idx - 1];
-                            if self.nodes[cand_idx].out_edges.len() >= 2 {
-                                // `arm_idx` is the immediate child of the fork
-                                // on *this* path -- constant for every node
-                                // downstream of it on the same unbranched
-                                // arm, so the plurality comparison below
-                                // (this arm's entry weight vs every sibling's)
-                                // gives the same verdict to the whole arm,
-                                // not just its first node.
-                                let (arm_idx, _, _) = path[search_idx];
-                                break Some((cand_idx, arm_idx));
-                            }
-                            search_idx -= 1;
-                            hops += 1;
-                        };
+                        let fork_info = self.nodes[node_idx]
+                            .nearest_fork
+                            .filter(|&(pred_idx, _)| rank_of[pred_idx] >= range_start_rank);
                         let Some((pred_idx, arm_idx)) = fork_info else {
                             return self.nodes[node_idx].coverage
                                 > self.nodes[node_idx].delete_count;
@@ -3255,5 +3389,231 @@ fn coverage_threshold(population: usize, min_coverage_fraction: f64) -> u32 {
         1
     } else {
         ((population / 2 + 1).max(2)) as u32
+    }
+}
+
+// ─── White-box tests: nearest_fork cache (Phase 4) ──────────────────────────
+//
+// `Node.nearest_fork` is a private field, so exercising it directly (not just
+// observing its downstream effect on `consensus()`'s output) requires a
+// same-module test, unlike the rest of this crate's tests (in `src/tests.rs`,
+// a sibling module that only sees public API). This module is specifically
+// for verifying the cache's own internal correctness -- the staleness
+// question the design doc calls out as unproven.
+#[cfg(test)]
+mod fork_cache_tests {
+    use super::*;
+
+    fn b(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    /// Directly exercises the staleness scenario: several reads establish a
+    /// clean run of single-out-edge nodes, *then* a later read introduces a
+    /// divergence at a node that was already a stable single-successor
+    /// predecessor for existing descendants, turning it into a fork after
+    /// the fact. Confirms the *pre-existing* descendants' cached
+    /// `nearest_fork` gets updated by forward propagation, by comparing
+    /// against an independent, exhaustive (unbounded) backward walk computed
+    /// fresh from the raw graph -- not just checking the cache agrees with
+    /// itself.
+    #[test]
+    fn nearest_fork_updates_for_preexisting_descendants_after_late_fork() {
+        // Seed: 4 A's (unique-enough prefix) + a 12-base non-repetitive tail.
+        // Node at position 4 (the tail's first base) is the one we'll fork
+        // later; positions 5..15 are its pre-existing descendants.
+        let seed = b("AAAACGTACGTACGTA");
+        let cfg = PoaConfig {
+            min_reads: 3,
+            band_width: 0,
+            adaptive_band: false,
+            warn_on_long_unbanded: false,
+            ..Default::default()
+        };
+        let mut g = PoaGraph::new(&seed, cfg).unwrap();
+
+        // Several reads that match the seed exactly: establishes positions
+        // 5..15 as a clean, unforked single-successor chain (their
+        // nearest_fork should all be None at this point -- no fork anywhere
+        // in this graph yet).
+        for _ in 0..4 {
+            g.add_read(&seed).unwrap();
+        }
+        for idx in 5..seed.len() {
+            assert_eq!(
+                g.nodes[idx].nearest_fork, None,
+                "node {idx} should have no fork ancestor yet (pre-divergence)"
+            );
+            assert_eq!(
+                g.nodes[idx].in_edges.len(),
+                1,
+                "node {idx} should be a plain single-predecessor chain node"
+            );
+        }
+        let fork_node = 4; // 'C', the first tail base
+        assert_eq!(g.nodes[fork_node].out_edges.len(), 1, "not yet a fork");
+        let orig_child = g.nodes[fork_node].out_edges[0].0;
+        assert_eq!(orig_child, 5);
+
+        // Now a later read diverges immediately after position 4 (matches
+        // "AAAAC" then substitutes the next base), giving node 4 a second
+        // out-edge -- turning it into a fork *after* positions 5..15 already
+        // existed as node 4's only descendants. Deliberately ends right at
+        // the mismatch (no shared suffix appended): the read's remaining
+        // bases would otherwise happen to equal seed[6..] exactly (both are
+        // the same repeat unit), so the aligner would legitimately re-Match
+        // them onto nodes 6..15 and reconverge there for real -- a correct
+        // but different scenario (fork-then-genuine-reconvergence) that this
+        // test isn't targeting. Ending here under SemiGlobal (free trailing
+        // gap, the default) isolates the forward-propagation question: does
+        // the still-untouched, never-reconverged 5..15 chain get its cached
+        // nearest_fork updated once node 4 retroactively becomes a fork.
+        let mut divergent = b("AAAAC");
+        divergent.push(b'T'); // seed has 'G' here; this read has 'T'
+        for _ in 0..3 {
+            g.add_read(&divergent).unwrap();
+        }
+        assert_eq!(
+            g.nodes[fork_node].out_edges.len(),
+            2,
+            "node {fork_node} should now be a genuine fork"
+        );
+
+        // Independent ground truth: walk backward from each descendant
+        // through raw in_edges (exhaustive, no hop bound -- safe here since
+        // the test graph is tiny), looking for the nearest node with 2+
+        // out-edges. This is deliberately NOT the cache and NOT the
+        // production interior-filter walk, so agreement is real evidence,
+        // not the cache checking itself.
+        fn ground_truth_nearest_fork(nodes: &[Node], start: usize) -> Option<(usize, usize)> {
+            let mut cur = start;
+            loop {
+                if nodes[cur].in_edges.len() != 1 {
+                    return None; // reached a reconvergence/source with no single predecessor
+                }
+                let pred = nodes[cur].in_edges[0];
+                if nodes[pred].out_edges.len() >= 2 {
+                    // `cur` is pred's direct child -- the arm entry point --
+                    // not the node we started the walk from.
+                    return Some((pred, cur));
+                }
+                cur = pred;
+            }
+        }
+
+        for idx in 5..seed.len() {
+            let expected = ground_truth_nearest_fork(&g.nodes, idx);
+            assert_eq!(
+                g.nodes[idx].nearest_fork, expected,
+                "node {idx}: cached nearest_fork should match the independently-computed \
+                 ground truth after node {fork_node} became a fork post-hoc"
+            );
+            assert_eq!(
+                g.nodes[idx].nearest_fork,
+                Some((fork_node, orig_child)),
+                "node {idx}: expected the cache to have been updated by forward \
+                 propagation to point at the newly-created fork"
+            );
+        }
+    }
+
+    /// The adversarial case that the first version of the test above
+    /// actually hit (by accident, before its own construction was fixed):
+    /// a single read both creates a brand-new fork AND, later in that exact
+    /// same read's own traceback, reconverges back onto the pre-existing
+    /// chain. This is exactly the timing hazard eager, inline propagation
+    /// got wrong (a downstream node looked like an ordinary single-
+    /// predecessor node at the moment the fork upstream was created, then
+    /// gained a second in-edge moments later in the same read). Confirms
+    /// the reconvergence node itself, and everything downstream of it, is
+    /// correctly left untouched (still `None`, matching an independent
+    /// ground-truth walk) rather than being stale-updated to point at the
+    /// new fork.
+    #[test]
+    fn nearest_fork_same_read_reconvergence_is_not_stale_updated() {
+        let seed = b("AAAACGTACGTACGTA");
+        let cfg = PoaConfig {
+            min_reads: 3,
+            band_width: 0,
+            adaptive_band: false,
+            warn_on_long_unbanded: false,
+            ..Default::default()
+        };
+        let mut g = PoaGraph::new(&seed, cfg).unwrap();
+        for _ in 0..4 {
+            g.add_read(&seed).unwrap();
+        }
+        let fork_node = 4;
+        let orig_child = g.nodes[fork_node].out_edges[0].0;
+        assert_eq!(orig_child, 5);
+
+        // This divergent read substitutes one base at position 5, then
+        // continues with the *same* suffix as the seed (seed[6..]) -- so
+        // after the mismatch, its remaining bases genuinely re-Match nodes
+        // 6..15 one-for-one, giving node 6 a real second in-edge from the
+        // new mismatch node. Node 4 becomes a fork; node 6 becomes a true
+        // reconvergence point; both effects come from this one read.
+        let mut divergent = b("AAAAC");
+        divergent.push(b'T'); // seed has 'G' here
+        divergent.extend_from_slice(&seed[6..]);
+        for _ in 0..3 {
+            g.add_read(&divergent).unwrap();
+        }
+        assert_eq!(
+            g.nodes[fork_node].out_edges.len(),
+            2,
+            "node {fork_node} should now be a genuine fork"
+        );
+        let reconv = 6usize;
+        assert_eq!(
+            g.nodes[reconv].in_edges.len(),
+            2,
+            "node {reconv} should have genuinely reconverged (2 predecessors) \
+             within the same read that created the fork"
+        );
+
+        fn ground_truth_nearest_fork(nodes: &[Node], start: usize) -> Option<(usize, usize)> {
+            let mut cur = start;
+            loop {
+                if nodes[cur].in_edges.len() != 1 {
+                    return None;
+                }
+                let pred = nodes[cur].in_edges[0];
+                if nodes[pred].out_edges.len() >= 2 {
+                    return Some((pred, cur));
+                }
+                cur = pred;
+            }
+        }
+
+        // Node 5 sits strictly between the fork and the reconvergence: it
+        // should still get the new fork.
+        assert_eq!(
+            g.nodes[5].nearest_fork,
+            Some((fork_node, orig_child)),
+            "node 5 (between the fork and the reconvergence) should still be updated"
+        );
+        assert_eq!(
+            g.nodes[5].nearest_fork,
+            ground_truth_nearest_fork(&g.nodes, 5)
+        );
+
+        // Node 6 (the reconvergence point itself) and everything downstream
+        // of it must NOT be stale-updated to the new fork -- they should
+        // match ground truth, which is None past a real reconvergence.
+        for idx in 6..seed.len() {
+            let expected = ground_truth_nearest_fork(&g.nodes, idx);
+            assert_eq!(
+                expected, None,
+                "sanity check on the ground-truth helper itself: node {idx} \
+                 is past a real reconvergence, so ground truth must be None"
+            );
+            assert_eq!(
+                g.nodes[idx].nearest_fork, expected,
+                "node {idx}: must not be stale-updated across the reconvergence \
+                 at node {reconv} -- this is the exact hazard deferred (end-of-read) \
+                 propagation is meant to avoid"
+            );
+        }
     }
 }

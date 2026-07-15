@@ -182,6 +182,74 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Regression: `tests/band_width_zero_unbanded.rs` (synthetic fixture; no real patient
   data).
 
+- **The interior filter's fork-context lookup (Known Bugs #6-#10) re-derived
+  "is there a fork anywhere back along this node's unbranched run" from scratch
+  on every `consensus()` call, via a 64-hop bounded backward walk over the
+  heaviest-path spine (`path[search_idx - 1]`, added by bug #8's fix).** This
+  worked but was pure re-derivation: the same walk runs again for every node
+  in the filtered range, on every call, even though the answer only changes
+  when the graph's edge structure changes. Added `Node.nearest_fork:
+  Option<(usize, usize)>` (nearest ancestor with 2+ out-edges, and which of
+  its out-edges this node descends from), populated incrementally as the
+  graph is built rather than walked at consensus time: a brand-new node
+  inherits its predecessor's `nearest_fork` unless the predecessor is itself
+  a fork, and when a predecessor gains a second out-edge partway through
+  the graph's life, `propagate_fork_if_new` walks forward from its existing
+  child to backfill `nearest_fork` on every already-existing descendant,
+  stopping at a reconvergence point (2+ in-edges), a further fork, or a
+  bounded depth (`ARM_MAX_DEPTH`, matching an existing bound already used
+  elsewhere in the file, rather than inventing an unproven new one). The
+  interior filter's fork lookup itself now reads `Node.nearest_fork` directly;
+  its accept/reject judgment (both axes: `coverage > delete_count` when no
+  fork is in reach, majority/plurality-of-the-fork's-local-total otherwise)
+  is unchanged, confirmed by the full test suite passing byte-for-byte
+  identically, not by inspection alone.
+  - **The staleness question this design flagged as unproven -- does a
+    cache populated incrementally stay correct when a node that was a stable,
+    unforked single-successor predecessor for existing descendants later
+    becomes a fork -- was real, not hypothetical.** A first version called
+    `propagate_fork_if_new` eagerly, inline, at the moment each new edge was
+    added. A constructed regression test (several reads establish nodes 5-15
+    as a clean single-predecessor chain off node 4, then later reads give
+    node 4 a second out-edge) initially failed: propagation correctly walked
+    forward and updated node 5, but a downstream node one read's own
+    traceback would *later* turn into a genuine reconvergence point was
+    updated first, before that same read's remaining ops added the second
+    in-edge that should have made it ineligible -- eager propagation had no
+    way to see a reconvergence its own read hadn't gotten around to creating
+    yet. Fixed by deferring propagation: `add_to_graph` now collects every
+    node that gained a new out-edge while processing the *current* read into
+    a list, and only calls `propagate_fork_if_new` for each of them once,
+    after that read's entire op sequence has been applied -- by which point
+    any reconvergence the read itself causes is already reflected in
+    `in_edges.len()`. Two regression tests capture this directly:
+    `nearest_fork_updates_for_preexisting_descendants_after_late_fork` (the
+    non-reconverging case: a permanently divergent one-node arm, confirming
+    forward propagation reaches every pre-existing descendant) and
+    `nearest_fork_same_read_reconvergence_is_not_stale_updated` (the
+    adversarial case: a single read both creates the fork and reconverges
+    back onto the original chain a few bases later, confirming the
+    reconvergence node and everything past it is correctly left at its old
+    value rather than stale-updated) -- both checked against an independent,
+    from-scratch backward walk over raw `in_edges`, not against the cache's
+    own logic. (White-box tests: `Node.nearest_fork` is a private field, so
+    these live in `#[cfg(test)] mod fork_cache_tests` inside `src/graph.rs`
+    itself rather than the black-box `src/tests.rs`.)
+  - One behavioral-equivalence subtlety needed an explicit guard rather than
+    a silent drop: the old walk refused to look further back than the start
+    of the current call's boundary-trimmed range (`range_start`), since a
+    fork sitting entirely within the trimmed-away leading section shouldn't
+    count. `nearest_fork` has no notion of any particular call's boundary
+    trim (it's a graph-level property), so the rewired filter reproduces
+    the same cutoff explicitly via topological rank comparison
+    (`rank_of[pred_idx] >= range_start_rank`) rather than dropping the check
+    and letting behavior drift.
+  - Phase 4 of the plan in `design/graph_data_model_rework.md`, and the
+    highest-risk phase of it by the plan's own assessment -- confirmed by
+    this being the first phase where the design's own explicitly-flagged
+    "unproven" concern (staleness) turned out to be a real bug, not a false
+    alarm.
+
 ### Breaking
 
 - **`BubbleSite.arm_read_counts` now counts only reads that genuinely confirmed
