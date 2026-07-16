@@ -254,6 +254,19 @@ pub struct PoaGraph {
     /// near-duplicates (edits with the same effect but different incidental
     /// length/shape) -- only byte-identical edits hash-match.
     fork_arm_index: HashMap<usize, HashMap<Vec<u8>, usize>>,
+    /// Set when any `add_read` call needed `align_with_retry`'s pass 2 or 3
+    /// (i.e. the configured band was too narrow for at least one read).
+    /// Read by `build_graph` (`src/lib.rs`): a graph built from a *mix* of
+    /// some reads succeeding on the configured (narrow) band and others
+    /// only succeeding after a wider retry is not the same as building the
+    /// whole graph with a single, consistent band from the start -- in a
+    /// periodic/repetitive locus, different reads can settle on different,
+    /// individually-plausible diagonals (Known Bug #3's mechanism),
+    /// fragmenting bubble structure that a uniformly-unbanded build would
+    /// not. `build_graph` uses this flag to rebuild the whole graph
+    /// unbanded from scratch when set, rather than trusting a
+    /// mixed-band graph as-is.
+    used_band_retry: bool,
 }
 
 // ─── DP cell ─────────────────────────────────────────────────────────────────
@@ -402,6 +415,10 @@ fn add_edge(nodes: &mut [Node], from: usize, to: usize) {
 /// read's traceback has been fully processed, not run it immediately.
 #[must_use]
 fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize, is_delete: bool) -> bool {
+    debug_assert_ne!(
+        from, to,
+        "increment_or_add_edge: refusing to create/increment a literal self-loop"
+    );
     for (succ, ew) in nodes[from].out_edges.iter_mut() {
         if *succ == to {
             if is_delete {
@@ -1830,7 +1847,41 @@ fn align(
 
     let (best_t, best_state) = match terminal_best {
         Some(result) => result,
-        None => (0, State::M),
+        None => {
+            // No node's banded row-window reached query column `l` at all --
+            // the DP could not complete within the configured band. This
+            // used to fall back to `(0, State::M)`, a fabricated starting
+            // point nowhere near a real cell, which made the traceback
+            // below immediately hit an UNSET cell and silently return an
+            // empty `Vec<AlignOp>` -- no error, no warning, just a no-op
+            // alignment that `add_to_graph` then applies as if the read
+            // contributed nothing at all. Confirmed on real data
+            // (`tests/adaptive_band_collapse.rs`): every non-seed read in a
+            // population wider than the effective band hits this
+            // identically, leaving the graph as just the seed's own linear
+            // chain, which `consensus()`'s boundary trim then collapses to
+            // a single base.
+            //
+            // `required` is estimated from `best_j_per_t`, which every row
+            // already updates with the furthest query column its own
+            // window reached (used elsewhere for the diagonal-skip
+            // machinery, reused here rather than tracked separately): the
+            // row that got closest to `l` fell short by
+            // `l - max(best_j_per_t)`, so widening the margin by that same
+            // amount is the natural single-shot estimate of what would
+            // have worked. This is a heuristic, not a proof of
+            // sufficiency -- see `align_with_retry`'s 3-pass caller, which
+            // does not trust this estimate alone and escalates to a
+            // mathematically-guaranteed-sufficient fully unbanded retry
+            // if it turns out to still be too narrow.
+            let max_best_j = best_j_per_t.iter().copied().max().unwrap_or(0);
+            let shortfall = l.saturating_sub(max_best_j);
+            let required = spine_margin.saturating_add(shortfall);
+            return Err(PoaError::BandTooNarrow {
+                configured: spine_margin,
+                required,
+            });
+        }
     };
 
     // ── Traceback ─────────────────────────────────────────────────────────────
@@ -1839,7 +1890,30 @@ fn align(
     let mut j = l;
     let mut cur_state = best_state;
 
+    // Defensive bound: a traceback over a well-formed DAG can never produce
+    // more than `l` Insert/Match steps (each consumes one query base) plus
+    // `n` Match/Delete steps (each consumes one graph node), so `l + n` is a
+    // hard ceiling for any *correct* alignment. This crate has a documented
+    // history of node-graph self-loops corrupting exactly this kind of
+    // predecessor-pointer walk (see `design/graph_data_model_rework.md`
+    // Phase 3's account of a literal node self-loop hanging
+    // `heaviest_path`'s own traceback) -- if that class of bug is ever
+    // reached from this traceback too, looping forever while `ops` grows
+    // without bound is an OOM/crash risk, not just a slow answer. Treating
+    // an over-long traceback as `BandTooNarrow` (rather than a silent
+    // infinite loop) is conservative: it costs nothing in the overwhelming
+    // majority of calls that never approach this bound, and turns a
+    // process-ending crash into a catchable, retriable error for the rare
+    // case that does.
+    let max_ops = l.saturating_add(n).saturating_add(16);
+
     loop {
+        if ops.len() > max_ops {
+            return Err(PoaError::BandTooNarrow {
+                configured: spine_margin,
+                required: spine_margin.saturating_mul(2).max(l),
+            });
+        }
         let cell = {
             let jlo = j_lo_arr[t];
             let jhi = j_hi_arr[t];
@@ -1921,6 +1995,82 @@ fn align(
 
     ops.reverse();
     Ok(ops)
+}
+
+/// Wraps [`align`] with a bounded, guaranteed-terminating retry for
+/// [`PoaError::BandTooNarrow`].
+///
+/// `TODO.md` has long described a "smart retry (3-pass)" here -- pass 1 at
+/// the configured width, pass 2 at the error's own `required` estimate,
+/// pass 3 fully unbanded -- as already implemented. It was not: `align`
+/// never returned `Err` at all before the fix that added the
+/// `BandTooNarrow` path above (confirmed by exhaustive search), so no
+/// caller ever exercised a retry, and none existed. Several existing
+/// tests (`band_too_narrow_fallback_to_unbanded`,
+/// `tracking_band_survives_phase_shift`) already asserted the *outcome*
+/// this retry produces, and passed anyway, for the wrong reason -- not
+/// because a retry recovered a wide-enough band, but because the missing
+/// `BandTooNarrow` path meant `align` silently returned a degenerate
+/// (possibly empty) alignment that the assertions happened not to notice
+/// was wrong. This is that design, actually built:
+///
+/// - **Pass 1**: the caller's own config, unmodified. This is the
+///   overwhelmingly common path and costs nothing extra when it succeeds.
+/// - **Pass 2**: on `BandTooNarrow`, retry once with `band_width` set to
+///   the error's own `required` estimate and `adaptive_band` forced off
+///   (so `required` is the literal effective margin used, not further
+///   changed by the adaptive formula), and with `anchors` cleared -- an
+///   anchor chain computed for the original, too-narrow window is not
+///   necessarily valid for a wider one, and `align_read_ops`/
+///   `align_read_ops_unbanded` already always call with no anchors for
+///   exactly this reason (a "just get a correct alignment" call, not a
+///   performance-sensitive incremental one).
+/// - **Pass 3**: if pass 2 *also* returns `BandTooNarrow` (the pass-1
+///   heuristic `required` estimate under-shot -- `real_in_edge_count`-style
+///   estimates elsewhere in this file are deliberately conservative, but
+///   this one is a single-shot approximation, not a proven lower bound),
+///   retry with a fully unbanded config (`band_width = 0, adaptive_band =
+///   false`, i.e. `spine_margin = l`) -- mathematically guaranteed
+///   sufficient (full NW over the DAG), not another estimate. If this
+///   *still* errors, that is a genuine, unexpected failure and is
+///   propagated rather than looped on again.
+///
+/// Returns `(ops, retried)`: `retried` is `true` whenever pass 1 (the
+/// caller's own config) did not succeed on its own, so the caller can tell
+/// a clean single-band alignment from one that only succeeded after
+/// widening -- see `PoaGraph::used_band_retry` for why that distinction
+/// matters beyond just "did it eventually succeed."
+#[allow(clippy::too_many_arguments)]
+fn align_with_retry(
+    nodes: &[Node],
+    topo: &[usize],
+    rank_of: &[usize],
+    spine: &[(usize, u8, i32)],
+    query: &[u8],
+    cfg: &PoaConfig,
+    scratch: &mut AlignScratch,
+    anchors: &[(usize, usize)],
+) -> Result<(Vec<AlignOp>, bool), PoaError> {
+    match align(nodes, topo, rank_of, spine, query, cfg, scratch, anchors) {
+        Ok(ops) => Ok((ops, false)),
+        Err(PoaError::BandTooNarrow { required, .. }) => {
+            let mut cfg2 = cfg.clone();
+            cfg2.band_width = required;
+            cfg2.adaptive_band = false;
+            match align(nodes, topo, rank_of, spine, query, &cfg2, scratch, &[]) {
+                Ok(ops) => Ok((ops, true)),
+                Err(PoaError::BandTooNarrow { .. }) => {
+                    let mut cfg3 = cfg.clone();
+                    cfg3.band_width = 0;
+                    cfg3.adaptive_band = false;
+                    align(nodes, topo, rank_of, spine, query, &cfg3, scratch, &[])
+                        .map(|ops| (ops, true))
+                }
+                Err(other) => Err(other),
+            }
+        }
+        Err(other) => Err(other),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2008,6 +2158,65 @@ fn reuse_would_collide(chain: &[usize], rest: &[AlignOp]) -> bool {
     })
 }
 
+/// Returns `true` if committing this reuse would create a back edge relative
+/// to the *rest of this same read's own traceback*, not just relative to the
+/// fork itself (that narrower check lives in `try_reuse_arm`, comparing only
+/// `fork` against `chain[0]`).
+///
+/// `align()`'s own traceback is provably rank-monotonic in the *original*
+/// node identities it names: reading its `Match`/`Delete` ops in forward
+/// order, the referenced existing-node rank strictly increases throughout
+/// (each step in the backward-built traceback moves to a strictly smaller
+/// DP row, so after `ops.reverse()` the forward sequence strictly
+/// increases). Confirmed empirically by dumping a real failing read's ops
+/// end to end: no adjacent pair of `Match`/`Delete` references ever regresses
+/// in rank.
+///
+/// Reuse breaks this guarantee from the *outside*: it substitutes a
+/// *different*, already-existing node (`chain`'s last element, at whatever
+/// rank that node happens to have) in place of whatever fresh identity
+/// `align()`'s own traceback implicitly expected at this position. The very
+/// next `Match`/`Delete` op in `rest` (an ordinary, unprotected
+/// `increment_or_add_edge` call in `add_to_graph`, ordinary edges never
+/// having needed a rank check before reuse existed) then wires an edge from
+/// this substitute straight to whatever existing node `align()` visits next
+/// -- which is only ever safe if the substitute's rank is still *less than*
+/// that next node's rank. `chain`'s internal edges are all real, pre-existing
+/// graph edges (verified by `verify_reuse_chain`'s single-out-edge walk), so
+/// rank strictly increases along `chain` too; checking only the *last*
+/// element (the one `prev` becomes) against the first subsequent existing-
+/// node reference is therefore sufficient -- if that holds, every earlier
+/// `chain` element (smaller rank) holds too.
+///
+/// Confirmed concretely via a `cag50_hifi`-class read set once the
+/// `BandTooNarrow` retry started actually widening bands for some reads: a
+/// substitution reuse landed on an existing node whose rank happened to sit
+/// *after* the very next node `align()`'s own traceback visited, splicing in
+/// a real back edge and corrupting the graph into a cycle -- silently
+/// hanging `heaviest_path`'s traceback in an unbounded loop (the same
+/// failure class `reuse_would_collide` already guards, reached by a
+/// different route: rank inversion rather than direct index reappearance).
+fn reuse_would_create_back_edge(rank_of: &[usize], chain: &[usize], rest: &[AlignOp]) -> bool {
+    let Some(&last_rank) = chain.last().and_then(|&idx| rank_of.get(idx)) else {
+        return false;
+    };
+    for op in rest {
+        if let AlignOp::Match(idx) | AlignOp::Delete(idx) = *op {
+            return match rank_of.get(idx) {
+                Some(&r) => last_rank >= r,
+                // `idx` isn't in this read's entry-snapshot rank_of at all,
+                // meaning it's a node this same read created after the
+                // snapshot was taken -- Match/Delete ops from align()'s own
+                // traceback never reference such nodes (they only name
+                // nodes that existed before this read started), so this
+                // shouldn't happen; bail out defensively rather than reject.
+                None => false,
+            };
+        }
+    }
+    false
+}
+
 /// Commits a verified reuse chain: increments edge weight/`edge_reads` and
 /// bumps `coverage` on every reused node -- the same effect a genuine `Match`
 /// against each of these nodes would have had. Only ever called after both
@@ -2045,19 +2254,67 @@ fn commit_reuse_chain(
 /// Looks up, verifies, and safety-checks a candidate reuse in one call;
 /// returns the reused chain's last node index on success. See
 /// `verify_reuse_chain` and `reuse_would_collide` for what "success" means.
+///
+/// `rank_of` is the topological rank snapshot taken at the *start* of the
+/// current `add_read` call (before this read's own ops are applied). Reuse
+/// splices a brand-new edge `fork -> chain[0]` between two nodes that both
+/// already existed in the graph -- unlike an ordinary Match/Insert/Delete op,
+/// which only ever connects nodes along `align()`'s own traceback and is
+/// therefore guaranteed rank-monotonic by construction (each step moves to a
+/// strictly smaller DP row), this edge is *not* derived from that traceback
+/// at all. It comes from `fork_arm_index`, a lookup keyed only by content
+/// (the fork node and the edit's bytes), with no reference to where either
+/// node sits in the graph's real topological order relative to the other.
+///
+/// `reuse_would_collide` guards one specific way this can go wrong (the
+/// reused chain reappearing later in this same read's own remaining ops),
+/// but not this one: if `fork` is not actually an ancestor of `chain[0]` in
+/// the graph's existing structure (i.e. `chain[0]` already sits at or before
+/// `fork` in topological order), splicing in `fork -> chain[0]` creates a
+/// genuine multi-node cycle, not a same-read self-loop. `reuse_would_collide`
+/// cannot see this because it only ever looks within the current read's own
+/// ops; it has no way to know the reused chain's actual position in the rest
+/// of the graph.
+///
+/// Confirmed concretely via a `cag50_hifi`-class read set once the
+/// `BandTooNarrow` retry (see `align_with_retry`) started actually firing:
+/// a retried alignment pass (wider band, anchors cleared) can settle on a
+/// different fork/traceback shape than the pass that originally populated
+/// `fork_arm_index` for this position, so by the time a later read's ops
+/// reach this same fork, `chain[0]` may already be topologically upstream of
+/// `fork` rather than downstream. Committing the reuse in that case corrupts
+/// the graph into a real cycle: `topological_order`'s Kahn's-algorithm queue
+/// never reaches in-degree zero for the cyclic nodes, silently excluding them
+/// from `topo` (and leaving their `rank_of` entries at the default `0`,
+/// colliding with whatever node is legitimately first), which in turn hangs
+/// `heaviest_path`'s own predecessor-pointer traceback in an unbounded loop
+/// -- the same failure class already documented on `reuse_would_collide`,
+/// just reached by a different path. Rejecting the reuse whenever it would
+/// not be rank-increasing is cheap (an O(1) rank comparison) and always
+/// safe: falling through to fresh-node creation, exactly like the existing
+/// `None`-returning cases, can never introduce a cycle since a brand-new node
+/// has no edges to anywhere except `fork` and, later, its own single
+/// successor.
 #[allow(clippy::too_many_arguments)]
 fn try_reuse_arm(
     nodes: &mut [Node],
     edge_reads: &mut HashMap<(usize, usize), Vec<u32>>,
     fork_arm_index: &HashMap<usize, HashMap<Vec<u8>, usize>>,
+    rank_of: &[usize],
     fork: usize,
     edit: &[u8],
     rest_ops: &[AlignOp],
     read_idx: u32,
 ) -> Option<usize> {
     let start = *fork_arm_index.get(&fork)?.get(edit)?;
+    if fork >= rank_of.len() || start >= rank_of.len() || rank_of[fork] >= rank_of[start] {
+        return None;
+    }
     let chain = verify_reuse_chain(nodes, edit, start)?;
     if reuse_would_collide(&chain, rest_ops) {
+        return None;
+    }
+    if reuse_would_create_back_edge(rank_of, &chain, rest_ops) {
         return None;
     }
     Some(commit_reuse_chain(
@@ -2065,11 +2322,13 @@ fn try_reuse_arm(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_to_graph(
     nodes: &mut Vec<Node>,
     edge_reads: &mut HashMap<(usize, usize), Vec<u32>>,
     edge_delete_reads: &mut HashMap<(usize, usize), Vec<u32>>,
     fork_arm_index: &mut HashMap<usize, HashMap<Vec<u8>, usize>>,
+    rank_of: &[usize],
     query: &[u8],
     ops: &[AlignOp],
     read_idx: u32,
@@ -2113,6 +2372,7 @@ fn add_to_graph(
                             nodes,
                             edge_reads,
                             fork_arm_index,
+                            rank_of,
                             p,
                             &edit,
                             &ops[i + 1..],
@@ -2169,6 +2429,7 @@ fn add_to_graph(
                         nodes,
                         edge_reads,
                         fork_arm_index,
+                        rank_of,
                         p,
                         &edit,
                         &ops[j..],
@@ -3304,6 +3565,7 @@ impl PoaGraph {
             align_scratch: AlignScratch::new(),
             spine_mers: HashMap::new(),
             fork_arm_index: HashMap::new(),
+            used_band_retry: false,
         })
     }
 
@@ -3313,6 +3575,24 @@ impl PoaGraph {
         }
 
         let (topo, rank_of) = topological_order(&self.nodes);
+        // Permanent internal invariant, zero-cost in release builds: the
+        // graph must always be a DAG entering `add_read`. If it isn't,
+        // `topological_order`'s Kahn's-algorithm queue silently excludes the
+        // cyclic nodes from `topo` rather than erroring, which would hang
+        // `heaviest_path`'s predecessor-pointer traceback in an unbounded
+        // loop the next time the spine is refreshed (see
+        // `reuse_would_create_back_edge`'s doc comment for how this was
+        // introduced and fixed). Catching the violation here, right at the
+        // point a caller could next observe it, is far cheaper to diagnose
+        // than the OOM it would otherwise cause.
+        debug_assert_eq!(
+            topo.len(),
+            self.nodes.len(),
+            "graph has a cycle before adding read {}: topo includes {} of {} nodes",
+            self.n_reads,
+            topo.len(),
+            self.nodes.len()
+        );
 
         // Refresh the spine when the cache is empty or the interval has elapsed.
         // The interval doubles each time the spine is stable (≤ SPINE_STABLE_THRESHOLD
@@ -3362,7 +3642,7 @@ impl PoaGraph {
             vec![]
         };
 
-        let ops = align(
+        let (ops, retried) = align_with_retry(
             &self.nodes,
             &topo,
             &rank_of,
@@ -3372,12 +3652,16 @@ impl PoaGraph {
             &mut self.align_scratch,
             &anchors,
         )?;
+        if retried {
+            self.used_band_retry = true;
+        }
         let read_idx = self.n_reads as u32;
         add_to_graph(
             &mut self.nodes,
             &mut self.edge_reads,
             &mut self.edge_delete_reads,
             &mut self.fork_arm_index,
+            &rank_of,
             read,
             &ops,
             read_idx,
@@ -3652,7 +3936,7 @@ impl PoaGraph {
     ) -> Result<(Vec<AlignOp>, usize, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
         let spine = heaviest_path(&self.nodes, &topo, &rank_of);
-        let ops = align(
+        let (ops, _retried) = align_with_retry(
             &self.nodes,
             &topo,
             &rank_of,
@@ -3672,7 +3956,7 @@ impl PoaGraph {
     ) -> Result<(Vec<AlignOp>, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
         let spine = heaviest_path(&self.nodes, &topo, &rank_of);
-        let ops = align(
+        let (ops, _retried) = align_with_retry(
             &self.nodes,
             &topo,
             &rank_of,
@@ -3688,6 +3972,17 @@ impl PoaGraph {
     /// Number of nodes currently in the graph.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// `true` if any `add_read` call so far needed `align_with_retry`'s
+    /// pass 2 or 3 (the configured band was too narrow for at least one
+    /// read). Crate-internal: consumed by `build_graph` (`src/lib.rs`) to
+    /// decide whether the whole graph needs a consistent unbanded rebuild
+    /// -- see `used_band_retry`'s own field doc comment for why a graph
+    /// built from a mix of band widths across different reads is not
+    /// trustworthy as-is in a periodic/repetitive locus.
+    pub(crate) fn used_band_retry(&self) -> bool {
+        self.used_band_retry
     }
 
     /// Return a snapshot of the graph topology for visualization and inspection.
@@ -4156,6 +4451,176 @@ mod fork_cache_tests {
                 "node {idx}: must not be stale-updated across the reconvergence \
                  at node {reconv} -- this is the exact hazard deferred (end-of-read) \
                  propagation is meant to avoid"
+            );
+        }
+    }
+}
+
+// ─── White-box tests: BandTooNarrow + align_with_retry ─────────────────────
+//
+// `align` and `align_with_retry` are private, so directly confirming the
+// exact threshold at which a too-narrow band now returns `BandTooNarrow`
+// (rather than the old silent empty-ops collapse), and that the retry
+// wrapper recovers a correct alignment, requires a same-module test.
+//
+// Fixture: a 100bp seed and a 220bp query built by appending 120bp of new
+// content to the seed's own sequence -- deliberately non-repetitive (unlike
+// `tests/adaptive_band_collapse.rs`'s real GAA-repeat fixture) so the
+// expected alignment shape (100 Match + 120 Insert, 0 Delete) is
+// unambiguous and exactly predictable, isolating the band/retry mechanism
+// itself from any repeat-driven alignment ambiguity.
+#[cfg(test)]
+mod band_too_narrow_tests {
+    use super::*;
+
+    fn fixture() -> (Vec<u8>, Vec<u8>) {
+        let seed: Vec<u8> = "ACGTACGTCG".repeat(10).into_bytes(); // 100bp
+        let mut query = seed.clone();
+        query.extend_from_slice(&"TGCA".repeat(30).into_bytes()); // +120bp
+        (seed, query)
+    }
+
+    fn align_direct(
+        g: &PoaGraph,
+        topo: &[usize],
+        rank_of: &[usize],
+        spine: &[(usize, u8, i32)],
+        query: &[u8],
+        band_width: usize,
+        scratch: &mut AlignScratch,
+    ) -> Result<Vec<AlignOp>, PoaError> {
+        let cfg = PoaConfig {
+            band_width,
+            adaptive_band: false,
+            alignment_mode: AlignmentMode::SemiGlobal,
+            ..PoaConfig::default()
+        };
+        align(&g.nodes, topo, rank_of, spine, query, &cfg, scratch, &[])
+    }
+
+    /// Directly confirms the exact band-width threshold: below it, `align`
+    /// now returns `Err(BandTooNarrow)` (never an empty, silently-wrong
+    /// `Ok(vec![])` -- the bug `tests/adaptive_band_collapse.rs` guards
+    /// against); at or above it, `align` succeeds directly with no retry
+    /// needed. Values confirmed empirically when this test was written, not
+    /// assumed: 100 (exactly the seed's own length, plausible-looking but
+    /// still 120bp short of the true diagonal shift) still errors; 119
+    /// (one short of the full 120bp gap) already succeeds, because the
+    /// windowing here centres with a small amount of slack, not because
+    /// the boundary is off by one in the traceback itself.
+    #[test]
+    fn band_too_narrow_returned_below_threshold_ok_at_and_above() {
+        let (seed, query) = fixture();
+        let g = PoaGraph::new(&seed, PoaConfig::default()).unwrap();
+        let (topo, rank_of) = topological_order(&g.nodes);
+        let spine = heaviest_path(&g.nodes, &topo, &rank_of);
+        let mut scratch = AlignScratch::new();
+
+        for &band_width in &[10usize, 50, 100] {
+            let result = align_direct(
+                &g,
+                &topo,
+                &rank_of,
+                &spine,
+                &query,
+                band_width,
+                &mut scratch,
+            );
+            match result {
+                Err(PoaError::BandTooNarrow {
+                    configured,
+                    required,
+                }) => {
+                    assert_eq!(configured, band_width);
+                    assert!(
+                        required > band_width,
+                        "required ({required}) should exceed the too-narrow configured \
+                         width ({band_width})"
+                    );
+                }
+                other => panic!(
+                    "band_width={band_width} expected BandTooNarrow, got {:?}",
+                    other.map(|ops| ops.len())
+                ),
+            }
+        }
+
+        for &band_width in &[119usize, 120, 121, 150] {
+            let result = align_direct(
+                &g,
+                &topo,
+                &rank_of,
+                &spine,
+                &query,
+                band_width,
+                &mut scratch,
+            );
+            match result {
+                Ok(ops) => assert_eq!(
+                    ops.len(),
+                    query.len(),
+                    "band_width={band_width}: expected one op per query base \
+                     (100 Match + 120 Insert), got {} ops",
+                    ops.len()
+                ),
+                Err(e) => panic!("band_width={band_width} expected Ok, got {e:?}"),
+            }
+        }
+    }
+
+    /// Confirms `align_with_retry` recovers a fully correct alignment from
+    /// every narrow starting width tested above, transparently -- the
+    /// actual fix for callers, not just the diagnostic in the test above.
+    #[test]
+    fn align_with_retry_recovers_correct_alignment_from_any_narrow_start() {
+        let (seed, query) = fixture();
+        let g = PoaGraph::new(&seed, PoaConfig::default()).unwrap();
+        let (topo, rank_of) = topological_order(&g.nodes);
+        let spine = heaviest_path(&g.nodes, &topo, &rank_of);
+        let mut scratch = AlignScratch::new();
+
+        for &band_width in &[10usize, 50, 100] {
+            let cfg = PoaConfig {
+                band_width,
+                adaptive_band: false,
+                alignment_mode: AlignmentMode::SemiGlobal,
+                ..PoaConfig::default()
+            };
+            let (ops, retried) = align_with_retry(
+                &g.nodes,
+                &topo,
+                &rank_of,
+                &spine,
+                &query,
+                &cfg,
+                &mut scratch,
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("band_width={band_width}: retry should recover, got {e:?}"));
+            assert!(
+                retried,
+                "band_width={band_width}: expected align_with_retry to report that pass 1 \
+                 needed widening"
+            );
+
+            let n_match = ops
+                .iter()
+                .filter(|o| matches!(o, AlignOp::Match(_)))
+                .count();
+            let n_insert = ops
+                .iter()
+                .filter(|o| matches!(o, AlignOp::Insert(_)))
+                .count();
+            let n_delete = ops
+                .iter()
+                .filter(|o| matches!(o, AlignOp::Delete(_)))
+                .count();
+            assert_eq!(
+                (n_match, n_insert, n_delete),
+                (100, 120, 0),
+                "band_width={band_width}: expected the retry to recover the exact \
+                 alignment shape (100 Match + 120 Insert, 0 Delete), got \
+                 Match={n_match} Insert={n_insert} Delete={n_delete}"
             );
         }
     }

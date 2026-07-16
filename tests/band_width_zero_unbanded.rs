@@ -18,10 +18,14 @@
 //! DP window to place correctly), without needing the exact real-world
 //! diagonal-ambiguity mechanism to reproduce a clear regression signal.
 //!
-//! A fixed `band_width = 50` cannot place the expansion at all here (the
-//! graph never recovers a coherent consensus). Genuinely unbanded DP
-//! (`band_width = 0`, `adaptive_band = false`, post-fix) reconstructs the
-//! expanded sequence exactly.
+//! A fixed `band_width = 50` could not place the expansion at all when this
+//! test was first written (the graph never recovered a coherent consensus).
+//! That is no longer true as of the `BandTooNarrow`/`align_with_retry` fix
+//! (see `tests/adaptive_band_collapse.rs`): `align()` now detects exactly
+//! this "band too narrow to reach the end of the read" condition and
+//! retries with a wider band automatically, so `band_width = 50` now also
+//! reconstructs the expansion exactly, the same as genuinely unbanded DP
+//! (`band_width = 0`, `adaptive_band = false`). Both are tested below.
 
 use poa_consensus::{AlignmentMode, PoaConfig, PoaGraph};
 
@@ -67,25 +71,34 @@ fn band_width_zero_reconstructs_expansion_exactly() {
 }
 
 #[test]
-fn fixed_band_width_50_cannot_place_the_same_expansion() {
-    // Documents the contrast: a merely-50-wide fixed band (what band_width=0
-    // silently fell back to before this fix) cannot correctly place a +210bp
-    // expansion that the seed lacks entirely -- the graph never converges on
-    // a coherent consensus. This is not a claim that band_width=50 is
-    // generally broken (it handles smaller/gradual divergence fine, see
-    // other tests in src/tests.rs); it specifically cannot do what
-    // band_width=0 is documented to do.
+fn fixed_band_width_50_now_recovers_via_band_too_narrow_retry() {
+    // This test originally documented the opposite: a merely-50-wide fixed
+    // band could not correctly place a +210bp expansion the seed lacks
+    // entirely, and asserted `assert_ne!` against the correct answer with a
+    // note that read "if this now passes, band_width=50 alone has become
+    // sufficient and this contrast test should be revisited." It now passes
+    // -- revisited here, per that note, rather than left stale.
+    //
+    // The reason is not that band_width=50 alone became wide enough on its
+    // own; it is that `align()` now correctly returns
+    // `Err(PoaError::BandTooNarrow)` instead of silently returning an
+    // empty/degenerate alignment when a read needs a wider window than
+    // configured (see `tests/adaptive_band_collapse.rs` for the severe
+    // silent-corruption bug this closes), and a new retry wrapper
+    // (`align_with_retry`, used by `add_read`/`align_read_ops`/
+    // `align_read_ops_unbanded`) catches that error and retries with a
+    // wider band -- escalating to fully unbanded if needed -- so every
+    // caller gets a correct answer transparently instead of either a silent
+    // wrong one or a hard failure.
     let (base, expanded) = repeat_and_expansion();
     let mut graph = build_graph(50, &base);
     for _ in 0..6 {
         graph.add_read(&expanded).unwrap();
     }
     let result = graph.consensus().unwrap();
-    assert_ne!(
+    assert_eq!(
         result.sequence, expanded,
-        "expected band_width=50 to fail to reconstruct the expansion \
-         (demonstrating why band_width=0 needs to be genuinely unbanded); \
-         if this now passes, band_width=50 alone has become sufficient and \
-         this contrast test should be revisited"
+        "band_width=50 should now reconstruct the expansion exactly via the \
+         BandTooNarrow retry, the same as genuinely unbanded (band_width=0)"
     );
 }

@@ -369,12 +369,41 @@ pub use types::{
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 fn build_graph(reads: &[&[u8]], seed_idx: usize, config: PoaConfig) -> Result<PoaGraph, PoaError> {
-    let mut graph = PoaGraph::new(reads[seed_idx], config)?;
+    let mut graph = PoaGraph::new(reads[seed_idx], config.clone())?;
     for (i, read) in reads.iter().enumerate() {
         if i != seed_idx {
             graph.add_read(read)?;
         }
     }
+
+    // If any read needed a wider-than-configured band during the
+    // incremental build (`align_with_retry`'s pass 2 or 3 -- see
+    // `PoaGraph::used_band_retry`'s doc comment), the resulting graph is a
+    // mix of different reads settling with different effective band
+    // widths. In a periodic/repetitive locus this can settle different
+    // reads onto different, individually-plausible diagonals (the same
+    // mechanism as Known Bug #3's "silent wrong alignment on narrow band
+    // in repetitive regions"), fragmenting bubble structure that a
+    // uniformly-unbanded build would not -- confirmed on real data
+    // (`multi_gaa30_100`): a mixed-band graph produced a spurious 3rd
+    // allele that vanished when every read used the same unbanded config
+    // from the start. Rebuild the whole graph unbanded, from scratch, for
+    // internal consistency, rather than trusting a mixed-band graph as-is.
+    // Skipped when the config was already fully unbanded (nothing to gain,
+    // and this recursion would otherwise never terminate).
+    if graph.used_band_retry() && (config.band_width > 0 || config.adaptive_band) {
+        let mut cfg2 = config.clone();
+        cfg2.band_width = 0;
+        cfg2.adaptive_band = false;
+        let mut graph2 = PoaGraph::new(reads[seed_idx], cfg2)?;
+        for (i, read) in reads.iter().enumerate() {
+            if i != seed_idx {
+                graph2.add_read(read)?;
+            }
+        }
+        return Ok(graph2);
+    }
+
     Ok(graph)
 }
 

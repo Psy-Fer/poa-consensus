@@ -11,6 +11,253 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`align()` silently collapsed the consensus to a single base -- with zero
+  error, zero warning -- whenever a read needed a wider DP band than
+  configured, including under the CLI's own default config
+  (`band_width: 50, adaptive_band: true`).** Found incidentally during a
+  seed-length-sensitivity batch generalization check (74 fresh random draws
+  across `CAG` and `GAA` repeats): 3 draws (~4%) produced a 1-base
+  consensus from a perfectly ordinary 28-read population. Traced to an
+  exact line, not guessed: `align()`'s "find best terminal cell at column
+  `l`" step searches every graph node's own banded row-window for a cell at
+  the read's full length; when the band cannot track the diagonal shift
+  needed (confirmed exact threshold on the reproducing fixture: **73bp**,
+  the precise length difference between a 292bp seed and a 365bp read), no
+  node's window reaches column `l`, and the search returns `None`. The
+  fallback for `None` was `(best_t, best_state) = (0, State::M)` -- not a
+  real alignment endpoint at all -- so the traceback's very first cell
+  lookup found `UNSET` and broke immediately, returning an empty
+  `Vec<AlignOp>`. `add_to_graph` on an empty ops list is a complete no-op:
+  no coverage, no new nodes, nothing recorded. Once every non-seed read in
+  a population wider than the effective band hits this identically (as
+  `select_seed(Auto)`'s own shortest-spanning-read heuristic makes likely),
+  the graph ends up holding only the seed's own linear chain at
+  `coverage=1` everywhere, which `consensus()`'s boundary trim then
+  collapses to one base.
+  - **`PoaError::BandTooNarrow` was never actually constructed anywhere in
+    `src/graph.rs`**, despite being fully defined in `src/error.rs`,
+    documented in `src/lib.rs`'s crate docs, and having a ready, user-facing
+    hint already written in `src/main.rs`'s `explain_error` ("try
+    `--adaptive-band`, or `--band-width {required}`"). `TODO.md`'s "Smart
+    retry (3-pass)" checkbox describes an automatic
+    `BandTooNarrow` → retry-wider → retry-unbanded loop as already shipped;
+    no such retry existed anywhere in `add_read()` or elsewhere -- confirmed
+    stale documentation (the same documentation-vs-reality drift already
+    found and flagged twice elsewhere this session: Known Bug #6's stale
+    `#[ignore]`, `phasing_groups`'s stale doc comment), not a mechanism that
+    regressed.
+  - **Confirmed, separately, that the shipped safety net
+    (`consensus_fit_scored`, the CLI's own single-allele entry point) gave
+    zero protection, for two independent reasons.** `stats().single_support_fraction`
+    on the collapsed graph is `1.0`, well above the `0.3` trigger -- the
+    retry mechanism does fire -- but (1) `analysis::consensus_fit` itself
+    hits the identical bug when scoring the degenerate 1-base candidate: it
+    builds a throwaway graph seeded on that single base and aligns every
+    original read against it, which is exactly the same "band too narrow
+    for the length gap" condition, so it *also* silently returned empty
+    ops -- zero Insert+Delete ops against zero reads that "fit" scored as
+    `0.0`, literally the best possible score, for what was actually the
+    worst candidate; the one genuinely correct candidate among the four
+    (`AlternateSeedRetry`, re-seeded on the population's median-length
+    read) scored a real, non-zero, *worse*-looking `0.039254` and lost the
+    comparison. (2) `consensus_fit_scored` has no truncation-ratio check at
+    all -- `consensus_adaptive` does, and was confirmed directly on the
+    reproducing fixture to catch and fully fix this
+    (`TruncationRetry { recovered: true }`, full 364bp output) -- but the
+    CLI deliberately calls `consensus_fit_scored` instead of
+    `consensus_adaptive` specifically to avoid multi-allele bubble
+    detection firing unexpectedly on a het SNP, an unrelated, deliberate
+    tradeoff whose side effect was silently losing this protection too.
+  - **Scope, confirmed via targeted batch checks, not assumed:** unit-agnostic
+    (`CAG` and `GAA` both reproduce), model-dependent (0/15 fresh draws
+    under the HiFi error model; the mechanism needs enough per-read indel
+    error to create a length spread exceeding the band, and HiFi's low
+    error rate rarely does), and scales with repeat length under ONT R10
+    (13%, 2/15, at `CAG×200` vs. ~4% at `CAG×50-60`/`GAA×55` vs. 0/15 at a
+    `CAG×20` control).
+  - **Fix, two parts, both implemented (not a quick patch -- see the
+    regression this surfaced during validation, described next):**
+    1. `align()`'s `terminal_best == None` branch now returns
+       `Err(PoaError::BandTooNarrow { configured, required })` instead of
+       the bogus `(0, State::M)` substitution. `configured` is the
+       effective `spine_margin` actually used; `required` is estimated
+       from `best_j_per_t` (already tracked per row for the diagonal-skip
+       machinery, reused here rather than tracked separately): the row
+       that got closest to column `l` fell short by
+       `l - max(best_j_per_t)`, so widening the margin by that amount is
+       the natural single-shot estimate -- a heuristic, not a proof of
+       sufficiency (confirmed empirically to sometimes be a loose
+       over-estimate, e.g. reporting `required` equal to the full query
+       length in one tested case; never confirmed to under-estimate, but
+       not trusted blindly either, see next point).
+    2. A new `align_with_retry` wrapper (used by `add_read`,
+       `align_read_ops`, and `align_read_ops_unbanded` -- so both graph
+       construction *and* `analysis::consensus_fit`'s own internal
+       throwaway-graph scoring, which calls `align_read_ops`, are covered
+       by the same fix, closing the exact gap described above) implements
+       the 3-pass retry `TODO.md` had described but never actually built:
+       pass 1 at the configured width (free when it succeeds, which is
+       nearly always); pass 2, on `BandTooNarrow`, at the error's own
+       `required` estimate with `adaptive_band` forced off and anchors
+       cleared (an anchor chain computed for the too-narrow window is not
+       necessarily valid for a wider one); pass 3, only if pass 2 *also*
+       errors, fully unbanded (`band_width = 0, adaptive_band = false`),
+       which is mathematically guaranteed sufficient, not another
+       estimate.
+  - **A real regression surfaced during validation, root-caused and fixed
+    before considering this complete, not shipped with a known gap.**
+    `bench/validate.py` initially dropped from 19/20 to 16/20 after the fix
+    above alone: `multi_gaa30_100` and two other multi-allele-adjacent
+    scenarios started reporting a spurious extra allele. Root cause,
+    traced concretely: a graph built by `add_read` calling into
+    `align_with_retry` per read produces a *mix* of band widths across
+    different reads -- most reads succeed on pass 1 (the narrow configured
+    band), a few need pass 2 or 3. In a periodic/repetitive locus (exactly
+    `multi_gaa30_100`'s GAA repeat), different reads can settle onto
+    different, individually-plausible diagonals depending on which pass
+    they took -- the same mechanism as Known Bug #3's "silent wrong
+    alignment on narrow band in repetitive regions," just newly reachable
+    through the retry rather than through a single global band choice.
+    Confirmed directly: rebuilding `multi_gaa30_100`'s exact read set with
+    a single, consistent, genuinely unbanded config for every read (no
+    retry involved at all) recovers the correct 2-allele split cleanly;
+    the mixed-band graph does not. Tried and confirmed insufficient: making
+    pass 2 skip straight to pass 3 (i.e. every retry goes fully unbanded,
+    never the heuristic `required` width) -- same 3-allele result, showing
+    the problem is the *mixing* of band widths across reads within one
+    graph, not the specific width chosen for the retried reads. **Fixed by
+    adding `PoaGraph::used_band_retry` (set whenever any `add_read` call
+    needed pass 2 or 3) and having `build_graph` (`src/lib.rs`) rebuild the
+    entire graph from scratch with a uniformly unbanded config whenever
+    it's set** -- mirroring the existing, already-shipped pattern in
+    `consensus_multi` ("rebuild fully unbanded and retry phasing when no
+    structural bubble is found under a banded build"), generalized to fire
+    on any per-read band-width inconsistency, not just the multi-allele
+    bubble-detection trigger. Costs an extra full graph rebuild only on the
+    rare loci that actually need it; zero cost on every clean build.
+  - **Validated impact.** `tests/adaptive_band_collapse.rs`'s fixture
+    (renamed from documenting the bug to confirming the fix,
+    `adaptive_band_default_config_no_longer_collapses_gaa55`) now recovers
+    a ~364bp consensus (tolerance ±10bp) under the CLI's exact default
+    config, matching genuinely unbanded output. New white-box tests
+    (`src/graph.rs`'s `band_too_narrow_tests` module, since `align`/
+    `align_with_retry` are private) confirm the exact threshold on a
+    second, non-repetitive synthetic fixture (100bp seed, 220bp query, a
+    clean 120bp gap): `band_width` 10/50/100 return `BandTooNarrow` with
+    `required > configured` in every case; 119/120/121/150 succeed
+    directly with the exact expected op count; `align_with_retry` recovers
+    the exact correct alignment shape (100 Match + 120 Insert + 0 Delete)
+    from every narrow starting width tested. `bench/validate.py`: 19/20,
+    matching the pre-regression baseline exactly (`cag50_d20` remains the
+    one unrelated, already-documented seed-sensitivity residual).
+    `bench/compare_callers.py`: 16/16, unchanged. The batch severity check
+    re-run post-fix on the same scenario classes and seeds as the original
+    incidental discovery (`CAG×50` HiFi, `CAG×200`/`GAA×200`/`CAG×20`
+    control under ONT R10, 15 fresh draws each) confirmed the collapse rate
+    drops to 0/15 across every class -- see the exact numbers in this
+    round's report. Full `cargo test --release --features cli` (194 lib
+    tests, up from 192 -- two new white-box tests -- plus all integration
+    binaries and doctests) green, no regressions. `cargo clippy
+    --all-features --tests` clean against this round's changes (one new
+    warning introduced and fixed during this round, `too_many_arguments`
+    on `align_with_retry`, resolved the same way the pre-existing
+    `best_prev_state_banded` case already was) and `cargo fmt --check`
+    clean. `PoaConfig`'s defaults are unchanged -- `adaptive_band` stays
+    `true` by default; this fix makes that default safe rather than
+    changing what the default is.
+  - **A second, more severe regression surfaced during the post-fix batch
+    severity re-check, also root-caused and fixed before considering this
+    complete: an OOM/crash on a `CAG×50` HiFi read set that built cleanly
+    on pre-fix code.** Confirmed via `ulimit -v`-bounded reproduction:
+    "memory allocation of 2147483648 bytes failed" (and, with a looser
+    limit, 4294967296, then 8589934592 -- doubling each time, the
+    signature of an unbounded `Vec` growth loop, not one oversized
+    allocation). A debug build with `RUST_BACKTRACE=full` pinned the crash
+    to `heaviest_path -> RawVec::grow_one`, *not* `align()`'s own traceback
+    (which already has a defensive iteration bound added alongside this
+    round's other changes, `band_too_narrow_tests` in `src/graph.rs`).
+    `heaviest_path` is called from `add_read` to refresh the cached spine,
+    and its predecessor-pointer traceback (`src/graph.rs`) has no bound of
+    its own -- an unbounded walk was already a documented risk class for
+    this exact function (`design/graph_data_model_rework.md`'s Phase 3
+    account of a literal node self-loop from an earlier session hanging
+    this same traceback), and this was a new way of reaching the same
+    class of failure, not a new kind of bug.
+    - **Root cause, traced precisely, not guessed.** A permanent invariant
+      check added to `add_read` (`debug_assert_eq!` comparing
+      `topological_order`'s output length against `self.nodes.len()`)
+      confirmed the graph had a genuine cycle by the time the reproducing
+      fixture's 14th read was processed: 310 of 798 nodes were excluded
+      from the topological order (stuck at an in-degree Kahn's algorithm
+      could never reduce to zero). Dumping every edge `add_to_graph`
+      created for that specific read found the exact back edge: an
+      ordinary `Match` op wired an edge from a node at topological rank
+      471 to a node at rank 466 -- backwards. Tracing *why* required first
+      ruling out `align()`'s own traceback as the source: dumping that
+      read's complete, unmodified `ops` sequence confirmed it is
+      rank-monotonic in the node identities it names (provable from its
+      own structure -- each traceback step moves to a strictly smaller DP
+      row -- and confirmed empirically, no exception found). The actual
+      culprit is `add_to_graph`'s single-base *substitution reuse*
+      (`try_reuse_arm`, the content-addressed fork-arm cache introduced in
+      an earlier session to avoid duplicating identical single-base edits
+      across reads): it can redirect `prev` to a different, already-
+      existing node, and that substitute's rank is not necessarily less
+      than the rank of whatever node `align()`'s traceback visits *next*.
+      The very next, ordinary `Match`/`Delete` edge is then created via
+      `increment_or_add_edge` with no rank check at all -- it never needed
+      one before reuse existed -- so it silently wired a real back edge
+      once the substitute's rank happened to exceed the next node's rank,
+      corrupting the graph into a cycle that stayed dormant (Kahn's
+      algorithm on a cyclic graph doesn't itself error) until the next
+      scheduled spine refresh walked `heaviest_path` straight into it.
+      This is a *different* failure than the one `reuse_would_collide`
+      already guards (a reused node reappearing later in the *same* read's
+      own ops) -- this one is a rank inversion reachable even when no
+      index ever collides.
+    - **Fix.** `try_reuse_arm` gained a second, independent rank check
+      (`reuse_would_create_back_edge`, alongside the existing
+      `fork`-vs-`chain[0]` check added for the multi-allele regression
+      above): reject the reuse if its *last* node's rank would not be less
+      than the rank of the very next `Match`/`Delete` reference in the
+      read's own remaining ops -- exactly the edge that would otherwise go
+      backward. Both checks use the same entry-snapshot `rank_of`
+      `add_read` already computes once per call (now threaded through
+      `add_to_graph` and `try_reuse_arm`), so the check is a cheap O(1)
+      comparison, not a graph walk. Rejecting falls through to ordinary
+      fresh-node creation, the same safe fallback `try_reuse_arm` already
+      used for its other failure cases (a fresh node cannot create a
+      cycle, having no edges yet to anywhere but `fork`). As a second,
+      independent line of defense -- not a substitute for the real fix --
+      `add_read` now carries a permanent, zero-cost-in-release
+      `debug_assert_eq!` confirming the graph is still a DAG on every
+      call, and `increment_or_add_edge` carries a permanent
+      `debug_assert_ne!` refusing a literal self-loop, so any future
+      regression of this class fails loudly in debug/test builds instead
+      of hanging or OOMing downstream.
+    - **Validated.** New regression test
+      `tests/reuse_back_edge_cycle.rs` (fixture:
+      `tests/fixtures/reuse_back_edge_cag50.fa`, a 22-read synthetic
+      `CAG×50` HiFi `pbsim3` simulation, same discipline as every other
+      fixture in this directory) reproduces the exact crash: confirmed to
+      hang/never-return with the new `reuse_would_create_back_edge` check
+      disabled, and to complete correctly (a plausible ~330bp consensus,
+      not a crash or garbage output) with it enabled. The same fixture, run
+      directly through the exact previously-crashing call
+      (`consensus_fit_scored` via the reusable batch-severity probe, seed
+      16, `band_width=50`/`adaptive_band=true`), now completes cleanly even
+      under a 2GB `ulimit -v`. The full post-fix batch severity re-check
+      (75 fresh draws: `CAG×50`/`CAG×60`/`GAA×55`, 25 seeds each, same
+      config) completed with zero crashes, zero timeouts, and 0% severe
+      collapse across every draw. `bench/validate.py`: 19/20, unchanged.
+      `bench/compare_callers.py`: 16/16, unchanged. Full `cargo test
+      --release --features cli` (194 lib tests, unchanged count, plus the
+      new `tests/reuse_back_edge_cycle.rs` integration test and all other
+      integration binaries and doctests) green, no regressions. `cargo
+      clippy --all-features --tests` and `cargo fmt --check` both clean,
+      matching the pre-existing baseline exactly (23 warning lines, zero
+      new). `PoaConfig`'s defaults remain unchanged.
+
 - **Follow-up to the multi-allele contamination fix below: the residual
   15.4% (8/52) misassignment rate reported after that fix was itself two
   more targeted, fixable bugs in `phasing_groups`/`validate_and_merge_groups`,
