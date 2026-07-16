@@ -11,6 +11,102 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Follow-up to the multi-allele contamination fix below: the residual
+  15.4% (8/52) misassignment rate reported after that fix was itself two
+  more targeted, fixable bugs in `phasing_groups`/`validate_and_merge_groups`,
+  not the periodic-alignment-ambiguity class (Known Bugs #3/#4/#9) it was
+  provisionally attributed to.** Traced by reproducing the exact ground-truth
+  ID tracing methodology on `multi_gaa30_100` and identifying each
+  misassigned read's own recorded arm choice at every structural bubble.
+  First finding, before any new fix: **the original 15.4%/8-read figure
+  itself was wrong**, an off-by-construction bug in the *investigation*
+  tooling, not the library -- `Consensus::read_indices` are indices into
+  `PoaGraph`'s internal read order (seed = index 0, then `add_read` calls in
+  external order skipping the seed), not the external `reads` slice passed
+  to `consensus_multi`; the probe script used for the original trace treated
+  them as external indices directly. Recomputing with the correct internal
+  ↔ external mapping gives corrected baseline numbers: **32.7% (17/52)
+  before the earlier fix, 11.5% (6/52) after it** -- still a large real
+  improvement, just not the exact figures previously reported.
+  - **(A) `phasing_groups` dumped every read it couldn't uniquely cluster
+    (a "bridge candidate," compatible with 2+ clusters at once) into
+    whichever cluster was globally largest, even when that read was
+    provably *incompatible* with that cluster's own arm-choice template.**
+    A bridge candidate's ambiguity means its bubble evidence didn't pick a
+    *unique* cluster, not that the read is uninformative -- confirmed on
+    `multi_gaa30_100`: 5 of the then-6 misassigned reads were bridge
+    candidates whose compatible-cluster set never included the cluster they
+    got dumped into. Fixed by resolving each bridge candidate (and each
+    fully-`None`/uninformative read) against read length instead of cluster
+    size: length is a signal largely orthogonal to bubble topology (a
+    structural bubble exists *because* of a length difference), so it
+    reliably breaks a tie the bubble evidence itself couldn't. Gated on a
+    plausibility check (`PLAUSIBLE_LEN_FRACTION = 0.85` of the shortest
+    well-supported cluster's median) before trusting a read's own length at
+    all -- an unconditional first version of this fix regressed immediately:
+    partial (non-spanning) reads have a truncated length reflecting how much
+    of the flank+repeat they happened to cover, not their true allele's
+    length, and several such reads clustered together purely by coincidental
+    shortness, fabricating a spurious 3rd allele out of reads that were all
+    genuinely the same true allele. A read that fails the plausibility check
+    falls back to its largest *bubble-compatible* cluster by member count
+    (bridge candidates) or the single largest cluster overall (fully
+    uninformative reads) -- i.e. close to the previous behavior, but only
+    for reads where a length comparison would itself be unreliable.
+  - **(B) `validate_and_merge_groups` merged a whole rejected candidate group
+    into its nearest confirmed group by the candidate's *aggregate* median
+    length, which could still drag a genuinely different-origin read along
+    with the majority of its own (accidentally mixed) cluster.** Confirmed
+    on the one read (of 6) that fix (A) did not touch: 3 reads (2 true-short,
+    1 true-long) shared byte-identical arm-choice signatures across all 3
+    structural bubbles by coincidence -- a genuine per-read alignment tie,
+    the one case in this investigation that really does match the
+    periodic-alignment-ambiguity family -- so `phasing_groups` correctly (by
+    its own logic) clustered all 3 together as one indivisible group. That
+    group's aggregate median length was dominated by its 2-read majority and
+    read as "short," so the whole group -- including the 1 true-long read --
+    merged into the short confirmed group. Fixed by routing each member of a
+    rejected candidate individually to whichever confirmed group its own
+    length is nearest to, rather than moving the candidate as one block; safe
+    specifically because the confirmed groups being compared against are, by
+    construction, already length-separated from each other (that is what
+    qualified them as confirmed), so per-read length comparison against them
+    is not diluted by the same aggregation problem as the rejected
+    candidate's own median.
+  - **Net result on `multi_gaa30_100`:** misassignment rate goes from a
+    corrected 11.5% (6/52, after the earlier fix alone) to **0.0% (0/52)**
+    after both (A) and (B) -- every read in the scenario, reproducibly.
+    Fix (A) alone accounted for 3.8% (2/52) as an intermediate checkpoint
+    (with a regression to a spurious 3rd allele from an unconditional first
+    attempt, caught and corrected before finalizing -- see above); (A) with
+    its plausibility guard alone reached 1.9% (1/52); (B) closed the last
+    read. `bench/validate.py` improves from 18/20 to **19/20**:
+    `multi_gaa30_100` itself was already passing after the earlier fix and
+    remains passing (Δ-2/Δ+1, unchanged); `multi_skew_cag20_40` -- previously
+    reported as a FAIL attributed to "unrelated per-partition consensus
+    noise" -- flips to a clean OK (Δ+0/Δ+0). That earlier attribution was
+    itself reassessed: re-tracing `multi_skew_cag20_40`'s read provenance
+    after this round's fix still shows a real, nonzero 12.8% (5/39)
+    misassignment rate, smaller than `multi_gaa30_100`'s pre-fix rate but not
+    zero -- the *consensus sequence* recovered correctly regardless, because
+    the contaminating reads stayed a minority within their misassigned
+    group's own heaviest-path vote. This is reported plainly rather than
+    claimed as a second full fix: bench-level pass and zero read-level
+    misassignment are related but not equivalent, and only the former is
+    confirmed clean here. The remaining single-allele `cag50_d20` FAIL is
+    unrelated (not a multi-allele scenario) and unaffected either way.
+    `bench/compare_callers.py` stays 16/16 (no multi-allele scenarios in that
+    suite). Full `cargo test --release --features cli` (192 lib tests, all
+    integration binaries, doctests) green, no regressions, including the two
+    Phase 2 tests (`partition_reads_by_bubble_excludes_delete_only_reads`,
+    `bubble_site_arm_read_counts_excludes_delete_only_reads`) and both new
+    tests from the earlier fix (`structural_phasing_no_contamination_on_noisy_periodic_repeat`,
+    `structural_bubble_phasing_subtle_length_delta_not_rejected`). `cargo
+    clippy --all-features --tests` and `cargo fmt --check` clean against
+    this round's changes. `phasing_groups`'s signature gained a `reads: &[Vec<u8>]`
+    parameter (it is a private function; no public API change).
+    `PoaConfig`'s defaults are unchanged.
+
 - **Multi-allele read-partition contamination on periodic (homogeneous) tandem
   repeats: `consensus_multi` could silently misassign a large fraction of reads
   to the wrong allele group.** Root-caused via ground-truth read tracing on real

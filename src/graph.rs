@@ -2863,24 +2863,56 @@ fn validate_and_merge_groups(
         if significant && separated_from_all {
             confirmed.push(cand);
             confirmed_lens.push(cand_lens);
+        } else if confirmed.len() == 1 {
+            // Only one confirmed group exists so far -- nothing to route
+            // individual members toward yet, merge wholesale (this is also
+            // the common, harmless case: a small or non-separated candidate
+            // whose members really do all belong together).
+            confirmed_lens[0].extend(cand_lens);
+            confirmed[0].extend(cand);
         } else {
-            // Not trustworthy as its own allele: merge into whichever
-            // confirmed group this candidate's own median length is closest
-            // to (rather than always the largest), so the merge target is
-            // the group it most plausibly actually came from.
-            let cand_med = median_usize(&cand_lens);
-            let target = confirmed_lens
-                .iter()
-                .enumerate()
-                .min_by(|&(_, a), &(_, b)| {
-                    let da = (median_usize(a) - cand_med).abs();
-                    let db = (median_usize(b) - cand_med).abs();
-                    da.partial_cmp(&db).unwrap()
-                })
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            confirmed_lens[target].extend(cand_lens);
-            confirmed[target].extend(cand);
+            // Not trustworthy as its own allele. Route each *member*
+            // individually to whichever confirmed group its own length is
+            // closest to, rather than moving the whole candidate as one
+            // block to wherever the candidate's *aggregate* median lands.
+            //
+            // Why per-read, not per-group: a rejected candidate can itself
+            // be an internally mixed cluster -- confirmed on real
+            // GAA×30/GAA×100 HiFi data (`multi_gaa30_100`): a 5-read
+            // candidate contained 4 reads of one true allele and 1 read of
+            // the other, all sharing the exact same cross-bubble arm-choice
+            // pattern by coincidence (see `phasing_groups`'s doc comment on
+            // this same underlying alignment-tie mechanism). The
+            // candidate's own aggregate median length was pulled toward the
+            // 4-read majority and the whole block -- including the 1
+            // genuinely different read -- got merged into that majority's
+            // confirmed group, misassigning the minority read. Each read's
+            // own length is not similarly diluted, and the two confirmed
+            // groups here are, by construction, already separated on
+            // length (that is what qualified them as confirmed in the
+            // first place), so per-read nearest-length routing recovers
+            // the minority read correctly without affecting the majority.
+            let snapshot_medians: Vec<f64> =
+                confirmed_lens.iter().map(|l| median_usize(l)).collect();
+            let mut per_read_targets: Vec<(usize, usize)> = Vec::with_capacity(cand.len());
+            for (&r, &len) in cand.iter().zip(cand_lens.iter()) {
+                let len = len as f64;
+                let target = snapshot_medians
+                    .iter()
+                    .enumerate()
+                    .min_by(|&(_, &a), &(_, &b)| {
+                        let da = (a - len).abs();
+                        let db = (b - len).abs();
+                        da.partial_cmp(&db).unwrap()
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                per_read_targets.push((r, target));
+            }
+            for (r, target) in per_read_targets {
+                confirmed_lens[target].push(reads[r].len());
+                confirmed[target].push(r);
+            }
         }
     }
 
@@ -2934,6 +2966,7 @@ fn phasing_groups(
     bubbles: &[(usize, Vec<usize>)],
     n_reads: usize,
     min_reads: usize,
+    reads: &[Vec<u8>],
 ) -> Vec<Vec<usize>> {
     let n_bubbles = bubbles.len();
 
@@ -2980,9 +3013,10 @@ fn phasing_groups(
     let mut clusters: Vec<Vec<Option<usize>>> = Vec::new();
     let mut cluster_members: Vec<Vec<usize>> = Vec::new();
     // Reads compatible with 2+ clusters at once: their partial information
-    // can't tell those clusters apart, so they must not be allowed to merge
-    // them. Folded into the largest final group, like `unassigned`.
-    let mut bridge_candidates: Vec<usize> = Vec::new();
+    // can't tell those clusters apart on its own. Each carries the list of
+    // clusters it's actually compatible with, so the resolution pass below
+    // can pick among *those* rather than guessing globally.
+    let mut bridge_candidates: Vec<(usize, Vec<usize>)> = Vec::new();
 
     for r in order {
         let row = &sig[r];
@@ -3011,8 +3045,142 @@ fn phasing_groups(
                     }
                 }
             }
-            _ => bridge_candidates.push(r),
+            _ => bridge_candidates.push((r, compatible_clusters)),
         }
+    }
+
+    // Resolve bridge candidates and fully-unassigned reads against the
+    // clusters formed above, using each read's own length as a
+    // corroborating signal -- but only when that read's length is itself
+    // plausible evidence, not an artifact of a partial (non-spanning) read.
+    //
+    // Why length at all: the previous design dumped both kinds of
+    // leftover read unconditionally into whichever cluster was globally
+    // largest, on the theory that "no unique bubble-arm signal" meant "no
+    // signal at all," so the majority was the least-bad guess. That holds
+    // for a read whose bubble-derived compatible set spans clusters that
+    // all end up on the *same* true side. Confirmed wrong on real
+    // GAA×30/GAA×100 HiFi data (`multi_gaa30_100`): a bridge candidate can
+    // be compatible with clusters on *opposite* true sides purely because
+    // one of its bubbles happens to overlap both (e.g. compatible with a
+    // small cluster representing a genuine cross-bubble alignment tie --
+    // see `validate_and_merge_groups`'s doc comment -- and also with the
+    // far larger pure-majority cluster on the *other* allele). Dumping such
+    // a read into the globally largest cluster is then actively wrong, not
+    // a low-information default. Read length is a signal largely
+    // orthogonal to bubble topology (a structural bubble is detected
+    // *because* of a length difference), so it can break this kind of tie
+    // even when the bubble evidence itself was misleading for this one
+    // read.
+    //
+    // Why length is gated on plausibility, not applied unconditionally: a
+    // first version of this fix compared every leftover read's length
+    // against *all* clusters unconditionally and regressed immediately --
+    // partial (non-spanning) reads that never reached any bubble have a
+    // truncated length reflecting how much of the flank+repeat they
+    // happened to cover, not their true allele's length, so several
+    // partial reads of the *same* true allele clustered together purely
+    // because they were all similarly short, fabricating a spurious extra
+    // "allele" that `validate_and_merge_groups` then couldn't tell apart
+    // from a real one (confirmed: `multi_gaa30_100` went from 2 output
+    // alleles to a spurious 3rd, a 4-read all-partial, all-same-true-origin
+    // group, once this fix's first version routed them by raw length
+    // alone). A read's length is only trustworthy as a discriminating
+    // signal when it is at least roughly as long as the *shortest*
+    // well-supported (>= min_reads) cluster's own median -- i.e. plausible
+    // as a genuine full instance of *some* known allele, not obviously
+    // truncated relative to every one of them. `PLAUSIBLE_LEN_FRACTION`
+    // (0.85) leaves room for a moderate deletion/error in an otherwise
+    // full-length short-allele read without being so loose it accepts an
+    // actually-partial read.
+    //   - A bridge candidate that fails the plausibility check falls back
+    //     to its own largest *bubble-compatible* cluster (still better than
+    //     the global default: at least respects the partial bubble
+    //     evidence it does have, which -- for a short/partial read -- is
+    //     more trustworthy than its truncated length).
+    //   - A fully unassigned read that fails the check has no compatible
+    //     set to fall back to at all (zero recorded arm choices anywhere),
+    //     so it defaults to the single largest cluster overall, exactly as
+    //     before this fix.
+    const PLAUSIBLE_LEN_FRACTION: f64 = 0.85;
+
+    if !cluster_members.is_empty() {
+        let snapshot_lens: Vec<f64> = cluster_members
+            .iter()
+            .map(|members| {
+                median_usize(&members.iter().map(|&r| reads[r].len()).collect::<Vec<_>>())
+            })
+            .collect();
+        let snapshot_sizes: Vec<usize> = cluster_members.iter().map(|m| m.len()).collect();
+        let min_full_len = (0..cluster_members.len())
+            .filter(|&c| snapshot_sizes[c] >= min_reads)
+            .map(|c| snapshot_lens[c])
+            .fold(f64::INFINITY, f64::min);
+
+        let nearest_cluster_among = |read_idx: usize, candidates: &[usize]| -> usize {
+            let len = reads[read_idx].len() as f64;
+            candidates
+                .iter()
+                .copied()
+                .min_by(|&a, &b| {
+                    let da = (snapshot_lens[a] - len).abs();
+                    let db = (snapshot_lens[b] - len).abs();
+                    da.partial_cmp(&db)
+                        .unwrap()
+                        // Tie-break toward the larger (more-evidenced) cluster, then
+                        // lowest index, for determinism.
+                        .then_with(|| snapshot_sizes[b].cmp(&snapshot_sizes[a]))
+                        .then_with(|| a.cmp(&b))
+                })
+                .unwrap()
+        };
+        let largest_overall = (0..cluster_members.len())
+            .max_by_key(|&c| snapshot_sizes[c])
+            .unwrap();
+        let all_clusters: Vec<usize> = (0..cluster_members.len()).collect();
+        // Fallback for a bridge candidate whose own length isn't trustworthy:
+        // pick the largest cluster among its bubble-compatible set *by
+        // member count*, not by length -- a read whose length we've just
+        // decided not to trust must not turn around and use that same
+        // length to break the tie among its fallback candidates.
+        let largest_compatible = |candidates: &[usize]| -> usize {
+            *candidates
+                .iter()
+                .max_by_key(|&&c| snapshot_sizes[c])
+                .unwrap()
+        };
+
+        let mut resolved: Vec<(usize, usize)> = Vec::new();
+        for (r, compat) in &bridge_candidates {
+            let len = reads[*r].len() as f64;
+            let target = if min_full_len.is_finite() && len >= PLAUSIBLE_LEN_FRACTION * min_full_len
+            {
+                nearest_cluster_among(*r, &all_clusters)
+            } else {
+                largest_compatible(compat)
+            };
+            resolved.push((*r, target));
+        }
+        for &r in &unassigned {
+            let len = reads[r].len() as f64;
+            let target = if min_full_len.is_finite() && len >= PLAUSIBLE_LEN_FRACTION * min_full_len
+            {
+                nearest_cluster_among(r, &all_clusters)
+            } else {
+                largest_overall
+            };
+            resolved.push((r, target));
+        }
+        for (r, target) in resolved {
+            cluster_members[target].push(r);
+        }
+    } else {
+        // No cluster exists at all (no read anywhere had a recorded arm
+        // choice) -- nothing to compare lengths against, so every read is
+        // definitionally in one, undifferentiated group.
+        cluster_members.push(Vec::new());
+        cluster_members[0].extend(bridge_candidates.into_iter().map(|(r, _)| r));
+        cluster_members[0].extend(unassigned);
     }
 
     let mut groups: Vec<Vec<usize>> = cluster_members;
@@ -3022,8 +3190,7 @@ fn phasing_groups(
         groups.push(Vec::new());
     }
 
-    // Fold groups below min_reads and unassigned/bridge-candidate reads into
-    // the largest group.
+    // Fold groups below min_reads into the largest group.
     let mut i = 1;
     while i < groups.len() {
         if groups[i].len() < min_reads {
@@ -3033,8 +3200,6 @@ fn phasing_groups(
             i += 1;
         }
     }
-    groups[0].extend(unassigned);
-    groups[0].extend(bridge_candidates);
     groups.retain(|g| !g.is_empty());
     groups
 }
@@ -3689,6 +3854,7 @@ impl PoaGraph {
                 &structural,
                 self.n_reads,
                 self.config.min_reads,
+                &self.reads,
             );
             // Validate against read-length bimodality + vote weight before
             // trusting phasing_groups' split -- see validate_and_merge_groups'
