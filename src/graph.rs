@@ -1389,7 +1389,12 @@ fn align(
                 if active_pred_ok {
                     let pt = rank_of[prev_sp];
                     let bj = best_j_per_t[pt];
-                    if bj < l && node_base == query[bj] {
+                    // bj+1 must land inside this row's own band, or the write at
+                    // line ~1472 (`bj + 1 - j_lo`) underflows: j_lo here is this
+                    // node's window, which can start after bj+1 (e.g. a locked
+                    // per-node window centred elsewhere), independent of the
+                    // predecessor's diagonal position.
+                    if bj < l && bj + 1 >= j_lo && bj < j_hi && node_base == query[bj] {
                         let m_prev = gs(&m, pt, bj, j_lo_arr[pt], j_hi_arr[pt], row_width);
                         let i_prev = gs(&ins, pt, bj, j_lo_arr[pt], j_hi_arr[pt], row_width);
                         let d_prev =

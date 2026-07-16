@@ -11,6 +11,93 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Defensive bounds-check fix in `align()`'s diagonal-skip fast path (the
+  "1-base pre-resolve at a bubble entry" branch): a potential index
+  underflow/out-of-window write when `bj + 1` (the query column the fast
+  path is about to write into) falls outside the *current node's own*
+  `[j_lo, j_hi]` window, rather than the predecessor's.** Provenance is
+  unusual and worth recording plainly: this fix appeared, already applied
+  and already correct, in the working tree partway through an unrelated
+  task in this session, with no reconstructable record of the specific
+  action that produced it (the session's own retrospective check could not
+  confirm or rule out an origin with confidence -- see the session record
+  for that exchange). Rather than reverting an unexplained diff outright or
+  trusting it blindly, it was treated as its own small investigation:
+  independently re-derived by tracing the exact write site
+  (`m[t * row_width + (bj + 1 - j_lo)]`, a few lines below the guard) and
+  confirmed the guard's three added conditions
+  (`bj + 1 >= j_lo && bj < j_hi`, alongside the pre-existing `bj < l`) are
+  precisely the precondition needed to keep that write in-bounds, with the
+  fallback (when the guard fails) correctly deferring to the always-correct
+  windowed DP path rather than skipping any correctness check.
+  - **Hypothesised trigger, investigated in depth, not confirmed live.**
+    The leading candidate mechanism was a collision between two independent,
+    normally mutually-exclusive arm-resolution paths in the same function:
+    mechanism (A), the diagonal-skip fast path's own cheap 1-base
+    pre-resolve (fires when a read's next base uniquely matches the
+    *spine's own* successor at a bubble entry, short-circuiting via an
+    early `continue`), and mechanism (B), the full lookahead/slide-and-lock
+    mechanism (reached only when (A) doesn't resolve, and the one that
+    populates the per-node "locked" windows, `AlignScratch::lock_node_j`/
+    `lock_exit_j`, `LOCK_EPS = 5`). The hypothesis: if (A) ever bails out
+    for a read that *does* match the spine (e.g. forced ambiguity at the
+    fork, or running out of query near the bubble), (B) could end up
+    locking the *spine's own* arm nodes with a tight, per-depth window
+    while `on_spine[node_idx]` is also true for those nodes -- the specific
+    combination the vulnerable diagonal-skip write requires (it is gated
+    on `on_spine[node_idx]` unconditionally). Three independent synthetic
+    constructions were tried (a plain two-distinct-base fork with a
+    length-drifted read; a "same leading base" fork intended to force
+    ambiguity, which turned out to have its shared prefix silently absorbed
+    into the spine by ordinary Match-reuse, moving the real fork to a point
+    where the two arms' bases were, by construction of what a fork even is,
+    already distinct; and an insertion-arm variant with the same intent and
+    the same outcome), followed by an unguided parameter sweep (short-arm
+    length, arm-extra length, drift, and read-population mix, 800+
+    combinations) with instrumentation checking both `lock_node_j` and
+    `lock_exit_j` against `on_spine` directly. None produced the collision.
+    Re-running the entire existing test suite (194 lib tests plus all
+    integration fixtures, including the real-data-derived RFC1/DAB1/DMD
+    structural-bubble cases) under the same instrumentation also found zero
+    occurrences. A structural argument was derived for why the collision
+    may not be reachable this way at all: mechanism (A) only fails to
+    resolve when the current read's next base disagrees with the spine's
+    own successor (that disagreement is the only way to reach (B) for a
+    genuine two-way fork, since a fork's two arms are, by definition of
+    being a fork, never identical at the point they diverge), so by the
+    time (B) runs, the read has already shown it does *not* match the
+    spine there -- meaning the arm (B) then picks, if it works correctly,
+    is essentially never the spine arm. The exit-node locking case
+    (`lock_exit_j`) is separately blocked: the diagonal-skip fast path's own
+    `active_pred_ok` gate requires every in-edge into a node to be either
+    the spine's own predecessor or already marked as a resolved loser, and a
+    genuinely-winning non-spine arm's own last node never gets marked that
+    way, so the fast path cannot even attempt an exit node reached from a
+    non-spine winner. Neither argument is an exhaustive proof (more complex
+    topologies -- three-or-more-arm forks, nested bubbles -- were not
+    fully explored), so this is reported as "not reproduced despite a
+    genuine, multi-pronged attempt," not as "proven impossible."
+  - **Kept as a defensive fix, not shipped as an unexplained one.** The
+    guard is a no-op on every currently-passing scenario (confirmed: full
+    `cargo test --release --features cli`, 194 lib tests plus all
+    integration binaries and doctests, identical pass/fail results with and
+    without it), costs nothing beyond two cheap integer comparisons on the
+    hot diagonal-skip path, and is independently verifiable as correct from
+    the write site alone regardless of what does or doesn't reach it in
+    practice -- a defensive bound of exactly this shape (turning a
+    would-be silent out-of-window write or index panic into a safe
+    fallback to the windowed DP path) is consistent with this session's own
+    established practice elsewhere (e.g. the `align()` traceback loop bound
+    and the `add_read`/`increment_or_add_edge` permanent invariant asserts
+    added during the `BandTooNarrow`/back-edge-cycle investigation, above).
+    No new regression test was added, since none was found that actually
+    exercises the guarded branch -- adding one that doesn't would be a false
+    signal of coverage. `cargo clippy --all-features --tests` and `cargo fmt
+    --check` both clean (23 warning lines, matching the pre-existing
+    baseline exactly, zero new). `bench/validate.py`: 19/20, unchanged.
+    `bench/compare_callers.py`: 16/16, unchanged. `PoaConfig`'s defaults are
+    unchanged.
+
 - **`align()` silently collapsed the consensus to a single base -- with zero
   error, zero warning -- whenever a read needed a wider DP band than
   configured, including under the CLI's own default config
