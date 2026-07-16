@@ -3294,3 +3294,67 @@ fn locked_arm_deep_bubble_alleles_lost() {
             .collect::<Vec<_>>(),
     );
 }
+
+/// `validate_and_merge_groups`'s read-length bimodality check must not create
+/// false negatives: a genuine multi-allele split with a real but *subtle*
+/// length delta should still be reported as two alleles, not silently
+/// downgraded to one.
+///
+/// Two independent structural bubbles (so `n_bubbles >= 2`, the condition
+/// under which the length-separation check actually runs — see
+/// `validate_and_merge_groups`'s doc comment): a CAT-repeat arm (4 vs 6
+/// units, 12bp vs 18bp) followed by a GAT-repeat arm (4 vs 6 units, 12bp vs
+/// 18bp). Both bubbles co-vary perfectly with the same two alleles, for a
+/// combined length delta of only 12bp — clean (noiseless) reads keep the
+/// pooled MAD at the floor (`MIN_SPREAD_FLOOR_BP` = 3.0bp), so the
+/// `LENGTH_SEPARATION_MADS` (3.0) bar sits at 9bp: 12bp clears it, but only
+/// just, deliberately closer to the boundary than the other structural-bubble
+/// tests (which all use much larger deltas, e.g. 15bp/26bp/30bp) or the
+/// same-length case (`locked_arm_deep_bubble_alleles_lost`, 0bp delta).
+#[test]
+fn structural_bubble_phasing_subtle_length_delta_not_rejected() {
+    let left = b"ACGTACGTACGT"; // 12bp unique flank
+    let right = b"TAGCTAGCTAGC"; // 12bp unique flank
+    let spacer = b"TTGGCCAA"; // 8bp unique junction between the two bubbles
+    let mid1_short: Vec<u8> = b"CAT".repeat(4); // 12bp
+    let mid1_long: Vec<u8> = b"CAT".repeat(6); // 18bp
+    let mid2_short: Vec<u8> = b"GAT".repeat(4); // 12bp
+    let mid2_long: Vec<u8> = b"GAT".repeat(6); // 18bp
+
+    let make = |m1: &[u8], m2: &[u8]| -> Vec<u8> {
+        let mut r = left.to_vec();
+        r.extend_from_slice(m1);
+        r.extend_from_slice(spacer);
+        r.extend_from_slice(m2);
+        r.extend_from_slice(right);
+        r
+    };
+    let short_read = make(&mid1_short, &mid2_short);
+    let long_read = make(&mid1_long, &mid2_long);
+
+    let cfg = PoaConfig {
+        min_reads: 3,
+        min_allele_freq: 0.2,
+        phasing_bubble_min_span: 10,
+        ..Default::default()
+    };
+
+    let mut all_reads: Vec<Vec<u8>> = (0..8).map(|_| short_read.clone()).collect();
+    all_reads.extend((0..8).map(|_| long_read.clone()));
+
+    let refs: Vec<&[u8]> = all_reads.iter().map(Vec::as_slice).collect();
+    let consensuses = poa_consensus::consensus_multi(&refs, 0, &cfg).unwrap();
+
+    assert_eq!(
+        consensuses.len(),
+        2,
+        "a genuine, if subtle (12bp), multi-bubble length delta must not be \
+         downgraded to a single allele by the length-bimodality safety check"
+    );
+    let mut lens: Vec<usize> = consensuses.iter().map(|c| c.sequence.len()).collect();
+    lens.sort_unstable();
+    let expected_short = short_read.len();
+    let expected_long = long_read.len();
+    assert_eq!(lens[0], expected_short, "short allele length mismatch");
+    assert_eq!(lens[1], expected_long, "long allele length mismatch");
+}

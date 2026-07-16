@@ -11,6 +11,128 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Multi-allele read-partition contamination on periodic (homogeneous) tandem
+  repeats: `consensus_multi` could silently misassign a large fraction of reads
+  to the wrong allele group.** Root-caused via ground-truth read tracing on real
+  GAA×30/GAA×100 HiFi data (`multi_gaa30_100`): ~29% of reads (15 of 52) ended
+  up in the wrong output allele's group. Two independent, layered fixes, applied
+  in a mandated order so each one's own contribution could be measured before
+  stacking the next:
+  - **(a) `find_structural_bubbles`'s arm-span measurement is now noise-tolerant.**
+    `materialize_arm_len` walked a strictly unbranched chain and stopped at the
+    *first* fork or reconvergence, no matter how small -- a single read's indel
+    error. In a periodic repeat, ordinary per-read indel noise (the dominant
+    ONT/HiFi error mode in these regions -- matching-vs-inserting at any one
+    column is close to a coin flip) scatters many such tiny disruptions
+    throughout the entire length-differentiating region, so no arm ever
+    measured long enough to clear `phasing_bubble_min_span` and the whole
+    locus fell through to the single-column SNP-bubble fallback, which cannot
+    reliably track a read's true (much longer) haplotype identity. Added
+    `materialize_arm_len_tolerant` plus `real_in_edge_count`: a node's
+    in-edges (or a fork's out-edges) only count as a "real" reconvergence/fork
+    if the edge's own weight clears the same significance threshold already
+    used elsewhere (`ceil(n_reads * min_allele_freq)`, floored at 1) --
+    concretely, "minor branching" means *one or more* out-edges/in-edges whose
+    weight is below that population-scaled floor, which by construction can
+    never itself be a second true haplotype (a true second allele's arm must,
+    by definition, already have cleared `min_allele_freq` to be worth phasing
+    at all). The walk passes straight through any such minor branching and
+    keeps measuring the arm; it still stops the instant *two or more*
+    sufficiently-weighted arms/in-edges appear, so a genuine second
+    structural bubble immediately downstream is never swallowed into the
+    first arm's span. `collect_bubble_sites`'s public `BubbleSite.is_structural`
+    field now uses the same tolerant measurement for consistency with
+    `find_structural_bubbles`'s own classification -- **this is a computed-value
+    behavior change on public API surface**: a site that was `is_structural:
+    false` purely because of scattered per-read noise fragmenting its span may
+    now report `true`. No other `materialize_arm_len` call site
+    (`compute_stats`'s `longest_bubble_span`, the public `bubble_arm_lengths()`)
+    was touched -- both remain general diagnostics, not consensus-affecting
+    decisions, and are out of scope here.
+  - **`phasing_groups`'s pairwise union-find had a latent wildcard-bridging bug,
+    surfaced (not introduced) by (a) finding more structural bubbles than
+    before.** A read with no recorded arm choice at some bubble (a wildcard,
+    `None`) union-found its way into merging two clusters that a fully-informed
+    read would never have judged compatible, because plain union-find only
+    checks pairwise compatibility, not compatibility against a cluster's *entire*
+    accumulated signature. Rewrote as informativeness-ordered incremental
+    clustering: reads are processed most-fully-specified first; a read only
+    joins an existing cluster if it is compatible with *every* bubble that
+    cluster has resolved so far, joins nothing (starts a new cluster) if
+    compatible with none, and is deferred to `bridge_candidates` (folded into
+    the largest final group) if compatible with more than one -- never silently
+    picking one arbitrarily. Verified this still correctly separates a nested
+    3-allele case (`structural_bubble_phasing_three_alleles`, unchanged) while
+    no longer bridging through partial-information reads.
+  - **(b) `validate_and_merge_groups`: a read-length bimodality safety net for
+    whatever the structural-bubble path still hands off.** After (a) also fixed
+    the underlying union-find bug, provisional groups from `phasing_groups`
+    could still include spurious small clusters (noise, not real minority
+    alleles) that individually cleared the read-count floor. Before trusting a
+    provisional split, each candidate group's read lengths are compared against
+    already-confirmed groups' lengths via a median-gap-vs-spread test
+    (`length_separated`: median gap >= 8bp *and* >= 3x the pooled median
+    absolute deviation, MAD floored at 3bp so near-zero-noise clean read sets
+    don't produce a degenerate zero threshold). A rejected candidate is folded
+    into whichever confirmed group its own median length is closest to, rather
+    than discarded. Two points tuned empirically, not assumed correct by design,
+    documented in code:
+    - The length-separation check only runs when the locus has **2 or more**
+      structural bubbles, not universally. A single structural bubble can
+      legitimately represent a same-length substitution-type difference (e.g.
+      `locked_arm_deep_bubble_alleles_lost`'s G×30-vs-A×30, both 50bp) with no
+      selection risk to guard against; the coincidental-tie risk this check
+      exists for is specifically the multiple-comparisons exposure that appears
+      once 2+ independent bubble sites are involved.
+    - The significance bar for a candidate group is the plain `min_reads` floor,
+      not a `min_allele_freq`-derived population-wide threshold. The stricter
+      threshold double-penalizes genuine minority alleles, because
+      `phasing_groups`'s own cross-bubble-consistency requirement already
+      attrites a minority cluster's size below its raw single-bubble arm
+      weight; re-applying the un-attrited population-wide bar on top of that
+      wrongly rejected a confirmed 5-read CAG×40 minority cluster
+      (`multi_skew_cag20_40`) that should have passed.
+    - **This check is deliberately scoped to the structural-bubble/`phasing_groups`
+      path only, not the same-length SNP-bubble fallback
+      (`partition_reads_by_bubble`)** -- genuine same-length substitution
+      haplotypes (`structural_bubble_phasing_ignores_snp_bubbles`,
+      `CATCATCAT` vs `CATCGTCAT`) legitimately have zero length difference by
+      construction, so a length check on that path would reject every correct
+      call.
+  - **Validation:** ground-truth read-provenance tracing on `multi_gaa30_100`
+    (extracted reads' true allele label, from the simulator, cross-referenced
+    against `Consensus.read_indices`) shows the misassignment rate drop from
+    **28.8% (15/52) before this fix to 15.4% (8/52) after** -- a substantial
+    improvement, not a complete elimination; the residual is consistent with
+    Known Bug #3/#4's separately-tracked periodic-alignment ambiguity, not this
+    contamination mechanism. `bench/validate.py`: `multi_gaa30_100` itself moves
+    from FAIL to a clean OK (100->98 units, Δ-2; 30->31 units, Δ+1, both within
+    tolerance), for an overall 18/20 (unchanged scenario count from the
+    preceding harness fix, since that fix already resolved `sv_cag20_out60`
+    separately -- see that entry below). `multi_skew_cag20_40` was investigated
+    as a residual FAIL (20->22, Δ+2 on the majority allele) and confirmed, via
+    the same ground-truth tracing method, to have **zero cross-contamination**
+    post-fix -- the residual is ordinary per-partition consensus noise (the
+    separately-tracked seed-sensitivity class of issue), not this bug, and is
+    reported here rather than swept aside. `bench/compare_callers.py`: 16/16,
+    unchanged (none of its scenarios exercise multi-allele partitioning).
+    New regression tests: `tests/multi_allele_periodic_phasing.rs`
+    (`structural_phasing_no_contamination_on_noisy_periodic_repeat`, a
+    synthetic GAA×15-vs-GAA×40 read set with deterministic scattered indel
+    noise -- confirmed to fail against the pre-fix code with ~30% per-group
+    cross-contamination, matching the real-data magnitude, and pass after) and
+    `structural_bubble_phasing_subtle_length_delta_not_rejected` in
+    `src/tests.rs` (a genuine but subtle, 12bp, two-bubble length delta,
+    confirming (b)'s bimodality check does not produce a false negative and
+    silently downgrade a real heterozygous call to single-allele output). Full
+    `cargo test --release --features cli` (192 lib tests, all integration
+    binaries, doctests) green, including the two multi-allele partitioning
+    tests from Phase 2 below (`partition_reads_by_bubble_excludes_delete_only_reads`,
+    `bubble_site_arm_read_counts_excludes_delete_only_reads`). `cargo clippy
+    --all-features --tests` and `cargo fmt --check` clean against this round's
+    changes (pre-existing warnings elsewhere in the test suite are unrelated
+    and untouched). `PoaConfig`'s defaults are unchanged.
+
 - **`heaviest_path` conflated Match and Delete traversal when scoring the consensus
   spine, letting a node reached mostly by reads *skipping past it* out-compete a
   genuinely Match-confirmed alternative arm at the same fork.** `Node.out_edges`
@@ -391,6 +513,60 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     unchanged. Not a complete fix for the underlying seed-length sensitivity --
     see `consensus_adaptive`'s doc comment for the full, honest account of what
     this does and does not solve.
+
+- **`bench/validate.py`'s `extract_allele_by_unit` was itself fabricating most
+  of the apparent severity of `cag50_d20` and (per the entry above)
+  `cag50_d20_s2` -- both look far closer to correct once measured properly.**
+  Digging into why `consensus_fit` scored the (supposedly under-called) pass-1
+  consensus as tied with the true answer for `cag50_d20`, and why the retry's
+  chosen candidate for `cag50_d20_s2` scored *better* than pass-1 despite the
+  benchmark reporting it as *more* wrong (Δ-7 -> Δ-10), turned up the same root
+  cause behind both: `extract_allele_by_unit`'s cluster-gap tolerance
+  (`2*len(unit)`, 6 bp for `CAG`/`GAA`) is too tight. A single interior
+  substitution error (e.g. one `CAG` -> `CAA`) breaks exact-match scanning for
+  a stretch wide enough to push the gap between surviving hits past 6 bp with
+  no actual indel present at all, splitting one genuine repeat run into two
+  clusters; the function then keeps only the larger cluster and silently
+  discards the rest as "not really part of the repeat."
+  - **Confirmed independently of this function, not just by adjusting its own
+    tolerance and re-checking itself:** built the ground-truth window directly
+    from the reference-construction constants (100 bp of real flank on each
+    side + the true repeat) and compared it to the actual consensus output via
+    plain Levenshtein distance (no clustering, no unit-counting at all).
+    `cag50_d20`'s pass-1 consensus (reported as Δ-5 units/edit=15) is only
+    **4 edits** from the 350 bp ground-truth window -- essentially exact.
+    `cag50_d20_s2`'s retry-chosen candidate (reported as Δ-10/edit=30, i.e.
+    "worse than pass-1's Δ-7") is only **8 edits** from ground truth, against
+    pass-1's own 28 -- the retry was a real, substantial improvement, not a
+    regression; the previous entry's "Δ-7 -> Δ-10" framing is superseded by
+    this direct measurement. Also re-ran `consensus_fit` on these consensuses
+    via the actual crate function (`poa_consensus::analysis::consensus_fit`),
+    not a re-implementation: its scores for `cag50_d20` (pass-1 0.050883 vs.
+    ground truth 0.050795) and its ranking of all four `cag50_d20_s2`
+    candidates matched the Levenshtein-based ordering exactly in both cases --
+    `consensus_fit` was never the problem; it was scoring correctly against a
+    ground truth that the benchmark's own reporting function was
+    misrepresenting.
+  - **Fixed by widening the tolerance from `2*len(unit)` to `4*len(unit)`.**
+    Verified safe before applying to the real file: patched a copy of the
+    function in memory and re-evaluated all 16 tracked single-allele scenarios
+    plus 9 ad hoc seed-sweep cases from this investigation (25 total) --
+    zero pass/fail status changes anywhere. Applied to the real file and
+    re-confirmed the same 25/25 zero-flip result directly against it (not the
+    copy). `bench/validate.py` stays 18/20 and `bench/compare_callers.py` stays
+    16/16 -- **this changes reported severity, not pass/fail status**:
+    `cag50_d20` now reports Δ-2/edit=2 (was Δ-5/edit=15) and still fails the
+    strict ±1-unit tolerance, `cag50_d20_s2` now reports Δ-5/edit=7 (was
+    Δ-10/edit=30) and still fails, and `cag20_d20_r9` (already excused via the
+    read-limit adequacy check) improves from Δ-7/edit=21 to Δ-2/edit=2 with no
+    status change. Both real residuals (Δ-2 and Δ-5) are now small enough that
+    whether they reflect a genuine remaining algorithmic gap or further
+    benchmark-measurement noise is an open question for future investigation,
+    not something this fix resolves -- it only removes a confound that was
+    making both failures look roughly 5-10x more severe than the consensus
+    output actually was. Bench-tooling only (`bench/validate.py`); no Rust
+    crate changes; `cargo test`/`clippy`/`fmt` are unaffected (confirmed, as
+    expected for a Python-only change).
 
 ### Breaking
 

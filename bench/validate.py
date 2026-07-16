@@ -321,7 +321,24 @@ def extract_allele_by_unit(cons: bytes, unit: str) -> Optional[bytes]:
     sequences (_U or its reverse).  Isolated spurious occurrences in the flank
     (from sequencing errors) are excluded by finding the largest CLUSTER of
     unit positions, where two positions belong to the same cluster if their
-    gap is <= 2*len(unit) (tolerates single-base indel errors in the repeat).
+    gap is <= 4*len(unit).
+
+    4*len(unit), not 2*len(unit): a single interior substitution error breaks
+    exact-match scanning for one full unit on each side of it (the base can
+    fall inside two overlapping unit-windows for a 3bp unit), which can
+    already push the gap between surviving hits past 2*len(unit) on its own,
+    with no real indel involved at all.  Confirmed on real consensus output
+    (cag50_d20, a single "CAG"->"CAA" substitution ~4 units into the repeat):
+    the true consensus was independently confirmed (Levenshtein distance
+    against the ground-truth window, not this function) to be only 4 edits
+    away from correct, but the 2*len(unit) tolerance split the repeat into a
+    3-unit cluster and a 45-unit cluster at that single substitution, kept
+    only the larger one, and reported a fabricated 5-unit/15bp deficit that
+    was not actually present in the consensus.  4*len(unit) was verified
+    (bench investigation, see CHANGELOG) to survive a single substitution's
+    worst-case gap while still not merging genuinely-separate clusters across
+    every currently-tracked scenario and several ad hoc ones (25 total, zero
+    pass/fail status changes from widening the tolerance from 2x to 4x).
     """
     u = unit.upper().encode()
     s = cons.upper()
@@ -342,10 +359,10 @@ def extract_allele_by_unit(cons: bytes, unit: str) -> Optional[bytes]:
         return cons[positions[0]: positions[0] + n]
 
     # Group into clusters: two consecutive positions are in the same cluster
-    # when their gap is <= 2*n (allows one extra/missing base per unit).
+    # when their gap is <= 4*n (see docstring for why 4x, not 2x).
     clusters: list[list[int]] = [[positions[0]]]
     for p in positions[1:]:
-        if p - clusters[-1][-1] <= 2 * n:
+        if p - clusters[-1][-1] <= 4 * n:
             clusters[-1].append(p)
         else:
             clusters.append([p])

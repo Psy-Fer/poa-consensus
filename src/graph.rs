@@ -475,6 +475,117 @@ fn materialize_arm_len(nodes: &[Node], start: usize, max_depth: usize) -> usize 
     len
 }
 
+/// Number of `node`'s in-edges whose own source-side weight (matched-only, the
+/// same axis `find_structural_bubbles`/`find_bubbles` already score arms on)
+/// clears `sig_threshold`. Used by [`materialize_arm_len_tolerant`] to tell a
+/// genuine reconvergence (2+ real paths meeting) apart from one real path plus
+/// incidental noise (e.g. one read's stray Delete-turned-edge, or a single
+/// misaligned base creating a low-weight side edge).
+fn real_in_edge_count(nodes: &[Node], node: usize, sig_threshold: i32) -> usize {
+    nodes[node]
+        .in_edges
+        .iter()
+        .filter(|&&p| {
+            nodes[p]
+                .out_edges
+                .iter()
+                .find(|&&(to, _)| to == node)
+                .is_some_and(|&(_, ew)| ew.matched >= sig_threshold)
+        })
+        .count()
+}
+
+/// Like [`materialize_arm_len`], but tolerant of minor internal noise: a fork
+/// or reconvergence only ends the arm when it is a *real* one -- i.e. when
+/// 2+ of the edges involved individually clear `sig_threshold` -- rather than
+/// on any branch at all, no matter how small.
+///
+/// # Why this exists (see `find_structural_bubbles`)
+///
+/// A genuinely long structural difference between two alleles (e.g. GAA×30
+/// vs GAA×100) does not, in real data, materialise as one perfectly clean
+/// unbranched chain of matches for its entire length: ordinary per-read
+/// sequencing noise creates small side-branches and reconvergences scattered
+/// throughout it (a single read's substitution error creating a 1-weight
+/// alternate node; a single read's Delete creating a low-weight direct edge
+/// past a node others still Match through). The strict, non-tolerant walk
+/// stops at the *first* such disruption, so it measures only the distance to
+/// the first read's noise, not the arm's true span -- confirmed empirically
+/// on real data (RFC1 hap2's whole "delete-driven forkless gap" class of
+/// known bugs is this same phenomenon in a different codepath) and on a
+/// synthetic 150 bp non-repetitive structural-insertion control at realistic
+/// (~6%) per-read error rates, where the strict walk also undercounts span
+/// for a perfectly clean, unambiguous, non-periodic difference.
+///
+/// # What counts as "minor" and why the bound is safe
+///
+/// A branch or reconvergence is "minor" exactly when it does NOT clear
+/// `sig_threshold` -- the identical `min_allele_freq`-derived vote count
+/// `find_bubbles`/`find_structural_bubbles` already use to decide "is this
+/// arm significant enough to be a competing-allele candidate" everywhere
+/// else in this file. This is deliberate, not a new, separately-tuned bar:
+/// anything this function is willing to walk through is, by the SAME
+/// definition already governing every other bubble decision in this module,
+/// not significant enough to be treated as a second real path. It cannot
+/// silently swallow a genuine second haplotype nested inside the arm being
+/// measured, because a genuine one clears the same bar used to find it in
+/// the first place -- if 2+ of the candidate edges at a fork (or 2+ of a
+/// node's in-edges) each clear `sig_threshold` independently, that is by
+/// construction a real branch/reconvergence, and the walk stops there exactly
+/// as the strict version would.
+///
+/// Bounded to `max_depth` steps, identical to the caller's existing bound
+/// (`phasing_bubble_min_span + 1`): the caller only ever needs to know
+/// whether the span reaches `phasing_bubble_min_span`, so once the walk has
+/// gone that far without hitting a REAL fork or reconvergence the answer is
+/// already known, and there is no reason -- or additional risk -- in
+/// continuing further. This keeps the same bounded-walk shape as this file's
+/// existing patterns (`ARM_MAX_DEPTH`, `FORK_SEARCH_HOPS`) rather than
+/// introducing an open-ended search; unlike reusing the whole-graph
+/// `compute_bubble_ranges` path-budget algorithm (which tracks true
+/// reconvergence of *every* out-edge, including noise ones, and can mark an
+/// entire open-ended tail of the graph as "one giant unresolved bubble" when
+/// a noise branch never reconverges before the graph ends), this walk only
+/// ever looks at the single arm being measured and never grows unbounded.
+fn materialize_arm_len_tolerant(
+    nodes: &[Node],
+    start: usize,
+    max_depth: usize,
+    sig_threshold: i32,
+) -> usize {
+    let mut len = 0;
+    let mut cur = start;
+    for _ in 0..max_depth {
+        // After the first step, only a REAL reconvergence (2+ in-edges each
+        // individually clearing sig_threshold) ends the arm.
+        if len >= 1 && real_in_edge_count(nodes, cur, sig_threshold) > 1 {
+            break;
+        }
+        len += 1;
+        match nodes[cur].out_edges.as_slice() {
+            [] => break,
+            [(next, _)] => cur = *next,
+            edges => {
+                let real_arms = edges
+                    .iter()
+                    .filter(|&&(_, ew)| ew.matched >= sig_threshold)
+                    .count();
+                if real_arms > 1 {
+                    break; // a genuine nested fork -- this arm ends here.
+                }
+                // At most one edge is significant; the rest are noise. A
+                // significant edge's weight is by definition >= sig_threshold
+                // and thus >= any noise edge's weight, so max_by_key always
+                // picks it when one exists, and picks an arbitrary (but
+                // deterministic) noise edge when none do.
+                let (next, _) = edges.iter().max_by_key(|&&(_, ew)| ew.matched).unwrap();
+                cur = *next;
+            }
+        }
+    }
+    len
+}
+
 // ─── Bubble detection ────────────────────────────────────────────────────────
 
 /// Find the topo rank of the exit node for a bubble starting at `entry_t`.
@@ -2443,15 +2554,18 @@ fn find_structural_bubbles(
                 return None;
             }
 
-            // An arm whose start node already has multiple in-edges is a direct edge to
-            // the bubble exit (arm span 0). Otherwise measure the single-successor chain.
+            // An arm whose start node already has a REAL (significant)
+            // second in-edge is a direct edge to the bubble exit (arm span
+            // 0); a start node with only NOISE extra in-edges is not
+            // actually a reconvergence and its span is still measured
+            // normally (see materialize_arm_len_tolerant's doc comment).
             let max_span = arms
                 .iter()
                 .map(|&start| {
-                    if nodes[start].in_edges.len() > 1 {
+                    if real_in_edge_count(nodes, start, threshold) > 1 {
                         0
                     } else {
-                        materialize_arm_len(nodes, start, max_check)
+                        materialize_arm_len_tolerant(nodes, start, max_check, threshold)
                     }
                 })
                 .max()
@@ -2524,6 +2638,12 @@ fn collect_bubble_sites(
         .map(|(i, &(node_idx, _, _))| (node_idx, i))
         .collect();
 
+    // Same threshold and noise-tolerant span measurement as
+    // find_structural_bubbles, so `BubbleSite.is_structural` always agrees
+    // with the classification actually used for phasing -- see that
+    // function's and materialize_arm_len_tolerant's doc comments for why.
+    let threshold = ((n_reads as f64 * min_allele_freq).ceil() as i32).max(1);
+
     find_bubbles(nodes, topo, n_reads, min_allele_freq)
         .into_iter()
         .filter_map(|(entry_node, arm_starts)| {
@@ -2541,10 +2661,10 @@ fn collect_bubble_sites(
             // Mirror the guard in find_structural_bubbles: a 0-length arm
             // (arm_start == exit) is not structural regardless of what follows.
             let is_structural = arm_starts.iter().any(|&a| {
-                let len = if nodes[a].in_edges.len() > 1 {
+                let len = if real_in_edge_count(nodes, a, threshold) > 1 {
                     0
                 } else {
-                    materialize_arm_len(nodes, a, phasing_bubble_min_span)
+                    materialize_arm_len_tolerant(nodes, a, phasing_bubble_min_span, threshold)
                 };
                 len >= phasing_bubble_min_span
             });
@@ -2562,13 +2682,253 @@ fn collect_bubble_sites(
         .collect()
 }
 
+// ─── Structural-split validity check ──────────────────────────────────────────
+//
+// `find_structural_bubbles`'s own per-bubble vote-count threshold only checks
+// whether a single bubble's arm split looks significant; it cannot tell a
+// genuine second haplotype apart from a column that happens to split reads
+// close to evenly by coincidence (a periodic-repeat phase-registration tie --
+// Known Bugs #3/#4/#9's family). Confirmed on real GAA×30/GAA×100 data: once
+// `find_structural_bubbles`'s noise-tolerant span measurement (above) started
+// correctly finding real structural bubbles instead of none, `phasing_groups`
+// began correctly refusing to bridge conflicting reads together (see its own
+// doc comment) -- but that, in turn, revealed several small clusters driven by
+// nothing more than a handful of reads agreeing on one coincidental tie
+// column. A genuine second allele's read population should ALSO show a
+// distinct read-length mode (the two alleles' own lengths differ) and hold up
+// on its own vote weight; a coincidental tie column produces reads whose
+// lengths are indistinguishable from the group they were spuriously split out
+// of.
+
+/// Minimum read-length gap (bp) between two candidate groups' medians before
+/// a length-based split is trusted at all. Guards against a near-zero
+/// absolute gap being amplified into an apparently "significant" separation
+/// ratio purely because both groups happen to have very tight internal
+/// spread (e.g. two 1-read groups always have zero spread).
+const MIN_LENGTH_GAP_BP: f64 = 8.0;
+
+/// A length gap must be at least this many multiples of the pooled spread
+/// (median absolute deviation) to count as genuine bimodal separation rather
+/// than ordinary scatter around one shared mode. 3 MADs is a conservative
+/// bar (roughly analogous to ~2 standard deviations for a normal-ish
+/// distribution): real independent haplotype length populations in the
+/// validated CAG/GAA scenarios differ by tens to hundreds of bp against a
+/// MAD on the order of single-digit bp (ordinary indel/substitution read
+/// noise), while the confirmed spurious clusters' medians sit within a few
+/// bp of the group they were actually noise from.
+const LENGTH_SEPARATION_MADS: f64 = 3.0;
+
+/// Floor on the per-group spread estimate, so two groups that both happen to
+/// have very tight (near-identical) internal lengths -- including the
+/// degenerate 1-read-group case, spread 0 -- don't produce an artificially
+/// inflated separation ratio from a near-zero denominator.
+const MIN_SPREAD_FLOOR_BP: f64 = 3.0;
+
+/// Median of `vals`, treated as `f64`. Empty input returns 0.0 (callers only
+/// ever pass non-empty read-length lists here).
+fn median_usize(vals: &[usize]) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    let mut v: Vec<f64> = vals.iter().map(|&x| x as f64).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
+}
+
+/// Median absolute deviation of `vals` around `median`.
+fn mad_usize(vals: &[usize], median: f64) -> f64 {
+    let dev: Vec<usize> = vals
+        .iter()
+        .map(|&x| (x as f64 - median).abs().round() as usize)
+        .collect();
+    median_usize(&dev)
+}
+
+/// True when two groups' read-length distributions are genuinely bimodally
+/// separated (real length-differing alleles) rather than ordinary scatter
+/// around one shared mode (see the constants above for the exact bar).
+fn length_separated(lens_a: &[usize], lens_b: &[usize]) -> bool {
+    if lens_a.is_empty() || lens_b.is_empty() {
+        return false;
+    }
+    let med_a = median_usize(lens_a);
+    let med_b = median_usize(lens_b);
+    let gap = (med_a - med_b).abs();
+    if gap < MIN_LENGTH_GAP_BP {
+        return false;
+    }
+    let spread_a = mad_usize(lens_a, med_a).max(MIN_SPREAD_FLOOR_BP);
+    let spread_b = mad_usize(lens_b, med_b).max(MIN_SPREAD_FLOOR_BP);
+    gap >= LENGTH_SEPARATION_MADS * spread_a.max(spread_b)
+}
+
+/// Validates candidate haplotype groups (as produced by [`phasing_groups`],
+/// before any of its own below-`min_reads` folding is undone) against a
+/// minimum-depth vote-weight floor, plus -- when 2+ structural bubbles were
+/// involved -- read-length bimodality as the primary discriminating signal.
+/// Any candidate that fails merges into whichever already-accepted group its
+/// own read lengths are closest to.
+///
+/// # Why the vote-weight bar is `min_reads`, not `min_allele_freq`
+///
+/// An earlier version used the same `min_allele_freq`-derived threshold
+/// `find_bubbles`/`find_structural_bubbles` use to decide whether a single
+/// bubble's own arm is significant. That is the wrong bar to apply to a
+/// *cluster*'s final size here: `phasing_groups`'s whole point is to keep
+/// only reads that agree *consistently across every bubble they have a
+/// recorded choice at* (see its own doc comment on why plain union-find
+/// bridging is unsound), which is a strictly harder bar to clear than any
+/// single bubble's own arm weight -- a read that is noisy at just one of
+/// several bubbles is correctly excluded from the clean cluster even though
+/// it still supports the same haplotype overall. Reusing the un-attrited
+/// `min_allele_freq * n_reads` threshold against this already-attrited count
+/// double-penalises exactly the reads `phasing_groups` is supposed to filter
+/// once, rejecting genuine minority alleles outright: confirmed on real data
+/// (`multi_skew_cag20_40`, a true ~20%-frequency CAG×40 minority allele) where
+/// the cleanly cross-bubble-consistent cluster (5 reads) cleared its own
+/// bubbles' individual arm-weight thresholds fine but fell under the
+/// pool-wide `min_allele_freq` bar purely from that attrition, even though it
+/// was clearly read-length-separated from the majority allele. `min_reads`
+/// (the same absolute depth floor `phasing_groups` already uses for ITS OWN
+/// below-floor folding, and the same floor `PoaGraph` requires before
+/// attempting a consensus at all) is the bar actually being asked here --
+/// "is there enough depth to build a consensus from this cluster at all" --
+/// so reusing it, rather than the separate significance-of-a-single-arm bar,
+/// is the correct comparison.
+///
+/// # Why length separation is required only when 2+ bubbles are in play
+///
+/// A genuine haplotype split is frequently the SAME length on both arms by
+/// construction -- not just same-length SNP-bubble-fallback haplotypes
+/// (`structural_bubble_phasing_ignores_snp_bubbles`, handled by a completely
+/// separate code path anyway), but same-length *structural* bubbles too: a
+/// single long homopolymer run that differs by base rather than length
+/// (confirmed by `locked_arm_deep_bubble_alleles_lost`, a G×30-vs-A×30 arm,
+/// which regressed under an earlier version of this function that required
+/// length separation unconditionally). Requiring length separation whenever
+/// there is only one structural bubble in the whole graph would reject that
+/// class of real call outright.
+///
+/// The confirmed failure mode this function targets -- a coincidental
+/// phase-registration tie in a periodic repeat producing a column whose vote
+/// split looks significant but carries no real length signal -- was only
+/// ever observed (and is only plausible) when 2+ structural bubbles exist:
+/// `find_structural_bubbles` evaluates every fork in the graph and keeps
+/// only those whose (now noise-tolerant) span clears the threshold, so
+/// multiple surviving bubbles means multiple independent candidates were
+/// compared, and a coincidental near-even split becomes far more likely to
+/// slip through *some* one of them than when there is only a single
+/// candidate in the entire graph. Gating the length requirement on bubble
+/// count is therefore not an arbitrary threshold but a direct response to
+/// that multiple-candidates dynamic: one bubble carries no such selection
+/// risk (its own span survived on genuine structural grounds, not on being
+/// picked as the most-balanced-looking of many), so the depth floor alone is
+/// trusted; two or more reintroduces exactly the risk length separation is
+/// meant to catch.
+fn validate_and_merge_groups(
+    groups: Vec<Vec<usize>>,
+    reads: &[Vec<u8>],
+    min_reads: usize,
+    n_bubbles: usize,
+) -> Vec<Vec<usize>> {
+    if groups.len() < 2 {
+        return groups;
+    }
+    let mut groups = groups;
+    groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.len()));
+
+    let require_length_separation = n_bubbles >= 2;
+
+    // The largest group is always trusted as the baseline/reference -- same
+    // philosophy as every other bubble-selection heuristic in this file
+    // (e.g. partition_reads_by_bubble's own largest-group fallback target).
+    let mut confirmed: Vec<Vec<usize>> = vec![groups[0].clone()];
+    let mut confirmed_lens: Vec<Vec<usize>> =
+        vec![groups[0].iter().map(|&r| reads[r].len()).collect()];
+
+    for cand in groups.into_iter().skip(1) {
+        let cand_lens: Vec<usize> = cand.iter().map(|&r| reads[r].len()).collect();
+
+        let significant = cand.len() >= min_reads;
+        let separated_from_all = !require_length_separation
+            || confirmed_lens
+                .iter()
+                .all(|existing| length_separated(&cand_lens, existing));
+
+        if significant && separated_from_all {
+            confirmed.push(cand);
+            confirmed_lens.push(cand_lens);
+        } else {
+            // Not trustworthy as its own allele: merge into whichever
+            // confirmed group this candidate's own median length is closest
+            // to (rather than always the largest), so the merge target is
+            // the group it most plausibly actually came from.
+            let cand_med = median_usize(&cand_lens);
+            let target = confirmed_lens
+                .iter()
+                .enumerate()
+                .min_by(|&(_, a), &(_, b)| {
+                    let da = (median_usize(a) - cand_med).abs();
+                    let db = (median_usize(b) - cand_med).abs();
+                    da.partial_cmp(&db).unwrap()
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            confirmed_lens[target].extend(cand_lens);
+            confirmed[target].extend(cand);
+        }
+    }
+
+    confirmed
+}
+
 /// Groups reads by arm-choice compatibility across all structural bubbles.
 ///
 /// For each structural bubble, edge_reads tells us which reads entered each arm.
 /// Two reads are in the same haplotype group when they agree on every bubble
 /// where both have a recorded arm choice. Reads with no arm assignment at any
 /// structural bubble (pre-dating all bubbles, or not spanning them) are folded
-/// into the largest group. Groups below min_reads are also folded into the largest.
+/// into the largest group, as are reads whose partial information can't
+/// distinguish between two or more existing groups (see below). Groups below
+/// min_reads are also folded into the largest.
+///
+/// # Why this is not a plain pairwise union-find
+///
+/// An earlier version unioned any two reads whenever they never *conflicted*
+/// (treating a missing arm choice at either read as an automatic pass) and
+/// took the transitive closure of that relation. That is unsound whenever a
+/// read has partial information (an arm choice at some bubbles but not
+/// others): such a read can be pairwise-"compatible" with two *mutually
+/// contradictory* fully-specified reads at once (e.g. read X entered arm 0 at
+/// bubble A and has no recorded choice at bubble B; reads Y and Z both entered
+/// arm 0 at bubble A but *disagree* at bubble B) -- plain union-find, being
+/// purely pairwise, transitively merges Y and Z into one group through X even
+/// though Y and Z themselves directly conflict and would never be unioned if
+/// compared to each other. Confirmed on real data (a periodic GAA repeat
+/// where `find_structural_bubbles`' noise-tolerant span measurement now
+/// correctly detects 2-3 real structural bubbles instead of 0): reads with
+/// only partial bubble coverage bridged two haplotypes with genuinely
+/// conflicting votes into a single collapsed group, when they should have
+/// stayed apart.
+///
+/// Fixed by building clusters incrementally, most-informative-read first,
+/// and only ever merging a read into a cluster when it is compatible with
+/// *exactly one* existing cluster -- never letting a read's own missing
+/// information be used to bridge two clusters that would conflict with each
+/// other. A read compatible with zero clusters starts a new one (this is
+/// what correctly produces 3+ groups for nested bubbles, e.g. a short/
+/// medium/long three-allele split: the short reads never reach the inner
+/// bubble at all, so they are informationally *incompatible* with both the
+/// medium and long clusters at the outer bubble -- a real conflict, not
+/// ambiguity -- and correctly form their own third group). A read compatible
+/// with two or more clusters carries no information that distinguishes them,
+/// so -- exactly like a read with no recorded arm choice anywhere -- it is
+/// folded into the largest final group rather than risking a wrong merge.
 fn phasing_groups(
     edge_reads: &HashMap<(usize, usize), Vec<u32>>,
     bubbles: &[(usize, Vec<usize>)],
@@ -2603,57 +2963,67 @@ fn phasing_groups(
         }
     }
 
-    // Union-find over assigned reads: merge reads whose arm choices never conflict.
-    let n = assigned.len();
-    let mut parent: Vec<usize> = (0..n).collect();
+    // Process the most-informative reads (fewest missing bubble choices)
+    // first, ties broken by read index for determinism, so cluster
+    // "templates" are established from the strongest evidence before any
+    // partial-information read is considered.
+    let mut order = assigned.clone();
+    order.sort_by_key(|&r| {
+        let known = sig[r].iter().filter(|s| s.is_some()).count();
+        (std::cmp::Reverse(known), r)
+    });
 
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let ri = assigned[i];
-            let rj = assigned[j];
-            let compatible = (0..n_bubbles).all(|b| match (sig[ri][b], sig[rj][b]) {
-                (Some(a), Some(bv)) => a == bv,
-                _ => true,
-            });
-            if compatible {
-                let mut pi = i;
-                while parent[pi] != pi {
-                    pi = parent[pi];
-                }
-                let mut pj = j;
-                while parent[pj] != pj {
-                    pj = parent[pj];
-                }
-                if pi != pj {
-                    parent[pj] = pi;
+    // clusters[c][b] = this cluster's observed arm choice at bubble b (None
+    // if no member has reached it yet). Grown incrementally: once a cluster
+    // observes a value at a bubble, that becomes a hard requirement for
+    // every subsequent read considered for that cluster.
+    let mut clusters: Vec<Vec<Option<usize>>> = Vec::new();
+    let mut cluster_members: Vec<Vec<usize>> = Vec::new();
+    // Reads compatible with 2+ clusters at once: their partial information
+    // can't tell those clusters apart, so they must not be allowed to merge
+    // them. Folded into the largest final group, like `unassigned`.
+    let mut bridge_candidates: Vec<usize> = Vec::new();
+
+    for r in order {
+        let row = &sig[r];
+        let compatible_clusters: Vec<usize> = clusters
+            .iter()
+            .enumerate()
+            .filter(|(_, known)| {
+                (0..n_bubbles).all(|b| match (row[b], known[b]) {
+                    (Some(a), Some(bv)) => a == bv,
+                    _ => true,
+                })
+            })
+            .map(|(ci, _)| ci)
+            .collect();
+
+        match compatible_clusters.as_slice() {
+            [] => {
+                clusters.push(row.clone());
+                cluster_members.push(vec![r]);
+            }
+            [only] => {
+                cluster_members[*only].push(r);
+                for b in 0..n_bubbles {
+                    if clusters[*only][b].is_none() {
+                        clusters[*only][b] = row[b];
+                    }
                 }
             }
+            _ => bridge_candidates.push(r),
         }
     }
 
-    // Path compression.
-    for i in 0..n {
-        let mut root = i;
-        while parent[root] != root {
-            root = parent[root];
-        }
-        parent[i] = root;
-    }
-
-    // Collect groups.
-    let mut group_map: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (slot, &r) in assigned.iter().enumerate() {
-        group_map.entry(parent[slot]).or_default().push(r);
-    }
-
-    let mut groups: Vec<Vec<usize>> = group_map.into_values().collect();
+    let mut groups: Vec<Vec<usize>> = cluster_members;
     groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.len()));
 
     if groups.is_empty() {
         groups.push(Vec::new());
     }
 
-    // Fold groups below min_reads and unassigned reads into the largest group.
+    // Fold groups below min_reads and unassigned/bridge-candidate reads into
+    // the largest group.
     let mut i = 1;
     while i < groups.len() {
         if groups[i].len() < min_reads {
@@ -2664,6 +3034,7 @@ fn phasing_groups(
         }
     }
     groups[0].extend(unassigned);
+    groups[0].extend(bridge_candidates);
     groups.retain(|g| !g.is_empty());
     groups
 }
@@ -3313,12 +3684,18 @@ impl PoaGraph {
         }
 
         let groups = if !structural.is_empty() {
-            phasing_groups(
+            let g = phasing_groups(
                 &self.edge_reads,
                 &structural,
                 self.n_reads,
                 self.config.min_reads,
-            )
+            );
+            // Validate against read-length bimodality + vote weight before
+            // trusting phasing_groups' split -- see validate_and_merge_groups'
+            // doc comment for why this is scoped to the structural-bubble
+            // path specifically, not the same-length SNP-bubble fallback
+            // below.
+            validate_and_merge_groups(g, &self.reads, self.config.min_reads, structural.len())
         } else {
             // Unbanded alignment and still no structural bubble. Try SNP bubble
             // partitioning for substitution haplotypes (same-length alleles).
