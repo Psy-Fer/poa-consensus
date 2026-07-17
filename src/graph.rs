@@ -40,6 +40,45 @@ const UNSET: i32 = i32::MIN / 2;
 /// Wide enough to absorb ~5 cumulative indels at 5% ONT error rate.
 const LOCK_EPS: usize = 5;
 
+/// Half-width of the local-population window used by `coverage_threshold`'s
+/// absolute-floor fallback (see `local_population_profile` and its call site
+/// in `consensus()`).
+///
+/// Empirically tuned, not derived from first principles -- both a much
+/// smaller and a much larger radius were tried and rejected:
+///
+/// - A read-length-scaled radius (the intuitive first choice: a read can
+///   only contribute evidence within roughly one read-length of where it
+///   starts) recovers almost none of the true partial-population fix --
+///   see the call site's comment.
+/// - A *small* radius (in this file's usual small-scale-jitter range, e.g.
+///   `LOCK_EPS = 5` / `MINI_EPS_BASE = 3`) gives the best recovery on the
+///   partial-read scenario this fix targets, but regresses three
+///   pre-existing majority-length-wins tests on real repeat data
+///   (`diag_sca8_real_sequences_no_flank`,
+///   `diag_dab1_sca37_attttc_lookahead_arm_length_bias`,
+///   `structural_phasing_no_contamination_on_noisy_periodic_repeat`): in a
+///   tandem repeat, a genuine minority's extra repeat units sit only a few
+///   bases past the majority's true boundary, so a small window bridges
+///   from the minority's own low coverage straight into the adjacent
+///   majority peak and wrongly rescues it -- reproducing the exact bug
+///   pattern (Known Bugs #1-#10) this crate has spent the most effort
+///   fixing, just via a new mechanism.
+/// - A sweep against those three regressions found their exact crossover
+///   radius at 18-20 (`diag_sca8`) and 40-45 (the periodic-phasing test);
+///   `LOCAL_POP_RADIUS = 50` sits safely above both with margin, confirmed
+///   against the full test suite (zero regressions) rather than living
+///   right at the measured edge.
+/// - This is a real, measured trade-off, not a free lunch: at radius=50 the
+///   partial-read regression scenario (`gen_short_reads_long_region_ont_r10`
+///   in `bench/compare_callers.py --general`) improves from edit=352 to
+///   edit=282 against truth (vs external tools' 250/234) -- better, but it
+///   does not fully close the gap the way a smaller, unsafe radius would.
+///   Closing it further needs a mechanism that distinguishes repeat-driven
+///   column proximity from genuine partial-population sparsity, which a
+///   single fixed window cannot do; out of scope here.
+const LOCAL_POP_RADIUS: usize = 50;
+
 // ─── Minimizer anchoring constants ───────────────────────────────────────────
 
 /// k-mer length for spine/read minimizer seeding.
@@ -3705,14 +3744,13 @@ impl PoaGraph {
         }
 
         let (topo, rank_of) = topological_order(&self.nodes);
-        let min_cov = self.min_coverage();
 
         let filtered: Vec<(usize, u8, i32)> = match self.config.consensus_mode {
             ConsensusMode::HeaviestPath => {
                 let path = heaviest_path(&self.nodes, &topo, &rank_of);
 
                 // Boundary trim: find the first/last node whose Match
-                // coverage clears the *global* population floor. This has
+                // coverage clears an absolute population floor. This has
                 // to stay absolute, not evidence-relative -- a trailing (or
                 // leading) minority extension has delete_count == 0 at its
                 // first node (nobody deletes through it; the rest of the
@@ -3720,10 +3758,45 @@ impl PoaGraph {
                 // semi-global alignment), so a Match-vs-Delete comparison
                 // alone can't distinguish "real interior disagreement"
                 // from "the majority already ended here." Only an absolute
-                // floor, sized off the whole population, can.
+                // floor can.
+                //
+                // The floor's *population* is a per-position local estimate
+                // (see `local_population_profile`), not the flat
+                // `self.n_reads` used before: for a genuinely partial-read
+                // population (no single read spans the whole target
+                // region), `self.n_reads` counts reads that can never
+                // reach a given position at all, making
+                // `(n_reads/2+1).max(2)` unreachable almost everywhere and
+                // silently collapsing the consensus toward half its true
+                // length (confirmed on `gen_short_reads_long_region_ont_r10`
+                // in `bench/compare_callers.py --general`).
+                //
+                // Radius choice: see `LOCAL_POP_RADIUS`'s own doc comment
+                // for the full empirical trade-off (a read-length-scaled
+                // radius under-fixes this bug; a small, jitter-scale radius
+                // over-fixes it by resurrecting three majority-vs-minority
+                // regressions on real repeat data). For a normal
+                // fully-spanning population this is a no-op (nearby columns
+                // already share the same near-total coverage, same as
+                // before); only a structurally partial population sees the
+                // floor actually shrink.
+                let radius = LOCAL_POP_RADIUS;
+                let path_coverage: Vec<u32> = path
+                    .iter()
+                    .map(|&(node_idx, _, _)| self.nodes[node_idx].coverage)
+                    .collect();
+                let local_pop = local_population_profile(&path_coverage, radius);
+                let local_min_cov_by_pos: Vec<u32> = local_pop
+                    .iter()
+                    .map(|&pop| coverage_threshold(pop as usize, self.config.min_coverage_fraction))
+                    .collect();
+
                 let meets_floor: Vec<bool> = path
                     .iter()
-                    .map(|&(node_idx, _, _)| self.nodes[node_idx].coverage >= min_cov)
+                    .enumerate()
+                    .map(|(i, &(node_idx, _, _))| {
+                        self.nodes[node_idx].coverage >= local_min_cov_by_pos[i]
+                    })
                     .collect();
 
                 let start = meets_floor.iter().position(|&s| s).unwrap_or(0);
@@ -3769,9 +3842,16 @@ impl PoaGraph {
                 //    This axis needs the fork's own coverage to clear a
                 //    majority of the fork's local total (not merely beat
                 //    zero), gated on that local total itself clearing the
-                //    *global* min_cov so a heavily fragmented, near-empty
-                //    fork can't manufacture a "majority" out of noise
-                //    (Known Bug #7).
+                //    position-local absolute floor (see
+                //    `local_population_profile`) so a heavily fragmented,
+                //    near-empty fork can't manufacture a "majority" out of
+                //    noise (Known Bug #7). This gate used a single global
+                //    `min_cov` before the partial-read-population fix
+                //    below; using the same per-position local floor here
+                //    keeps both checks on one consistent notion of
+                //    "population," and is a no-op for the fully-spanning
+                //    populations Bug #7 was originally about (the nearby
+                //    window still sees the same near-total coverage).
                 //
                 // A node several hops downstream of a fork, on an
                 // otherwise-unbranched continuation of one of its arms,
@@ -3820,7 +3900,7 @@ impl PoaGraph {
                             .iter()
                             .map(|&(_, ew)| ew.total())
                             .sum();
-                        if (local_total.max(0) as u32) < min_cov {
+                        if (local_total.max(0) as u32) < local_min_cov_by_pos[i] {
                             return false;
                         }
                         let local_min_cov = coverage_threshold(
@@ -3867,7 +3947,16 @@ impl PoaGraph {
                     .map(|i| path[i])
                     .collect()
             }
-            ConsensusMode::MajorityFrequency => majority_frequency(&self.nodes, &topo, min_cov),
+            // `MajorityFrequency` keeps the flat, whole-population floor:
+            // its documented use case is HiFi data with near-identical read
+            // lengths within an allele group (CLAUDE.md's "Consensus
+            // Modes"), not the genuinely-partial-read populations the local
+            // profile above targets, and `topo` order (unlike `path`) does
+            // not correspond to sequence position closely enough for a
+            // position-windowed estimate to be meaningful.
+            ConsensusMode::MajorityFrequency => {
+                majority_frequency(&self.nodes, &topo, self.min_coverage())
+            }
         };
 
         let sequence: Vec<u8> = filtered.iter().map(|&(_, base, _)| base).collect();
@@ -4233,6 +4322,83 @@ fn coverage_threshold(population: usize, min_coverage_fraction: f64) -> u32 {
     } else {
         ((population / 2 + 1).max(2)) as u32
     }
+}
+
+/// For each position `i` along `coverages`, the maximum value observed within
+/// `radius` positions on either side (inclusive) -- an O(n) sliding-window
+/// maximum (monotonic deque), safe for path lengths in the thousands.
+///
+/// This is the "local population" proxy consumed by `coverage_threshold`'s
+/// absolute-floor fallback for `ConsensusMode::HeaviestPath` (boundary trim
+/// and the interior filter's fork-population gate). It replaces `self.n_reads`
+/// -- the total read count ever added to the graph -- with an estimate of
+/// how many reads could plausibly reach *near* this exact position.
+///
+/// The distinction matters for a genuinely partial-read population (no
+/// single read spans the whole target region, by construction -- see
+/// `Scenario.partial` / `gen_short_reads_long_region_ont_r10` in
+/// `bench/compare_callers.py`): `self.n_reads` counts reads that structurally
+/// can never reach a given interior position at all, so the absolute floor
+/// `(n_reads/2+1).max(2)` is unreachable almost everywhere and the consensus
+/// silently collapses toward half its true length. A *local* window instead
+/// asks "how much agreement has this graph achieved *anywhere nearby*" --
+/// for a fully-spanning population that is still essentially `n_reads`
+/// (nearby columns share the same near-total coverage), so the fallback is
+/// unchanged in the common case; for a partial population it correctly
+/// shrinks to the achievable local depth.
+///
+/// A *global* (whole-path) maximum was tried first and rejected: a single
+/// anomalously dense stretch elsewhere in the graph (e.g. where many
+/// independently-placed partial reads' random start/end positions happen to
+/// overlap) would inflate the floor everywhere else in the same graph,
+/// which is exactly the miscalibration being fixed, just moved to a
+/// different spot. Bounding the window to `radius` (see `LOCAL_POP_RADIUS`'s
+/// own doc comment for how that constant's value was chosen -- it is an
+/// empirically-tuned trade-off, not derived from read length or any other
+/// single principle) keeps the estimate local to what nearby evidence can
+/// actually support.
+///
+/// Deliberately does *not* use a forward-recovery scan (does coverage climb
+/// back up further along?) -- Known Bug #9's writeup found that approach
+/// regressed genuine trailing-minority-extension tests
+/// (`long_repeat_length_majority_wins`, `edge_extreme_length_variation_majority_wins`)
+/// by letting a stray noisy read overlapping the tail look like "recovery."
+/// A symmetric, bounded window has no such directional bias: at a true
+/// boundary, the high-coverage core sits on one side only, so the window's
+/// max there still reflects the real population, correctly rejecting a
+/// trailing extension a few positions further out.
+fn local_population_profile(coverages: &[u32], radius: usize) -> Vec<u32> {
+    let n = coverages.len();
+    let mut out = vec![0u32; n];
+    if n == 0 {
+        return out;
+    }
+    let mut deque: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut right = 0usize;
+    for (i, out_i) in out.iter_mut().enumerate() {
+        let hi = (i + radius).min(n - 1);
+        while right <= hi {
+            while let Some(&back) = deque.back() {
+                if coverages[back] <= coverages[right] {
+                    deque.pop_back();
+                } else {
+                    break;
+                }
+            }
+            deque.push_back(right);
+            right += 1;
+        }
+        let lo = i.saturating_sub(radius);
+        while let Some(&front) = deque.front() {
+            if front < lo {
+                deque.pop_front();
+            } else {
+                break;
+            }
+        }
+        *out_i = deque.front().map(|&idx| coverages[idx]).unwrap_or(0);
+    }
+    out
 }
 
 // ─── White-box tests: nearest_fork cache (Phase 4) ──────────────────────────

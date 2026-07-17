@@ -1077,6 +1077,89 @@ fn overlapping_partial_reads_assemble_beyond_seed_length() {
     );
 }
 
+/// Deterministic xorshift RNG (mirrors `tests/sv_analysis.rs`'s helper of the
+/// same name) -- used only to generate a non-repetitive truth sequence below,
+/// so the test isn't entangled with any of the repeat-specific known bugs.
+fn xorshift_local(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+#[test]
+fn partial_read_population_default_coverage_floor_reaches_both_ends() {
+    // Regression test for the `coverage_threshold()` absolute-floor fallback
+    // (min_coverage_fraction == 0.0, the PoaConfig default) being sized off
+    // `self.n_reads` -- the *total* read count -- instead of a local
+    // population estimate. For a genuinely partial-read population (no
+    // single read spans the whole target region, by construction), that
+    // global floor is unreachable at either end even though each end has
+    // substantial, self-consistent local support, and the default-config
+    // consensus silently collapsed to roughly the shared middle third.
+    //
+    // Confirmed on `bench/compare_callers.py --general`'s
+    // `gen_short_reads_long_region_ont_r10` scenario (poa-consensus scored
+    // worse than both abPOA and SPOA); this is the minimal, deterministic,
+    // synthetic reproduction of the same population-accounting bug.
+    //
+    // Truth: 240 bp, non-repetitive (xorshift-generated, not a tandem
+    // repeat, to avoid entanglement with the repeat-specific known bugs).
+    // Left group: 8 reads covering truth[0..180] (left 180 bp).
+    // Right group: 8 reads covering truth[60..240] (right 180 bp).
+    // No read spans the full 240 bp; the two groups overlap only in the
+    // middle third (60..180). Before the fix: n_reads=16, old min_cov =
+    // 16/2+1 = 9, but each boundary region only ever has 8 reads' worth of
+    // agreement (the *other* group's reads never reach there at all) --
+    // 8 < 9, so both ends were trimmed away, leaving only the ~120 bp
+    // overlap. After the fix, the local population near each boundary
+    // correctly reflects the ~8 reads that actually reach there, and the
+    // full 240 bp is kept.
+    let mut rng: u64 = 0x5EED_1234_ABCD_0001;
+    let truth: Vec<u8> = (0..240)
+        .map(|_| b"ACGT"[(xorshift_local(&mut rng) % 4) as usize])
+        .collect();
+
+    let left = truth[0..180].to_vec();
+    let right = truth[60..240].to_vec();
+    assert!(left.len() < truth.len() && right.len() < truth.len());
+
+    let mut reads: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..8 {
+        reads.push(left.clone());
+    }
+    for _ in 0..8 {
+        reads.push(right.clone());
+    }
+
+    let cfg = PoaConfig {
+        alignment_mode: AlignmentMode::SemiGlobal,
+        ..Default::default() // min_coverage_fraction left at the 0.0 sentinel
+    };
+    let result = consensus_cfg(&reads, 0, cfg);
+    assert!(
+        result.len() >= truth.len() - 5,
+        "partial-read population should not collapse the default-config \
+         consensus to the shared middle region: got len {} vs truth len {} \
+         (seq: '{}')",
+        result.len(),
+        truth.len(),
+        s(&result)
+    );
+    // Allow a couple of bases of ordinary boundary-trim slack at the very
+    // tail (this test is about the population accounting, not pixel-perfect
+    // boundary placement); anything the fix keeps must still exactly match
+    // the noise-free truth base-for-base, no fabricated/rearranged content.
+    let n = result.len().min(truth.len());
+    assert_eq!(
+        result[..n],
+        truth[..n],
+        "recovered consensus must match the (noise-free) truth base-for-base, \
+         not merely in length -- got seq '{}'",
+        s(&result)
+    );
+}
+
 #[test]
 fn coverage_vec_reflects_partial_read_depth() {
     // The Consensus::coverage field must show lower values at positions that

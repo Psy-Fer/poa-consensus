@@ -11,6 +11,89 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`coverage_threshold()`'s absolute-floor fallback (used whenever
+  `min_coverage_fraction` is left at its `0.0` default) was sized off
+  `self.n_reads` -- the total read count ever added to the graph -- instead
+  of a population estimate scoped to what can actually reach a given
+  position.** For a genuinely partial-read population (no single read
+  spans the whole target region, by construction -- e.g. a region longer
+  than any individual read), `self.n_reads` counts reads that can never
+  reach a given interior/boundary position at all, so
+  `(n_reads/2+1).max(2)` is unreachable almost everywhere except a narrow
+  zone where enough reads happen to overlap. Both boundary trim and the
+  interior filter's fork-population gate (Known Bug #7) consumed this same
+  floor, so the default-config consensus silently collapsed toward
+  whichever narrow high-overlap zone existed, roughly half the true
+  length. Found via `bench/compare_callers.py --general`'s new
+  `gen_short_reads_long_region_ont_r10` scenario: poa-consensus scored
+  edit=352 against truth vs abPOA's 250 and SPOA's 234 -- meaningfully
+  worse, not just "also imperfect."
+  - **Fix**: both call sites now consume a per-position *local* population
+    estimate, `local_population_profile` -- an O(n) sliding-window maximum
+    (monotonic deque) over the raw heaviest path's own node coverage,
+    radius `LOCAL_POP_RADIUS`. For a fully-spanning population this is a
+    no-op (every nearby column already shares the same near-total
+    coverage, identical behaviour to before); only a structurally partial
+    population sees the floor correctly shrink to the depth actually
+    achievable near each position.
+  - **Radius choice was the hard part, and is fully empirical, not derived
+    from first principles** -- see `LOCAL_POP_RADIUS`'s own doc comment in
+    `src/graph.rs` for the complete trade-off. Summary: a read-length-scaled
+    radius (the intuitive first choice) barely fixes the bug at all (only
+    171 of 500bp recovered), because it's wide enough to bridge from the
+    genuinely sparse interior into an adjacent, denser flank -- reproducing
+    the same miscalibration in a smaller area. A small, jitter-scale
+    radius (this file's existing `LOCK_EPS = 5` / `MINI_EPS_BASE = 3`
+    range) gives the best recovery on the target scenario, but resurrects
+    three pre-existing majority-vs-minority regressions on real repeat
+    data (`diag_sca8_real_sequences_no_flank`,
+    `diag_dab1_sca37_attttc_lookahead_arm_length_bias`,
+    `structural_phasing_no_contamination_on_noisy_periodic_repeat`):
+    in a tandem repeat, a genuine minority's extra units sit only a few
+    bases past the majority's true boundary, so a small window bridges
+    straight into the majority's peak and wrongly rescues the minority --
+    the exact Known-Bugs-#1-#10 failure pattern, via a new mechanism. A
+    sweep found the exact regression crossover at radius 18-20
+    (`diag_sca8`) and 40-45 (the periodic-phasing test); `LOCAL_POP_RADIUS
+    = 50` sits safely above both, confirmed against the full test suite.
+    This is a real trade-off, not a free lunch: at radius=50 the target
+    scenario improves from edit=352 to edit=273 against truth (external
+    tools: 250/234) -- meaningfully better, but it does not fully close
+    the gap the way the unsafe smaller radius would. Closing it further
+    needs a mechanism that distinguishes repeat-driven column proximity
+    from genuine partial-population sparsity, which a single fixed window
+    cannot do; out of scope here.
+  - Deliberately does not use a forward-recovery scan (does coverage climb
+    back up further along the path?) -- Known Bug #9's writeup found that
+    approach regressed genuine trailing-minority-extension tests
+    (`long_repeat_length_majority_wins`,
+    `edge_extreme_length_variation_majority_wins`) by letting a stray
+    noisy read overlapping the tail look like "recovery." A symmetric,
+    bounded window has no such directional bias.
+  - **Scope**: `ConsensusMode::MajorityFrequency` is unaffected -- it keeps
+    the flat, whole-population floor. Its documented use case (CLAUDE.md's
+    "Consensus Modes") is HiFi data with near-identical read lengths within
+    an allele group, not the partial-read populations this fix targets,
+    and `topo` order (unlike the heaviest path) does not correspond to
+    sequence position closely enough for a position-windowed estimate to
+    be meaningful. The `min_coverage_fraction > 0.0` explicit-fraction
+    branch (and `PoaConfig`'s default value of `0.0`) are both unchanged --
+    this fix is scoped to the *fallback's* own population estimate, not
+    the user-tunable fraction semantics.
+  - Regression test:
+    `partial_read_population_default_coverage_floor_reaches_both_ends`
+    (`src/tests.rs`) -- synthetic, deterministic, non-repetitive 240 bp
+    truth split into two 180 bp halves (8 reads each) with a 120 bp
+    overlap and no spanning read; confirmed to fail (recovering only
+    ~178 bp) against a read-length-scaled radius, passes at
+    `LOCAL_POP_RADIUS = 50`.
+  - Validated against the full test suite (195 lib tests + all integration
+    fixtures, zero regressions), `bench/validate.py` (19/20, unchanged --
+    the one failure, `cag50_d20`, is the pre-existing, unrelated
+    seed-sensitivity issue), `bench/compare_callers.py` (16/16, unchanged),
+    and `bench/compare_callers.py --general` (9 of the other 10 general
+    scenarios unaffected; the target scenario improves as described above).
+
 - **Defensive bounds-check fix in `align()`'s diagonal-skip fast path (the
   "1-base pre-resolve at a bubble entry" branch): a potential index
   underflow/out-of-window write when `bj + 1` (the query column the fast

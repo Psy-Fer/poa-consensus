@@ -112,6 +112,13 @@ class Allele:
     unit:   str          # e.g. "CAG"
     count:  int          # repeat count
     depth:  int          # target read depth for this allele
+    # Display-only override for non-repeat "alleles" (see
+    # bench/compare_callers.py's GENERAL_SCENARIOS): when set, callers should
+    # print this instead of f"{unit}x{count}" for human-readable output.
+    # Purely cosmetic -- `unit`/`count` still drive `.seq` below, so a
+    # non-repeat truth is represented as `Allele(unit=<raw sequence>,
+    # count=1, ...)`, which needs no other change anywhere in this module.
+    desc:   Optional[str] = None
 
     @property
     def seq(self) -> str:
@@ -120,6 +127,10 @@ class Allele:
     @property
     def id(self) -> str:
         return f"{self.unit.lower()}{self.count}"
+
+    @property
+    def display(self) -> str:
+        return self.desc if self.desc is not None else f"{self.unit}×{self.count}"
 
 
 @dataclass
@@ -133,6 +144,12 @@ class Scenario:
     length_mean: Optional[int] = None   # override simulated read length (default: 75% of ref)
     flank_len:   int   = FLANK_LEN      # bp of flanking sequence on each side
     long_read:   bool  = False          # gated behind --long-reads
+    # bedpull defaults to "spanning reads only" (see extract_reads below);
+    # every existing scenario relies on that default (length_mean is chosen
+    # to comfortably span the target region). Set True only for a scenario
+    # that deliberately wants partial, non-spanning reads extracted too
+    # (e.g. bench/compare_callers.py's gen_short_reads_long_region_ont_r10).
+    partial:     bool  = False
 
     @property
     def is_multi(self) -> bool:
@@ -557,7 +574,10 @@ def extract_reads(scenario: Scenario, bam: Path, work: Path) -> Path:
                 min_lens[f"allele_{i}"] = ANCHOR_PAD // 2  # permissive: 50 bp
 
     raw = work / "extracted_raw.fa"
-    run(["bedpull", "-b", bam, "-r", bed, "-o", raw])
+    bedpull_cmd = ["bedpull", "-b", bam, "-r", bed, "-o", raw]
+    if scenario.partial:
+        bedpull_cmd.append("--partial")
+    run(bedpull_cmd)
 
     # Filter out reads that are too short to span the repeat region.
     extracted = work / "extracted.fa"
