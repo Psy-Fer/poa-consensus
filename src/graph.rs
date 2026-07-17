@@ -266,6 +266,32 @@ pub struct PoaGraph {
     /// (from_node, to_node) → sorted list of read indices that Deleted
     /// through this edge's target (skipped it without consuming a base).
     edge_delete_reads: HashMap<(usize, usize), Vec<u32>>,
+    /// Per-node bypass edges: from-node index → list of `(to_node, weight)`.
+    /// A bypass edge records that a read skipped one or more nodes via a run
+    /// of consecutive `Delete` ops, reconnecting the run's entry predecessor
+    /// directly to the node it resumed matching/inserting at. This is a
+    /// *separate* structural edge around the skipped node(s) -- exactly how
+    /// abPOA and SPOA represent a deletion (see
+    /// `design/architecture_comparison_abpoa_spoa.md` Finding 1, and
+    /// `design/bypass_edge_delete_rework.md` for the full phased plan this is
+    /// Phase 1 of).
+    ///
+    /// **Phase 1 status: written but never read.** No consumer
+    /// (`heaviest_path`, the interior filter, `find_bubbles`/
+    /// `find_structural_bubbles`, `compute_stats`, `verify_reuse_chain`)
+    /// looks at this field yet; wiring it into path selection is Phase 2.
+    /// Populating it here changes no existing behavior -- the existing
+    /// same-edge Delete bookkeeping (`delete_count`, `edge_delete_reads`, the
+    /// `increment_or_add_edge(.., true)` call) is left entirely intact
+    /// alongside it (dual bookkeeping, see the design doc's Audit item 11).
+    ///
+    /// Weight is a plain `i32`, deliberately *not* an [`EdgeWeight`]: a bypass
+    /// edge is definitionally delete-traffic, so keeping it a distinct type
+    /// makes it impossible to accidentally feed its weight into a `matched`-
+    /// based check (e.g. `find_bubbles`' arm-qualification), which the design
+    /// doc's worked false-bubble example shows would otherwise regress
+    /// multi-allele detection in proportion to ordinary deletion noise.
+    bypass_edges: HashMap<usize, Vec<(usize, i32)>>,
     /// number of times the long-unbanded warning was emitted
     warnings: usize,
     /// Cached heaviest-path spine, recomputed adaptively rather than every read.
@@ -2366,11 +2392,36 @@ fn try_reuse_arm(
     ))
 }
 
+/// Record (or increment) a bypass edge `from -> to`. See
+/// `PoaGraph.bypass_edges`. Weight is a running count of reads that took this
+/// bypass; a self-loop (`from == to`) is refused defensively for symmetry
+/// with `increment_or_add_edge`, though the caller's own guards should make
+/// it unreachable.
+fn record_bypass_edge(
+    bypass_edges: &mut HashMap<usize, Vec<(usize, i32)>>,
+    from: usize,
+    to: usize,
+) {
+    if from == to {
+        debug_assert_ne!(from, to, "record_bypass_edge: refusing a self-loop bypass");
+        return;
+    }
+    let entry = bypass_edges.entry(from).or_default();
+    for (t, w) in entry.iter_mut() {
+        if *t == to {
+            *w += 1;
+            return;
+        }
+    }
+    entry.push((to, 1));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_to_graph(
     nodes: &mut Vec<Node>,
     edge_reads: &mut HashMap<(usize, usize), Vec<u32>>,
     edge_delete_reads: &mut HashMap<(usize, usize), Vec<u32>>,
+    bypass_edges: &mut HashMap<usize, Vec<(usize, i32)>>,
     fork_arm_index: &mut HashMap<usize, HashMap<Vec<u8>, usize>>,
     rank_of: &[usize],
     query: &[u8],
@@ -2380,6 +2431,24 @@ fn add_to_graph(
     let mut prev: Option<usize> = None;
     let mut q_idx: usize = 0;
     let mut i = 0usize;
+
+    // Bypass-edge tracking (Phase 1 of design/bypass_edge_delete_rework.md).
+    // `bypass_pending` is `Some(entry_pred)` while inside a run of consecutive
+    // `Delete` ops, where `entry_pred` is `prev` as it stood *just before* the
+    // run's first Delete (itself an `Option`: `None` when the read begins with
+    // a Delete run, i.e. there is no predecessor to bypass *from*). It is set
+    // on the first Delete of a run, left untouched by subsequent Deletes in
+    // the same run, and consumed by the next `Match`/`Insert` op -- which, by
+    // the time it finishes, has advanced `prev` to the node the read resumed
+    // at (the bypass edge's `to`). Capturing the resume node this way, rather
+    // than peeking at `ops[i]`, is what makes it correct in the mismatch and
+    // insert cases too: those create/reuse a *new* node whose index isn't
+    // known until the op is processed, but `prev` names it correctly
+    // afterward regardless. A run left pending at end-of-ops (a terminal
+    // Delete run, e.g. a semi-global read that runs out before the graph does)
+    // is simply dropped -- there is no resume node, so no bypass edge to
+    // nowhere is created.
+    let mut bypass_pending: Option<Option<usize>> = None;
 
     // Nodes that gained a new out-edge while processing *this* read.
     // `propagate_fork_if_new` is deliberately NOT called inline as each edge
@@ -2394,6 +2463,12 @@ fn add_to_graph(
     let mut newly_forked: Vec<usize> = Vec::new();
 
     while i < ops.len() {
+        // The node this iteration's op reconnects the read to (its first, in
+        // read order -- not `prev`'s final value, which for a multi-base
+        // Insert is the run's *last* node). Set by the `Match`/`Insert` arms;
+        // left `None` by `Delete`. Used only to resolve a pending bypass run
+        // (see `bypass_pending`); has no effect on any existing bookkeeping.
+        let mut resume_node: Option<usize> = None;
         match ops[i] {
             AlignOp::Match(node_idx) => {
                 let q_base = query[q_idx];
@@ -2448,6 +2523,11 @@ fn add_to_graph(
                         new_idx
                     }
                 };
+                // A Match reconnects at exactly one node (`cur`), whether a
+                // clean match, a reused single-base substitution (chain
+                // length 1, so first == last), or a freshly created
+                // substitute -- so `cur` is unambiguously the resume node.
+                resume_node = Some(cur);
                 prev = Some(cur);
                 i += 1;
             }
@@ -2481,6 +2561,17 @@ fn add_to_graph(
                     )
                 });
                 if let Some(reused_idx) = reused {
+                    // Reuse returns the arm's *last* node, but the read
+                    // reconnects at the arm's *first* node -- re-look up the
+                    // same content-address key `try_reuse_arm` used (keyed on
+                    // the current `prev`, which is the run's last deleted node
+                    // when this Insert follows a Delete run) to recover it.
+                    // For a bypass edge the target must be where the read
+                    // genuinely rejoins, so its own onward matched edges carry
+                    // its weight from there; pointing at the arm's last node
+                    // would skip the arm's interior the read actually traversed.
+                    resume_node = prev
+                        .and_then(|p| fork_arm_index.get(&p).and_then(|m| m.get(&edit)).copied());
                     prev = Some(reused_idx);
                 } else {
                     let fork = prev;
@@ -2510,12 +2601,22 @@ fn add_to_graph(
                             .or_default()
                             .insert(edit.clone(), start);
                     }
+                    // The first newly-created node is where the read resumes.
+                    resume_node = chain_start;
                 }
                 q_idx += edit.len();
                 i = run_start + edit.len();
                 let _ = j; // j == i; kept named for clarity above
             }
             AlignOp::Delete(node_idx) => {
+                // Open a bypass run on the first Delete: capture `prev` (the
+                // entry predecessor) *before* the existing bookkeeping below
+                // advances it to the deleted node. `Some(None)` marks a run
+                // that begins with no predecessor (read starts on a Delete
+                // under semi-global), which resolves to no bypass edge.
+                if bypass_pending.is_none() {
+                    bypass_pending = Some(prev);
+                }
                 nodes[node_idx].delete_count += 1;
                 if let Some(p) = prev {
                     if increment_or_add_edge(nodes, p, node_idx, true) {
@@ -2530,7 +2631,29 @@ fn add_to_graph(
                 i += 1;
             }
         }
+
+        // Resolve a pending bypass run at the first non-Delete op (the one
+        // that set `resume_node`). A `Delete` leaves `resume_node` `None`, so
+        // the run stays open across the whole run and is only closed here by
+        // the Match/Insert that ends it. Recording is skipped (but the run
+        // still closes) when the run had no entry predecessor -- a leading
+        // Delete run has nothing to bypass *from*.
+        if let Some(entry_pred) = bypass_pending {
+            if let Some(to) = resume_node {
+                if let Some(from) = entry_pred {
+                    record_bypass_edge(bypass_edges, from, to);
+                }
+                bypass_pending = None;
+            }
+        }
     }
+
+    // A bypass run still open here is a terminal Delete run (the read ran out
+    // of query before the graph ended, e.g. a semi-global right-flank gap):
+    // no resume node ever followed, so there is no bypass edge to record.
+    // Dropping `bypass_pending` unresolved is the correct handling -- a bypass
+    // edge to a nonexistent "next" node would be malformed.
+    let _ = bypass_pending;
 
     // Now that this read's entire traceback has been applied and the graph
     // reflects its final shape (including any reconvergence this same read
@@ -3602,6 +3725,7 @@ impl PoaGraph {
             reads: vec![seed.to_vec()],
             edge_reads,
             edge_delete_reads: HashMap::new(),
+            bypass_edges: HashMap::new(),
             warnings: 0,
             cached_spine: Vec::new(),
             spine_updated_at: 0,
@@ -3704,6 +3828,7 @@ impl PoaGraph {
             &mut self.nodes,
             &mut self.edge_reads,
             &mut self.edge_delete_reads,
+            &mut self.bypass_edges,
             &mut self.fork_arm_index,
             &rank_of,
             read,
@@ -4624,6 +4749,217 @@ mod fork_cache_tests {
                  propagation is meant to avoid"
             );
         }
+    }
+}
+
+// ─── White-box tests: bypass edges (Phase 1 of bypass_edge_delete_rework) ────
+//
+// `PoaGraph.bypass_edges` is a private field written by `add_to_graph` but not
+// yet read by any consumer (Phase 1 is purely additive; wiring it into
+// `heaviest_path` is Phase 2). These same-module tests assert the field's own
+// contents directly against hand-constructed read sets with known deletion
+// patterns, since nothing observable in `consensus()` output depends on it
+// yet. All use unbanded Global alignment over a deliberately non-repetitive
+// seed so every read's Match/Delete op sequence -- and therefore the exact
+// (from, to) node indices of the bypass edges -- is unambiguous and exactly
+// predictable (a linear seed builds nodes 0..len in sequence order, so for a
+// pure-deletion read every op references node index == seed position).
+#[cfg(test)]
+mod bypass_edge_tests {
+    use super::*;
+
+    fn b(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    // 16 bp, non-repetitive: no adjacent duplicate bases near the deletion
+    // sites used below, so each deletion has a single optimal placement.
+    const SEED: &str = "ACGTGCATCGTAGCTA";
+
+    fn cfg_global_unbanded() -> PoaConfig {
+        PoaConfig {
+            band_width: 0,
+            adaptive_band: false,
+            alignment_mode: AlignmentMode::Global,
+            warn_on_long_unbanded: false,
+            min_reads: 2,
+            ..Default::default()
+        }
+    }
+
+    /// Flatten `bypass_edges` into a sorted `(from, to, weight)` list for
+    /// order-independent assertions.
+    fn flatten(g: &PoaGraph) -> Vec<(usize, usize, i32)> {
+        let mut out: Vec<(usize, usize, i32)> = g
+            .bypass_edges
+            .iter()
+            .flat_map(|(&from, tos)| tos.iter().map(move |&(to, w)| (from, to, w)))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn single_base_deletion_records_one_bypass_edge() {
+        // Delete seed position 6 ('A', between 'C'@5 and 'T'@7, both distinct
+        // from 'A' and from each other -> unambiguous single-base deletion).
+        let mut g = PoaGraph::new(&b(SEED), cfg_global_unbanded()).unwrap();
+        let read = b("ACGTGCTCGTAGCTA"); // SEED without index 6
+        g.add_read(&read).unwrap();
+
+        // Expected op sequence: Match(0..=5), Delete(6), Match(7..=15).
+        // Entry predecessor of the run = node 5; resume node = node 7.
+        assert_eq!(
+            flatten(&g),
+            vec![(5, 7, 1)],
+            "one single-base deletion should record exactly one bypass edge 5->7 weight 1"
+        );
+        // Strict no-op cross-check: the existing same-edge delete bookkeeping
+        // is still intact alongside the new bypass edge.
+        assert_eq!(
+            g.nodes[6].delete_count, 1,
+            "delete_count on the skipped node must still be incremented (dual bookkeeping)"
+        );
+        assert!(
+            g.edge_delete_reads.contains_key(&(5, 6)),
+            "edge_delete_reads must still record the skip on the same edge as before"
+        );
+    }
+
+    #[test]
+    fn multi_base_deletion_run_records_one_spanning_bypass_edge() {
+        // Delete seed positions 6,7 ('A','T'): "C A T C"@5..=8 -> "C C",
+        // a clean 2-base deletion between the two 'C's.
+        let mut g = PoaGraph::new(&b(SEED), cfg_global_unbanded()).unwrap();
+        let read = b("ACGTGCCGTAGCTA"); // SEED without indices 6,7
+        g.add_read(&read).unwrap();
+
+        // Match(0..=5), Delete(6), Delete(7), Match(8..=15): a single bypass
+        // edge spanning the whole run, 5 -> 8, not one edge per deleted node.
+        assert_eq!(
+            flatten(&g),
+            vec![(5, 8, 1)],
+            "a 2-base deletion run should record exactly one bypass edge 5->8 weight 1"
+        );
+        assert_eq!(g.nodes[6].delete_count, 1);
+        assert_eq!(g.nodes[7].delete_count, 1);
+    }
+
+    #[test]
+    fn deletion_run_spanning_a_preexisting_fork() {
+        let mut g = PoaGraph::new(&b(SEED), cfg_global_unbanded()).unwrap();
+
+        // First, an insertion read that gives node 7 ('T') a second out-edge
+        // (to the first inserted node), making it a genuine fork. This read
+        // has no Delete ops, so it records no bypass edge itself.
+        let ins = b("ACGTGCATAACGTAGCTA"); // SEED with "AA" inserted after node 7
+        g.add_read(&ins).unwrap();
+        assert_eq!(
+            g.nodes[7].out_edges.len(),
+            2,
+            "node 7 should now be a fork (matched arm to C@8, inserted arm to the new 'A')"
+        );
+        assert!(
+            flatten(&g).is_empty(),
+            "an insertion-only read must not record any bypass edge"
+        );
+
+        // Now a deletion read that deletes nodes 6,7,8 -- a run that spans the
+        // fork at node 7. Added twice to also exercise weight incrementing.
+        let del = b("ACGTGCGTAGCTA"); // SEED without indices 6,7,8
+        g.add_read(&del).unwrap();
+        g.add_read(&del).unwrap();
+
+        // Match(0..=5), Delete(6,7,8), Match(9..=15): one bypass edge 5 -> 9,
+        // weight 2 (two identical deletion reads). The fork at node 7 in the
+        // middle of the deleted run does not fragment or misplace it.
+        assert_eq!(
+            flatten(&g),
+            vec![(5, 9, 2)],
+            "a deletion run spanning a fork should still record one bypass edge 5->9, \
+             incremented to weight 2 across the two identical deletion reads"
+        );
+        assert_eq!(g.nodes[6].delete_count, 2);
+        assert_eq!(g.nodes[7].delete_count, 2);
+        assert_eq!(g.nodes[8].delete_count, 2);
+    }
+
+    #[test]
+    fn leading_delete_run_records_no_bypass_edge() {
+        // Leading delete run: read is a strict suffix of the seed. Under
+        // Global alignment the seed's leading bases must be deleted to connect
+        // to the source, so the read's ops begin with a Delete run -- one that
+        // has no entry predecessor (`bypass_pending == Some(None)`). It
+        // resolves (closes) at the first Match but records no bypass edge,
+        // because there is no predecessor node to bypass *from*.
+        let mut g = PoaGraph::new(&b(SEED), cfg_global_unbanded()).unwrap();
+        let suffix = b("ATCGTAGCTA"); // SEED[6..16]
+        g.add_read(&suffix).unwrap();
+        assert!(
+            flatten(&g).is_empty(),
+            "a leading delete run (no predecessor to bypass from) must record no bypass edge"
+        );
+        // Confirm the leading Delete run genuinely occurred (so this really
+        // exercises the Some(None) path, not a vacuous empty-ops case) while
+        // the existing per-node delete bookkeeping still happens.
+        assert_eq!(
+            g.nodes[0].delete_count, 1,
+            "leading deleted nodes are still counted by the existing bookkeeping"
+        );
+    }
+
+    #[test]
+    fn trailing_terminal_delete_run_records_no_bypass_edge() {
+        // A trailing terminal Delete run (a Delete run with no following
+        // Match/Insert to resume at) does not arise from `align()` over a
+        // linear seed -- its terminal-cell search gives a free trailing gap,
+        // so the optimal traceback simply ends at the last matched node rather
+        // than deleting onward. To exercise the end-of-ops drop path directly
+        // and deterministically, call `add_to_graph` with a hand-built op
+        // sequence that ends in a Delete run (a shape a real traceback can
+        // produce in a branching graph): Match(0), Match(1), Delete(2),
+        // Delete(3). The pending bypass run must be dropped, never recorded as
+        // an edge to a nonexistent resume node.
+        let mut g = PoaGraph::new(&b(SEED), cfg_global_unbanded()).unwrap();
+        let (_topo, rank_of) = topological_order(&g.nodes);
+        let ops = vec![
+            AlignOp::Match(0),
+            AlignOp::Match(1),
+            AlignOp::Delete(2),
+            AlignOp::Delete(3),
+        ];
+        let query = b("AC"); // matches nodes 0 ('A') and 1 ('C')
+        add_to_graph(
+            &mut g.nodes,
+            &mut g.edge_reads,
+            &mut g.edge_delete_reads,
+            &mut g.bypass_edges,
+            &mut g.fork_arm_index,
+            &rank_of,
+            &query,
+            &ops,
+            1,
+        );
+        assert!(
+            flatten(&g).is_empty(),
+            "a trailing terminal delete run must not create a bypass edge to nowhere"
+        );
+        // The existing per-node delete bookkeeping still runs for the
+        // terminal deletes -- only the (correctly absent) bypass edge differs.
+        assert_eq!(g.nodes[2].delete_count, 1);
+        assert_eq!(g.nodes[3].delete_count, 1);
+    }
+
+    #[test]
+    fn no_deletions_records_no_bypass_edges() {
+        // A pure-match read set never touches bypass_edges at all.
+        let mut g = PoaGraph::new(&b(SEED), cfg_global_unbanded()).unwrap();
+        g.add_read(&b(SEED)).unwrap();
+        g.add_read(&b(SEED)).unwrap();
+        assert!(
+            flatten(&g).is_empty(),
+            "reads with no Delete ops must leave bypass_edges empty"
+        );
     }
 }
 

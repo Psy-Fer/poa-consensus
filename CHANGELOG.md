@@ -9,6 +9,55 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **Bypass-edge bookkeeping for Delete ops (Phase 1 of
+  `design/bypass_edge_delete_rework.md`) -- purely additive, changes no
+  existing behavior.** `add_to_graph` now additionally records, in a new
+  private `PoaGraph.bypass_edges: HashMap<usize, Vec<(usize, i32)>>`
+  (from-node -> `[(to_node, weight)]`), a bypass edge for each run of
+  consecutive `Delete` ops: from the run's entry predecessor directly to the
+  node the read resumed matching/inserting at, skipping the deleted node(s).
+  This mirrors how abPOA and SPOA represent a deletion (a real topological
+  edge *around* the skipped node rather than a counter on it -- see
+  `design/architecture_comparison_abpoa_spoa.md` Finding 1), and is the
+  storage foundation the later phases build on.
+  - **Storage-shape choice**: a `HashMap` field on `PoaGraph`, not a `Vec` on
+    `Node`, and a plain `i32` weight, not an `EdgeWeight`. Rationale: it
+    mirrors the existing `edge_reads`/`edge_delete_reads` side-table idiom
+    (`add_to_graph` already threads those two maps as `&mut` params, so a
+    third is minimal and consistent), keeps `Node`/`push_node` untouched (so
+    Phase 1 is genuinely additive at the node level), and -- most importantly
+    -- the distinct `i32` type makes it impossible to accidentally feed a
+    bypass edge's weight into a `matched`-based check (e.g. `find_bubbles`'
+    arm qualification), which the design doc's worked example shows would
+    otherwise regress multi-allele detection in proportion to deletion noise.
+  - **Dual bookkeeping, not replacement**: the existing same-edge Delete
+    accounting (`delete_count`, `edge_delete_reads`, the
+    `increment_or_add_edge(.., true)` call) is left entirely intact alongside
+    the new bypass edge -- `delete_count` remains a genuine per-node signal
+    other consumers depend on (`mean_column_entropy`, `majority_frequency`),
+    while the bypass edge answers a different question (which topological path
+    the skipping reads took). See the design doc's Audit item 11.
+  - **Nothing reads `bypass_edges` yet** (`heaviest_path`, the interior
+    filter, `find_bubbles`/`find_structural_bubbles`, `compute_stats`,
+    `verify_reuse_chain` are all unchanged); wiring it into path selection and
+    retiring `credibility_penalty` is Phase 2. Edge cases handled and tested:
+    single-base delete, multi-base delete run, a delete run spanning a
+    pre-existing fork (records one correct edge, not fragmented), a leading
+    delete run (no entry predecessor -> no edge, the `Some(None)` path), and a
+    trailing terminal delete run (no resume node -> pending run dropped, no
+    malformed edge to nowhere). Six white-box tests in a new
+    `bypass_edge_tests` module in `src/graph.rs` assert `bypass_edges`'
+    contents directly (the field is private and not yet observable through
+    `consensus()`), mirroring the existing `fork_cache_tests` pattern.
+  - Confirmed a strict no-op on all existing behavior: the full suite passes
+    (201 lib tests -- the previous 195 plus these 6 new ones -- all
+    integration tests, all doctests), `bench/validate.py` is unchanged
+    (19/20; the one failure, `cag50_d20`, is the pre-existing unrelated
+    seed-sensitivity issue) and `bench/compare_callers.py` is unchanged
+    (16/16).
+
 ### Fixed
 
 - **`coverage_threshold()`'s absolute-floor fallback (used whenever
