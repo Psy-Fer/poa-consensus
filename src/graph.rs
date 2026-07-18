@@ -258,39 +258,47 @@ pub struct PoaGraph {
     /// (from_node, to_node) → sorted list of read indices that genuinely
     /// confirmed this edge's target (Match, or the founding Insert that
     /// created it). Does NOT include reads that merely deleted through the
-    /// target -- see `edge_delete_reads` for those. Two parallel maps rather
-    /// than one map with a tagged value, mirroring the existing `coverage`/
-    /// `delete_count` idiom at the node level (see
-    /// design/graph_data_model_rework.md Phase 2).
+    /// target. Mirrors the `coverage`/`delete_count` idiom at the node level
+    /// (see design/graph_data_model_rework.md Phase 2).
     edge_reads: HashMap<(usize, usize), Vec<u32>>,
-    /// (from_node, to_node) → sorted list of read indices that Deleted
-    /// through this edge's target (skipped it without consuming a base).
+    /// **Vestigial under pure bypass (revised Phase 1 of
+    /// design/bypass_edge_delete_rework.md).** Formerly `(from, to)` → read
+    /// indices that Deleted through an edge; it was always write-only (no
+    /// production consumer ever read it -- confirmed by exhaustive grep). Under
+    /// pure bypass a deleting read touches the skipped node only via
+    /// `delete_count`, never via an edge, so this map is no longer populated at
+    /// all; it stays initialised-empty. Left in place rather than removed to
+    /// keep this phase's delta minimal; removable in a later cleanup.
+    #[allow(dead_code)]
     edge_delete_reads: HashMap<(usize, usize), Vec<u32>>,
     /// Per-node bypass edges: from-node index → list of `(to_node, weight)`.
     /// A bypass edge records that a read skipped one or more nodes via a run
-    /// of consecutive `Delete` ops, reconnecting the run's entry predecessor
-    /// directly to the node it resumed matching/inserting at. This is a
-    /// *separate* structural edge around the skipped node(s) -- exactly how
-    /// abPOA and SPOA represent a deletion (see
-    /// `design/architecture_comparison_abpoa_spoa.md` Finding 1, and
-    /// `design/bypass_edge_delete_rework.md` for the full phased plan this is
-    /// Phase 1 of).
+    /// of consecutive `Delete` ops and then reconnected -- by a clean Match --
+    /// onto a node already in the graph (the run's entry predecessor bypasses
+    /// straight to that resume node). This is a *separate* structural edge
+    /// around the skipped node(s) -- exactly how abPOA and SPOA represent a
+    /// deletion (see `design/architecture_comparison_abpoa_spoa.md` Finding 1,
+    /// and `design/bypass_edge_delete_rework.md` for the full phased plan).
     ///
-    /// **Phase 1 status: written but never read.** No consumer
-    /// (`heaviest_path`, the interior filter, `find_bubbles`/
-    /// `find_structural_bubbles`, `compute_stats`, `verify_reuse_chain`)
-    /// looks at this field yet; wiring it into path selection is Phase 2.
-    /// Populating it here changes no existing behavior -- the existing
-    /// same-edge Delete bookkeeping (`delete_count`, `edge_delete_reads`, the
-    /// `increment_or_add_edge(.., true)` call) is left entirely intact
-    /// alongside it (dual bookkeeping, see the design doc's Audit item 11).
+    /// **Pure-bypass representation (revised Phase 1).** The skipped nodes are
+    /// touched only by `delete_count`; no laundered matched through-edge is
+    /// created (that is the delta from the superseded dual-bookkeeping Phase 1
+    /// commit). A resume that instead *diverges into new structure*
+    /// (mismatch/insert) is recorded as an ordinary minority `out_edge`, not a
+    /// bypass -- so bypass edges here are exactly "rejoined the existing main
+    /// path after a skip."
+    ///
+    /// **Phase 1 status: written but not yet read by any consumer.**
+    /// `heaviest_path` (the intended reader) does not consult it until Phase 2;
+    /// the interior filter, `find_bubbles`/`find_structural_bubbles`,
+    /// `compute_stats`, and `verify_reuse_chain` never will (they iterate
+    /// `Node.out_edges`, which a bypass edge is deliberately kept out of).
     ///
     /// Weight is a plain `i32`, deliberately *not* an [`EdgeWeight`]: a bypass
-    /// edge is definitionally delete-traffic, so keeping it a distinct type
-    /// makes it impossible to accidentally feed its weight into a `matched`-
-    /// based check (e.g. `find_bubbles`' arm-qualification), which the design
-    /// doc's worked false-bubble example shows would otherwise regress
-    /// multi-allele detection in proportion to ordinary deletion noise.
+    /// edge is definitionally delete-traffic, and keeping it in this separate
+    /// structure (never in `out_edges`) is what makes it invisible to every
+    /// `matched`-based out-edge consumer for free -- so it cannot manufacture a
+    /// false bubble, at any deletion rate.
     bypass_edges: HashMap<usize, Vec<(usize, i32)>>,
     /// number of times the long-unbanded warning was emitted
     warnings: usize,
@@ -2416,11 +2424,15 @@ fn record_bypass_edge(
     entry.push((to, 1));
 }
 
+// `edge_delete_reads` is intentionally NOT a parameter: under pure bypass a
+// deleting read touches the skipped node only via `delete_count`, never via an
+// edge, so there is nothing to record in that (write-only, unread) map. The
+// `PoaGraph.edge_delete_reads` field is left in place (initialised empty,
+// never populated) as a removable-later cleanup, out of scope here.
 #[allow(clippy::too_many_arguments)]
 fn add_to_graph(
     nodes: &mut Vec<Node>,
     edge_reads: &mut HashMap<(usize, usize), Vec<u32>>,
-    edge_delete_reads: &mut HashMap<(usize, usize), Vec<u32>>,
     bypass_edges: &mut HashMap<usize, Vec<(usize, i32)>>,
     fork_arm_index: &mut HashMap<usize, HashMap<Vec<u8>, usize>>,
     rank_of: &[usize],
@@ -2465,17 +2477,35 @@ fn add_to_graph(
     while i < ops.len() {
         // The node this iteration's op reconnects the read to (its first, in
         // read order -- not `prev`'s final value, which for a multi-base
-        // Insert is the run's *last* node). Set by the `Match`/`Insert` arms;
-        // left `None` by `Delete`. Used only to resolve a pending bypass run
-        // (see `bypass_pending`); has no effect on any existing bookkeeping.
+        // Insert is the run's *last* node). Set (to `Some`) by the
+        // `Match`/`Insert` arms to signal "a non-Delete op ran, close any
+        // pending bypass run"; left `None` by `Delete` so a run stays open
+        // across its whole span.
         let mut resume_node: Option<usize> = None;
+        // Whether this iteration's op was a clean Match onto a node ALREADY in
+        // the graph (base agrees) -- the only resume shape that records a
+        // bypass edge under pure bypass. A mismatch/insert (new or reused
+        // structure) instead keeps its ordinary real out-edge and records no
+        // bypass (see the resolution block after the match).
+        let mut resume_is_bypass = false;
         match ops[i] {
             AlignOp::Match(node_idx) => {
                 let q_base = query[q_idx];
                 q_idx += 1;
                 let cur = if nodes[node_idx].base == q_base {
                     nodes[node_idx].coverage += 1;
-                    if let Some(p) = prev {
+                    if bypass_pending.is_some() {
+                        // Pure bypass (revised Phase 1): this clean Match is
+                        // resuming a Delete run onto a node already in the
+                        // graph. Record NO matched out-edge (from the entry
+                        // predecessor or anywhere) and NO `edge_reads` entry --
+                        // that edge is exactly the "laundering" this rework
+                        // removes (it let the skipped node's downstream matched
+                        // weight re-inflate its arm). `coverage` is still bumped
+                        // (above); the reconnection is represented solely by the
+                        // bypass edge recorded at the resolution block below.
+                        resume_is_bypass = true;
+                    } else if let Some(p) = prev {
                         if increment_or_add_edge(nodes, p, node_idx, false) {
                             newly_forked.push(p);
                         }
@@ -2561,17 +2591,13 @@ fn add_to_graph(
                     )
                 });
                 if let Some(reused_idx) = reused {
-                    // Reuse returns the arm's *last* node, but the read
-                    // reconnects at the arm's *first* node -- re-look up the
-                    // same content-address key `try_reuse_arm` used (keyed on
-                    // the current `prev`, which is the run's last deleted node
-                    // when this Insert follows a Delete run) to recover it.
-                    // For a bypass edge the target must be where the read
-                    // genuinely rejoins, so its own onward matched edges carry
-                    // its weight from there; pointing at the arm's last node
-                    // would skip the arm's interior the read actually traversed.
-                    resume_node = prev
-                        .and_then(|p| fork_arm_index.get(&p).and_then(|m| m.get(&edit)).copied());
+                    // An Insert creates/rejoins DIVERGENT structure, not the
+                    // existing main path, so under pure bypass it keeps its
+                    // ordinary real edges (created inside `try_reuse_arm`) and
+                    // records NO bypass edge -- `resume_is_bypass` stays false.
+                    // `resume_node` just needs to be `Some` to signal that a
+                    // non-Delete op ran and any pending bypass run should close.
+                    resume_node = Some(reused_idx);
                     prev = Some(reused_idx);
                 } else {
                     let fork = prev;
@@ -2601,7 +2627,9 @@ fn add_to_graph(
                             .or_default()
                             .insert(edit.clone(), start);
                     }
-                    // The first newly-created node is where the read resumes.
+                    // New structure, not the existing main path: keep the real
+                    // edges just created, record no bypass (`resume_is_bypass`
+                    // stays false); `resume_node` only signals run closure.
                     resume_node = chain_start;
                 }
                 q_idx += edit.len();
@@ -2610,41 +2638,68 @@ fn add_to_graph(
             }
             AlignOp::Delete(node_idx) => {
                 // Open a bypass run on the first Delete: capture `prev` (the
-                // entry predecessor) *before* the existing bookkeeping below
-                // advances it to the deleted node. `Some(None)` marks a run
-                // that begins with no predecessor (read starts on a Delete
-                // under semi-global), which resolves to no bypass edge.
+                // entry predecessor). `Some(None)` marks a run that begins with
+                // no predecessor (read starts on a Delete under semi-global),
+                // which resolves to no bypass edge.
                 if bypass_pending.is_none() {
                     bypass_pending = Some(prev);
                 }
+                // Pure bypass (revised Phase 1): increment the skipped node's
+                // own `delete_count` (this is all `mean_column_entropy` and
+                // `majority_frequency` need -- they read per-node
+                // coverage/delete_count only) and do NOTHING else. In
+                // particular do NOT:
+                //   - create/increment a `p -> node_idx` edge
+                //     (`increment_or_add_edge(.., true)`), nor push
+                //     `edge_delete_reads` (that map is write-only -- no
+                //     production consumer reads it -- so under pure bypass it
+                //     simply stops being populated; the field is left in place,
+                //     removable in a later cleanup);
+                //   - advance `prev` through the skipped node.
+                // Leaving `prev` at the entry predecessor is what makes the
+                // read's next real op reconnect via a bypass edge (existing
+                // resume) or a fresh minority out-edge (new resume) instead of
+                // laundering the skipped node's downstream matched edge.
                 nodes[node_idx].delete_count += 1;
-                if let Some(p) = prev {
-                    if increment_or_add_edge(nodes, p, node_idx, true) {
-                        newly_forked.push(p);
-                    }
-                    edge_delete_reads
-                        .entry((p, node_idx))
-                        .or_default()
-                        .push(read_idx);
-                }
-                prev = Some(node_idx);
                 i += 1;
             }
         }
 
-        // Resolve a pending bypass run at the first non-Delete op (the one
-        // that set `resume_node`). A `Delete` leaves `resume_node` `None`, so
-        // the run stays open across the whole run and is only closed here by
-        // the Match/Insert that ends it. Recording is skipped (but the run
-        // still closes) when the run had no entry predecessor -- a leading
-        // Delete run has nothing to bypass *from*.
-        if let Some(entry_pred) = bypass_pending {
-            if let Some(to) = resume_node {
-                if let Some(from) = entry_pred {
+        // Resolve a pending bypass run at the first non-Delete op. A `Delete`
+        // leaves `resume_node` `None`, so the run stays open across its whole
+        // span and is only closed here by the Match/Insert that ends it. A
+        // bypass edge is recorded only when that resume was a clean Match onto
+        // an EXISTING node (`resume_is_bypass`) AND the run had an entry
+        // predecessor to bypass *from* (a leading Delete run has none). A
+        // mismatch/insert resume closes the run but records no bypass -- its
+        // real out-edge already represents the reconnection.
+        if bypass_pending.is_some() && resume_node.is_some() {
+            if resume_is_bypass {
+                if let (Some(Some(from)), Some(to)) = (bypass_pending, resume_node) {
+                    debug_assert!(
+                        rank_of[from] < rank_of[to],
+                        "bypass edge {from}->{to} (rank {}->{}) must respect topological \
+                         order -- it is redundant with the real entry-pred->...->resume \
+                         path through the skipped nodes",
+                        rank_of[from],
+                        rank_of[to]
+                    );
+                    // Anti-laundering guard: a bypass resume must NOT have
+                    // created a matched edge into the resume node for this
+                    // read. If it had, this read would appear as the last
+                    // pushed reader on that edge -- the exact laundering the
+                    // pure-bypass Delete arm removes.
+                    debug_assert!(
+                        edge_reads
+                            .get(&(from, to))
+                            .is_none_or(|v| v.last() != Some(&read_idx)),
+                        "laundering guard: deleting read {read_idx} created a matched \
+                         edge {from}->{to} into its bypass resume node"
+                    );
                     record_bypass_edge(bypass_edges, from, to);
                 }
-                bypass_pending = None;
             }
+            bypass_pending = None;
         }
     }
 
@@ -3827,7 +3882,6 @@ impl PoaGraph {
         add_to_graph(
             &mut self.nodes,
             &mut self.edge_reads,
-            &mut self.edge_delete_reads,
             &mut self.bypass_edges,
             &mut self.fork_arm_index,
             &rank_of,
@@ -4799,6 +4853,36 @@ mod bypass_edge_tests {
         out
     }
 
+    /// The `EdgeWeight` on the `from -> to` out-edge, or `None` if no such edge.
+    fn out_edge(g: &PoaGraph, from: usize, to: usize) -> Option<EdgeWeight> {
+        g.nodes[from]
+            .out_edges
+            .iter()
+            .find(|&&(t, _)| t == to)
+            .map(|&(_, ew)| ew)
+    }
+
+    /// Asserts the pure-bypass invariant across the whole graph: no `out_edge`
+    /// anywhere carries any `deleted`-bucket weight (under pure bypass a
+    /// deleting read never traverses an edge into a skipped node), and
+    /// `edge_delete_reads` was never populated.
+    fn assert_no_delete_bucket_or_delete_reads(g: &PoaGraph) {
+        for (idx, nd) in g.nodes.iter().enumerate() {
+            for &(to, ew) in &nd.out_edges {
+                assert_eq!(
+                    ew.deleted, 0,
+                    "pure bypass: out-edge {idx}->{to} must carry no deleted-bucket weight, \
+                     got {}",
+                    ew.deleted
+                );
+            }
+        }
+        assert!(
+            g.edge_delete_reads.is_empty(),
+            "pure bypass: edge_delete_reads must never be populated"
+        );
+    }
+
     #[test]
     fn single_base_deletion_records_one_bypass_edge() {
         // Delete seed position 6 ('A', between 'C'@5 and 'T'@7, both distinct
@@ -4808,22 +4892,32 @@ mod bypass_edge_tests {
         g.add_read(&read).unwrap();
 
         // Expected op sequence: Match(0..=5), Delete(6), Match(7..=15).
-        // Entry predecessor of the run = node 5; resume node = node 7.
+        // Entry predecessor of the run = node 5; clean-match resume onto the
+        // existing node 7 -> one bypass edge 5->7, weight 1.
         assert_eq!(
             flatten(&g),
             vec![(5, 7, 1)],
             "one single-base deletion should record exactly one bypass edge 5->7 weight 1"
         );
-        // Strict no-op cross-check: the existing same-edge delete bookkeeping
-        // is still intact alongside the new bypass edge.
+        // (a) delete_count on the skipped node is still incremented -- this is
+        // all mean_column_entropy/majority_frequency need.
         assert_eq!(
             g.nodes[6].delete_count, 1,
-            "delete_count on the skipped node must still be incremented (dual bookkeeping)"
+            "delete_count on the skipped node must still be incremented"
         );
-        assert!(
-            g.edge_delete_reads.contains_key(&(5, 6)),
-            "edge_delete_reads must still record the skip on the same edge as before"
+        // Pure-bypass representation: the laundered through-edge is ABSENT.
+        // Under the superseded dual-bookkeeping the deleting read advanced
+        // through node 6 and its resume Match(7) inflated edge 6->7's matched
+        // weight to 2 (seed + this read); under pure bypass 6->7 stays at the
+        // seed's matched=1, and node 5's seed edge 5->6 gains no deleted-bucket
+        // weight either.
+        assert_eq!(
+            out_edge(&g, 6, 7).map(|ew| ew.matched),
+            Some(1),
+            "edge 6->7 must NOT have gained matched weight from the deleting read \
+             (that would be the laundering this rework removes)"
         );
+        assert_no_delete_bucket_or_delete_reads(&g);
     }
 
     #[test]
@@ -4843,6 +4937,9 @@ mod bypass_edge_tests {
         );
         assert_eq!(g.nodes[6].delete_count, 1);
         assert_eq!(g.nodes[7].delete_count, 1);
+        // Pure-bypass: resume edge 7->8 not inflated by the deleting read.
+        assert_eq!(out_edge(&g, 7, 8).map(|ew| ew.matched), Some(1));
+        assert_no_delete_bucket_or_delete_reads(&g);
     }
 
     #[test]
@@ -4882,6 +4979,12 @@ mod bypass_edge_tests {
         assert_eq!(g.nodes[6].delete_count, 2);
         assert_eq!(g.nodes[7].delete_count, 2);
         assert_eq!(g.nodes[8].delete_count, 2);
+        // Pure-bypass: resume edge 8->9 is matched=2 (the seed plus the
+        // insertion read, both genuine matchers that traverse 8->9), NOT 4 --
+        // the two DELETING reads did not launder their weight onto it. Under
+        // the superseded dual-bookkeeping it would have been 4.
+        assert_eq!(out_edge(&g, 8, 9).map(|ew| ew.matched), Some(2));
+        assert_no_delete_bucket_or_delete_reads(&g);
     }
 
     #[test]
@@ -4932,7 +5035,6 @@ mod bypass_edge_tests {
         add_to_graph(
             &mut g.nodes,
             &mut g.edge_reads,
-            &mut g.edge_delete_reads,
             &mut g.bypass_edges,
             &mut g.fork_arm_index,
             &rank_of,
@@ -4944,10 +5046,13 @@ mod bypass_edge_tests {
             flatten(&g).is_empty(),
             "a trailing terminal delete run must not create a bypass edge to nowhere"
         );
-        // The existing per-node delete bookkeeping still runs for the
-        // terminal deletes -- only the (correctly absent) bypass edge differs.
+        // The per-node delete bookkeeping still runs for the terminal deletes
+        // -- only the (correctly absent) bypass edge differs.
         assert_eq!(g.nodes[2].delete_count, 1);
         assert_eq!(g.nodes[3].delete_count, 1);
+        // Pure-bypass: the terminal Delete run created no edges into/out of the
+        // skipped nodes.
+        assert_no_delete_bucket_or_delete_reads(&g);
     }
 
     #[test]

@@ -1827,10 +1827,18 @@ fn bubble_site_arm_read_counts_excludes_delete_only_reads() {
 // point) rather than byte-identical exact duplicates. Fuzzy near-duplicates
 // are explicitly out of scope for Phase 3 (would need canonicalization, a
 // follow-on problem per the design doc) and are NOT expected to merge here.
-// The consensus itself stays at 77bp (one extra repeat unit over the 70bp
-// truth) both before and after -- Phase 3 does not fix this scenario's
-// overall accuracy, only reduces (not eliminates) the underlying
-// fragmentation, exactly as scoped.
+//
+// **Pure-bypass (bypass_edge_delete_rework revised Phase 1) further reduced
+// the structural counts to 162 nodes / 65 singletons / 12 duplicate forks.**
+// This is a *representation* change, not an output change: the deleting reads
+// no longer create delete-bucket edges into skipped nodes, and post-delete
+// divergences hang off the entry predecessor rather than the last deleted
+// node, so a couple of fragmentation artifacts disappear -- in the same
+// simplifying direction as the whole rework. The consensus OUTPUT is
+// unchanged at 77bp (one extra repeat unit over the 70bp truth) across all of
+// Phase 1+2, Phase 3, AND pure bypass -- asserted explicitly below as the
+// actual correctness invariant, so the structural counts are documented drift,
+// not a magic-number gate on behavior.
 #[test]
 fn period7_content_addressing_reduces_duplicate_forks() {
     let template = repeat_unit(b"GCTAGCT", 10); // 70 bp
@@ -1874,18 +1882,32 @@ fn period7_content_addressing_reduces_duplicate_forks() {
     }
     let singletons = topo.nodes.iter().filter(|n| n.coverage == 1).count();
 
+    // Output-correctness invariant (unchanged across Phase 1+2, Phase 3, and
+    // pure bypass): the consensus is 77bp, one extra repeat unit over the 70bp
+    // truth. This is the property that must NOT move; the structural counts
+    // below are documented representation drift.
+    let cons_len = g.consensus().unwrap().sequence.len();
+    assert_eq!(
+        cons_len, 77,
+        "consensus output length must stay 77bp (the scenario's invariant); \
+         a change here is an output-correctness regression, not representation drift"
+    );
+
+    // Structural fragmentation metrics -- representation, not output. Updated
+    // to the pure-bypass baseline (was 163/67/12 at Phase 3; see the module
+    // comment above for why each dropped).
     assert_eq!(
         topo.nodes.len(),
-        163,
-        "node count drifted from the measured Phase 3 baseline (166 before, 163 after)"
+        162,
+        "node count drifted from the pure-bypass baseline (163 at Phase 3, 162 under pure bypass)"
     );
     assert_eq!(
-        singletons, 67,
-        "singleton(cov=1) node count drifted from the measured Phase 3 baseline (71 before, 67 after)"
+        singletons, 65,
+        "singleton(cov=1) node count drifted from the pure-bypass baseline (67 at Phase 3, 65 under pure bypass)"
     );
     assert_eq!(
         dup_fork_positions, 12,
-        "duplicate-fork-position count drifted from the measured Phase 3 baseline (14 before, 12 after)"
+        "duplicate-fork-position count drifted from the pure-bypass baseline (12 at Phase 3, 12 under pure bypass)"
     );
 }
 

@@ -11,52 +11,75 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- **Bypass-edge bookkeeping for Delete ops (Phase 1 of
-  `design/bypass_edge_delete_rework.md`) -- purely additive, changes no
-  existing behavior.** `add_to_graph` now additionally records, in a new
-  private `PoaGraph.bypass_edges: HashMap<usize, Vec<(usize, i32)>>`
-  (from-node -> `[(to_node, weight)]`), a bypass edge for each run of
-  consecutive `Delete` ops: from the run's entry predecessor directly to the
-  node the read resumed matching/inserting at, skipping the deleted node(s).
-  This mirrors how abPOA and SPOA represent a deletion (a real topological
-  edge *around* the skipped node rather than a counter on it -- see
-  `design/architecture_comparison_abpoa_spoa.md` Finding 1), and is the
-  storage foundation the later phases build on.
-  - **Storage-shape choice**: a `HashMap` field on `PoaGraph`, not a `Vec` on
-    `Node`, and a plain `i32` weight, not an `EdgeWeight`. Rationale: it
-    mirrors the existing `edge_reads`/`edge_delete_reads` side-table idiom
-    (`add_to_graph` already threads those two maps as `&mut` params, so a
-    third is minimal and consistent), keeps `Node`/`push_node` untouched (so
-    Phase 1 is genuinely additive at the node level), and -- most importantly
-    -- the distinct `i32` type makes it impossible to accidentally feed a
-    bypass edge's weight into a `matched`-based check (e.g. `find_bubbles`'
-    arm qualification), which the design doc's worked example shows would
-    otherwise regress multi-allele detection in proportion to deletion noise.
-  - **Dual bookkeeping, not replacement**: the existing same-edge Delete
-    accounting (`delete_count`, `edge_delete_reads`, the
-    `increment_or_add_edge(.., true)` call) is left entirely intact alongside
-    the new bypass edge -- `delete_count` remains a genuine per-node signal
-    other consumers depend on (`mean_column_entropy`, `majority_frequency`),
-    while the bypass edge answers a different question (which topological path
-    the skipping reads took). See the design doc's Audit item 11.
-  - **Nothing reads `bypass_edges` yet** (`heaviest_path`, the interior
-    filter, `find_bubbles`/`find_structural_bubbles`, `compute_stats`,
-    `verify_reuse_chain` are all unchanged); wiring it into path selection and
-    retiring `credibility_penalty` is Phase 2. Edge cases handled and tested:
-    single-base delete, multi-base delete run, a delete run spanning a
-    pre-existing fork (records one correct edge, not fragmented), a leading
-    delete run (no entry predecessor -> no edge, the `Some(None)` path), and a
-    trailing terminal delete run (no resume node -> pending run dropped, no
-    malformed edge to nowhere). Six white-box tests in a new
-    `bypass_edge_tests` module in `src/graph.rs` assert `bypass_edges`'
-    contents directly (the field is private and not yet observable through
-    `consensus()`), mirroring the existing `fork_cache_tests` pattern.
-  - Confirmed a strict no-op on all existing behavior: the full suite passes
-    (201 lib tests -- the previous 195 plus these 6 new ones -- all
-    integration tests, all doctests), `bench/validate.py` is unchanged
-    (19/20; the one failure, `cag50_d20`, is the pre-existing unrelated
-    seed-sensitivity issue) and `bench/compare_callers.py` is unchanged
-    (16/16).
+- **Pure-bypass representation for Delete ops (Phase 1 of
+  `design/bypass_edge_delete_rework.md`).** A run of consecutive `Delete` ops
+  is now represented the way abPOA and SPOA represent a deletion: the deleting
+  read touches the skipped node(s) only by incrementing their `delete_count`,
+  and reconnects via a separate *bypass edge* around them, rather than
+  traversing through them. `add_to_graph` records bypass edges in a private
+  `PoaGraph.bypass_edges: HashMap<usize, Vec<(usize, i32)>>` (from-node ->
+  `[(to_node, weight)]`); this is the storage foundation the later phases (wire
+  `heaviest_path`, retire `credibility_penalty`, simplify the interior filter)
+  build on. See `design/architecture_comparison_abpoa_spoa.md` Finding 1 for
+  why this is the root-cause fix for the interior-filter saga (Known Bugs
+  #6-#10).
+  - **Supersedes the earlier dual-bookkeeping Phase 1 commit.** That first
+    attempt kept the old same-edge Delete accounting *and* added bypass edges
+    alongside it. A Phase 2 attempt then proved that could not work: advancing
+    `prev` through the deleted node meant the resume `Match` still inflated the
+    skipped node's downstream `matched` edge ("laundering"), so the bypass edge
+    was double-counted and dominated -- removing `credibility_penalty` on top of
+    it broke `heaviest_path_prefers_matched_over_delete_inflated_arm`. The
+    design's own Audit item 1 (credibility-penalty redundancy) had assumed pure
+    bypass all along, contradicting Audit item 11 (dual bookkeeping). This
+    revision resolves the contradiction: item 11's `delete_count` increment
+    (genuinely needed by `mean_column_entropy`/`majority_frequency`, which read
+    per-node counters only) is kept; item 11's route-through-the-node part (the
+    laundering) is dropped.
+  - **Delta vs the dual-bookkeeping commit**, in `add_to_graph`'s `Delete` arm:
+    removed the `increment_or_add_edge(.., true)` call, the `edge_delete_reads`
+    push, and the `prev = Some(node_idx)` advance -- `prev` now stays at the
+    entry predecessor across the whole run. `delete_count += 1` is kept.
+  - **Resume handling** distinguishes rejoining existing structure from
+    creating new structure: a clean `Match` resuming onto a node already in the
+    graph records **only** a bypass edge (plus `coverage`), creating no matched
+    out-edge (that edge was the laundering); a mismatch/insert resume creates
+    its ordinary real minority out-edge and records no bypass (a new node needs
+    a real in-edge, and it is a genuine weight-1 divergence below the allele
+    threshold, not a false bubble).
+  - **`bypass_edges` is a plain-`i32`-weighted `HashMap`, never an entry in
+    `Node.out_edges`.** This is what makes bypass edges invisible for free to
+    every out-edge consumer (`find_bubbles`/`find_structural_bubbles`,
+    `compute_stats`, `verify_reuse_chain`, `propagate_fork_if_new`) -- so no
+    false bubble can be manufactured from deletion noise, at any deletion rate.
+  - `EdgeWeight.deleted` is now vestigial (its only writer was the removed
+    `increment_or_add_edge(.., true)` call) and stays 0; `edge_delete_reads` is
+    no longer populated (it was always write-only -- no production consumer) and
+    is left in place, `#[allow(dead_code)]`, removable in a later cleanup. Both
+    are noted for a future mechanical cleanup, out of scope here.
+  - **Nothing consumes `bypass_edges` yet** -- `heaviest_path` still scores
+    `matched`-only with `credibility_penalty` and does not consult bypass edges;
+    wiring it and retiring `credibility_penalty` is Phase 2. Two debug-asserts
+    guard the representation: an anti-laundering check (a bypass resume created
+    no matched edge into its resume node) and the bypass topological-order
+    invariant (`rank_of[from] < rank_of[to]`).
+  - **Validation.** Full suite passes (201 lib tests + all integration +
+    doctests). `heaviest_path_prefers_matched_over_delete_inflated_arm` passes
+    with its assertion **unchanged** -- confirming the design's prediction that
+    removing the laundered edge alone lets the (still `credibility_penalty`-
+    equipped) `heaviest_path` pick the genuinely Match-confirmed arm correctly,
+    even before Phase 2's wiring. The six `bypass_edge_tests` white-box tests
+    were updated from the superseded dual-bookkeeping assertions to pure-bypass
+    ones (bypass edge recorded; `delete_count` still incremented; laundered
+    edge absent; `EdgeWeight.deleted == 0`; `edge_delete_reads` empty). One
+    other test moved and was confirmed a *representation* (not output) change:
+    `period7_content_addressing_reduces_duplicate_forks`'s graph-structure
+    counts dropped (163->162 nodes, 67->65 singletons; a further, same-direction
+    fragmentation reduction) while its consensus **output is unchanged at 77bp**
+    -- that output invariant is now asserted explicitly so the structural counts
+    read as documented drift, not a behavior gate. `bench/validate.py` unchanged
+    (19/20; `cag50_d20` the pre-existing unrelated failure);
+    `bench/compare_callers.py` unchanged (16/16).
 
 ### Fixed
 
