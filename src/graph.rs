@@ -3347,11 +3347,49 @@ fn length_separated(lens_a: &[usize], lens_b: &[usize]) -> bool {
 /// picked as the most-balanced-looking of many), so the depth floor alone is
 /// trusted; two or more reintroduces exactly the risk length separation is
 /// meant to catch.
+///
+/// # Why a clean distinguishing bubble is *also* required (Phase 3 of
+/// `design/bypass_edge_delete_rework.md`)
+///
+/// Length separation alone became insufficient once Delete ops were
+/// represented as bypass edges (pure bypass). A single allele's deletion-heavy
+/// reads no longer register at the structural bubbles they skipped (their
+/// bypass edges are invisible to `edge_reads`, which the per-read arm signature
+/// is built from), and a deletion elsewhere frame-shifts a read onto the
+/// *wrong* (shorter) arm at a downstream bubble. `phasing_groups` then splits
+/// that one allele into sub-groups that happen to be narrowly length-separated
+/// from each other -- confirmed on `multi_skew_cag20_40`, where the true CAG×40
+/// allele over-split into ~39- and ~32-unit sub-groups whose 16bp median gap
+/// just cleared the 12bp length-separation bar. Length separation cannot tell a
+/// genuinely bimodal two-allele length distribution from a unimodal one that
+/// `phasing_groups` bisected, because it only ever compares the two
+/// already-tight halves.
+///
+/// The added requirement is orthogonal to length: a candidate is a genuinely
+/// distinct allele only if it also has a **clean distinguishing bubble** versus
+/// every already-confirmed group -- a structural bubble where a clear majority
+/// (>= `CLEAR_MAJORITY`) of each group, over enough reads (>= `MIN_ARM_COV`),
+/// takes a *different* arm. Measured (see the design doc's Phase 3 spike):
+/// every genuine two-allele case -- `multi_gaa30_100`, `multi_cag15_25`,
+/// `multi_cag20_50`, `structural_phasing_no_contamination_on_noisy_periodic_repeat`,
+/// `structural_phasing_small_gap_bridge_candidate_stress` -- has such a bubble
+/// at majority fractions 0.80-1.00, while `multi_skew_cag20_40`'s two CAG×40
+/// sub-groups take the *same* majority arm at every bubble (no distinguishing
+/// bubble at all), so they fail and merge back to one allele. A candidate that
+/// clears length separation but fails this check is the same allele split by
+/// deletion noise; it merges wholesale into the length-nearest confirmed group
+/// it is structurally indistinguishable from. This check, like length
+/// separation, is gated on 2+ structural bubbles (with 0-1 there is nothing to
+/// distinguish on beyond length, and the SNP-bubble fallback is a separate
+/// path). The `else` per-read length-routing branch (the `multi_gaa30_100`
+/// contamination fix, for candidates that fail *length* separation) is
+/// untouched.
 fn validate_and_merge_groups(
     groups: Vec<Vec<usize>>,
     reads: &[Vec<u8>],
     min_reads: usize,
-    n_bubbles: usize,
+    bubbles: &[(usize, Vec<usize>)],
+    edge_reads: &HashMap<(usize, usize), Vec<u32>>,
 ) -> Vec<Vec<usize>> {
     if groups.len() < 2 {
         return groups;
@@ -3359,7 +3397,63 @@ fn validate_and_merge_groups(
     let mut groups = groups;
     groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.len()));
 
+    let n_bubbles = bubbles.len();
     let require_length_separation = n_bubbles >= 2;
+
+    // Clear-majority threshold and minimum arm coverage for the "clean
+    // distinguishing bubble" check (validated in the Phase 3 spike; the
+    // outcome is robust across 0.60-0.70, 0.60 is what was measured).
+    const CLEAR_MAJORITY: f64 = 0.60;
+    const MIN_ARM_COV: usize = 2;
+
+    // Per-bubble `read -> arm index` map -- the same arm signal `phasing_groups`
+    // clustered on, rebuilt here from `edge_reads` (cheap: O(reads x bubbles),
+    // and only when 2+ bubbles gate the check below).
+    let arm_of: Vec<HashMap<usize, usize>> = bubbles
+        .iter()
+        .map(|(entry, arm_starts)| {
+            let mut m: HashMap<usize, usize> = HashMap::new();
+            for (k, &a) in arm_starts.iter().enumerate() {
+                if let Some(rs) = edge_reads.get(&(*entry, a)) {
+                    for &r in rs {
+                        m.entry(r as usize).or_insert(k);
+                    }
+                }
+            }
+            m
+        })
+        .collect();
+
+    // (majority arm, majority fraction, coverage) for a group at bubble `b`.
+    let group_bubble_stats = |grp: &[usize], b: usize| -> (Option<usize>, f64, usize) {
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for &r in grp {
+            if let Some(&k) = arm_of[b].get(&r) {
+                *counts.entry(k).or_default() += 1;
+            }
+        }
+        let cov: usize = counts.values().sum();
+        match counts.into_iter().max_by_key(|&(_, c)| c) {
+            Some((arm, c)) => (Some(arm), c as f64 / cov as f64, cov),
+            None => (None, 0.0, 0),
+        }
+    };
+
+    // True iff some structural bubble has both groups' clear majorities on
+    // *different* arms (with enough coverage on each side).
+    let clean_distinguishing = |ga: &[usize], gb: &[usize]| -> bool {
+        (0..n_bubbles).any(|b| {
+            let (ma, fa, ca) = group_bubble_stats(ga, b);
+            let (mb, fb, cb) = group_bubble_stats(gb, b);
+            ma.is_some()
+                && mb.is_some()
+                && ma != mb
+                && fa >= CLEAR_MAJORITY
+                && fb >= CLEAR_MAJORITY
+                && ca >= MIN_ARM_COV
+                && cb >= MIN_ARM_COV
+        })
+    };
 
     // The largest group is always trusted as the baseline/reference -- same
     // philosophy as every other bubble-selection heuristic in this file
@@ -3378,8 +3472,30 @@ fn validate_and_merge_groups(
                 .all(|existing| length_separated(&cand_lens, existing));
 
         if significant && separated_from_all {
-            confirmed.push(cand);
-            confirmed_lens.push(cand_lens);
+            // Length-separated -- but a genuinely distinct allele must ALSO
+            // have a clean distinguishing bubble vs every confirmed group
+            // (gated on 2+ bubbles, same as length separation). A candidate
+            // that clears length but fails this is one allele's
+            // deletion-noise-split sub-group; merge it wholesale into the
+            // length-nearest confirmed group it can't be distinguished from.
+            let structurally_distinct = !require_length_separation
+                || confirmed.iter().all(|c| clean_distinguishing(&cand, c));
+            if structurally_distinct {
+                confirmed.push(cand);
+                confirmed_lens.push(cand_lens);
+            } else {
+                let cand_med = median_usize(&cand_lens);
+                let target = (0..confirmed.len())
+                    .filter(|&c| !clean_distinguishing(&cand, &confirmed[c]))
+                    .min_by(|&a, &b| {
+                        let da = (median_usize(&confirmed_lens[a]) - cand_med).abs();
+                        let db = (median_usize(&confirmed_lens[b]) - cand_med).abs();
+                        da.partial_cmp(&db).unwrap()
+                    })
+                    .expect("structurally_distinct false => at least one indistinguishable group");
+                confirmed_lens[target].extend(cand_lens);
+                confirmed[target].extend(cand);
+            }
         } else if confirmed.len() == 1 {
             // Only one confirmed group exists so far -- nothing to route
             // individual members toward yet, merge wholesale (this is also
@@ -4458,12 +4574,18 @@ impl PoaGraph {
                 self.config.min_reads,
                 &self.reads,
             );
-            // Validate against read-length bimodality + vote weight before
-            // trusting phasing_groups' split -- see validate_and_merge_groups'
-            // doc comment for why this is scoped to the structural-bubble
-            // path specifically, not the same-length SNP-bubble fallback
-            // below.
-            validate_and_merge_groups(g, &self.reads, self.config.min_reads, structural.len())
+            // Validate against read-length bimodality + vote weight + a clean
+            // distinguishing bubble before trusting phasing_groups' split --
+            // see validate_and_merge_groups' doc comment for why this is scoped
+            // to the structural-bubble path specifically, not the same-length
+            // SNP-bubble fallback below.
+            validate_and_merge_groups(
+                g,
+                &self.reads,
+                self.config.min_reads,
+                &structural,
+                &self.edge_reads,
+            )
         } else {
             // Unbanded alignment and still no structural bubble. Try SNP bubble
             // partitioning for substitution haplotypes (same-length alleles).
@@ -5098,6 +5220,125 @@ mod bypass_edge_tests {
         assert!(
             flatten(&g).is_empty(),
             "reads with no Delete ops must leave bypass_edges empty"
+        );
+    }
+}
+
+// ─── White-box tests: validate_and_merge_groups structure-corroborated split ─
+//
+// Phase 3 of design/bypass_edge_delete_rework.md added a "clean distinguishing
+// bubble" requirement to `validate_and_merge_groups` (a private fn), so a
+// single allele whose deletion-heavy reads `phasing_groups` split into
+// narrowly length-separated sub-groups is merged back, while genuine alleles
+// with a real arm-choice difference stay split. These tests exercise the
+// decision function directly with hand-built `groups`/`bubbles`/`edge_reads`
+// -- deterministic, and guarding BOTH directions of the discriminator (the
+// full pbsim-driven integration case is the `multi_skew_cag20_40` bench
+// scenario, which black-box reproduction of the exact over-split is too
+// error-model-dependent to capture reliably in a unit test).
+#[cfg(test)]
+mod validate_and_merge_tests {
+    use super::*;
+
+    fn read_of_len(n: usize) -> Vec<u8> {
+        vec![b'A'; n]
+    }
+
+    /// Two length-separated sub-groups that take the SAME majority arm at every
+    /// bubble (structurally indistinguishable -- the multi_skew_cag20_40 shape:
+    /// one allele split by deletion noise) must merge back into one allele.
+    /// Without the fix, the length-separated sub-group is confirmed as its own
+    /// allele and this returns 3 groups.
+    #[test]
+    fn merges_structurally_indistinct_length_split() {
+        // reads 0..10 = short allele (~100bp); 10..15 = long sub-group A
+        // (~316bp); 15..19 = long sub-group B (~300bp, narrowly length-
+        // separated from A -- a 16bp median gap, like the real over-split).
+        let mut reads = Vec::new();
+        for _ in 0..10 {
+            reads.push(read_of_len(100));
+        }
+        for k in 0..5 {
+            reads.push(read_of_len(314 + k)); // 314..=318, median 316
+        }
+        for k in 0..4 {
+            reads.push(read_of_len(298 + k)); // 298..=301, median 300
+        }
+        let g0: Vec<usize> = (0..10).collect();
+        let sub_a: Vec<usize> = (10..15).collect();
+        let sub_b: Vec<usize> = (15..19).collect();
+
+        // Two structural bubbles (require_length_separation gate). Synthetic
+        // node ids; arm 0 = "short" arm, arm 1 = "long" arm.
+        let bubbles = vec![
+            (0usize, vec![1usize, 2usize]),
+            (3usize, vec![4usize, 5usize]),
+        ];
+        let mut edge_reads: HashMap<(usize, usize), Vec<u32>> = HashMap::new();
+        edge_reads.insert((0, 1), g0.iter().map(|&r| r as u32).collect());
+        edge_reads.insert((3, 4), g0.iter().map(|&r| r as u32).collect());
+        // Both long sub-groups take arm 1 at both bubbles -> no distinguishing
+        // bubble between them.
+        let long: Vec<u32> = sub_a.iter().chain(&sub_b).map(|&r| r as u32).collect();
+        edge_reads.insert((0, 2), long.clone());
+        edge_reads.insert((3, 5), long);
+
+        let out = validate_and_merge_groups(
+            vec![g0.clone(), sub_a.clone(), sub_b.clone()],
+            &reads,
+            3,
+            &bubbles,
+            &edge_reads,
+        );
+        assert_eq!(
+            out.len(),
+            2,
+            "structurally-indistinct length-split sub-groups must merge to 2 alleles, got {}",
+            out.len()
+        );
+        // Every long-allele read (both sub-groups) ends up together.
+        let long_group = out
+            .iter()
+            .find(|g| g.contains(&10))
+            .expect("a group containing the long allele");
+        for r in sub_a.iter().chain(&sub_b) {
+            assert!(
+                long_group.contains(r),
+                "long-allele read {r} must be in the single merged long group"
+            );
+        }
+    }
+
+    /// Companion (the over-merge guard): two genuine alleles that DO have a
+    /// clean distinguishing bubble (different majority arms) must stay split --
+    /// the fix narrows splitting, so it must not collapse real alleles.
+    #[test]
+    fn keeps_structurally_distinct_length_split() {
+        let mut reads = Vec::new();
+        for _ in 0..10 {
+            reads.push(read_of_len(100)); // allele X, arm 0
+        }
+        for _ in 0..8 {
+            reads.push(read_of_len(200)); // allele Y, arm 1
+        }
+        let gx: Vec<usize> = (0..10).collect();
+        let gy: Vec<usize> = (10..18).collect();
+        let bubbles = vec![
+            (0usize, vec![1usize, 2usize]),
+            (3usize, vec![4usize, 5usize]),
+        ];
+        let mut edge_reads: HashMap<(usize, usize), Vec<u32>> = HashMap::new();
+        edge_reads.insert((0, 1), gx.iter().map(|&r| r as u32).collect());
+        edge_reads.insert((3, 4), gx.iter().map(|&r| r as u32).collect());
+        edge_reads.insert((0, 2), gy.iter().map(|&r| r as u32).collect());
+        edge_reads.insert((3, 5), gy.iter().map(|&r| r as u32).collect());
+
+        let out = validate_and_merge_groups(vec![gx, gy], &reads, 3, &bubbles, &edge_reads);
+        assert_eq!(
+            out.len(),
+            2,
+            "two genuine alleles with a clean distinguishing bubble must stay split, got {}",
+            out.len()
         );
     }
 }

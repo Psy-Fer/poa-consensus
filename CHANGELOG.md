@@ -9,6 +9,67 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **Multi-allele over-split under pure bypass: `consensus_multi` no longer
+  splits a single length-variant allele into two "alleles" when its
+  deletion-heavy reads scatter across structural bubbles (Phase 3 of
+  `design/bypass_edge_delete_rework.md`).** Pure bypass (Phase 1) made a
+  deleting read's skipped structural bubbles invisible to `edge_reads` (the
+  per-read arm signature source), and frame-shifted some reads onto the wrong
+  (shorter) arm downstream, so `phasing_groups` split one allele into
+  narrowly length-separated sub-groups that the existing length-separation
+  check accepted -- confirmed on `bench/validate.py`'s `multi_skew_cag20_40`,
+  where the true CAG×40 allele over-split into ~39- and ~32-unit sub-groups
+  (3 alleles called instead of 2). This was an accepted Phase-1 regression that
+  Phase 3 fixes.
+  - **The fix:** `validate_and_merge_groups` now requires a candidate group to
+    have a **clean distinguishing bubble** vs every already-confirmed group --
+    a structural bubble where a clear majority (>= 0.60) of each, over >= 2
+    reads, takes a *different* arm -- *in addition to* clearing length
+    separation, before it is confirmed as a distinct allele. A candidate that
+    clears length but fails this (same allele split by deletion noise) merges
+    wholesale into the length-nearest confirmed group it is structurally
+    indistinguishable from. This is orthogonal to length: a measurement spike
+    (see the design doc) confirmed every genuine two-allele guard --
+    `multi_gaa30_100`, `multi_cag15_25`, `multi_cag20_50`,
+    `structural_phasing_no_contamination_on_noisy_periodic_repeat`,
+    `structural_phasing_small_gap_bridge_candidate_stress` -- has such a bubble
+    at majority fractions 0.80-1.00, while `multi_skew`'s two CAG×40 sub-groups
+    take the *same* majority arm at every bubble (no distinguishing bubble), so
+    they merge back to one allele.
+  - **Scoped narrowly:** gated on 2+ structural bubbles (the same gate the
+    length-separation check already uses); the SNP-bubble fallback
+    (`partition_reads_by_bubble`), the single-bubble same-length path
+    (`locked_arm_deep_bubble_alleles_lost`), and the per-read length-routing
+    branch that fixes the `multi_gaa30_100` contamination case (for candidates
+    that fail *length* separation) are all untouched.
+  - **Regression tests** (both directions of the discriminator, deterministic
+    white-box against `validate_and_merge_groups`):
+    `merges_structurally_indistinct_length_split` (a length-separated
+    same-majority-arm split must merge -- verified to return 3 groups without
+    the fix) and `keeps_structurally_distinct_length_split` (genuine
+    different-arm alleles must stay split -- the over-merge guard). The
+    `multi_skew_cag20_40` bench scenario is the integration-level guard.
+  - **Validation:** `bench/validate.py` back to **19/20** (`multi_skew_cag20_40`
+    now 2 alleles; only the unrelated pre-existing `cag50_d20` seed-sensitivity
+    case remains). `bench/compare_callers.py` 16/16. Full suite green with every
+    contamination/genuine-allele guard passing with **unchanged assertions**.
+    Ground-truth read tracing on `multi_gaa30_100` (true origin from read
+    headers) confirms the fix leaves its read assignment **byte-identical** to
+    the pre-fix committed baseline; the labeled synthetic contamination guards
+    (`structural_phasing_*`) show **0% misassignment**.
+  - **Public API unchanged:** only `consensus_multi`'s allele count/grouping
+    output changes (the intended correction). `BubbleSite`'s field semantics,
+    `collect_bubble_sites`, `find_bubbles`, and every public signature are
+    untouched.
+  - **Phase 3's originally-planned items dissolved under pure bypass and are
+    not part of this phase:** the `compute_stats` `total()`->`matched` switch
+    and the `verify_reuse_chain` tolerance were both premised on bypass edges
+    appearing in `Node.out_edges`; under the separate-`bypass_edges`-HashMap
+    representation they never do, so neither fix is needed (see the design doc's
+    re-audit). This phase is solely the multi-allele bypass-awareness fix.
+
 ### Changed
 
 - **`heaviest_path` now routes around widely-skipped nodes via bypass edges,
