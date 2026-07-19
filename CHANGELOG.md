@@ -59,6 +59,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     headers) confirms the fix leaves its read assignment **byte-identical** to
     the pre-fix committed baseline; the labeled synthetic contamination guards
     (`structural_phasing_*`) show **0% misassignment**.
+  - **Known characteristic of the bypass rework (documented, not a Phase 3
+    regression, no principled fix):** on `multi_gaa30_100`, read-level
+    misassignment went from **0% pre-rework to 5.8% (3/52)** under pure bypass
+    (introduced by the Phase 1 representation change; Phase 3 leaves it
+    byte-identical). Independently confirmed across commits `5a2b6b5`
+    (pre-rework, 0%), `c464568` (Phase 2, 5.8%), and current. The 3 reads are
+    genuinely *partial* GAA×100 reads (247/206/193 bp, 24-29 GAA units --
+    shorter than the GAA×30 median of 290 bp, from partial semi-global
+    coverage, **not** deletions). A GAA×100 read truncated to 24-29 units is
+    byte-for-byte indistinguishable from a truncated GAA×100 or a full-ish
+    GAA×30 (same motif, same flank; it does not span far enough to reach the
+    length-divergence point), so its allele is genuinely ambiguous and no graph
+    representation can place it on principled grounds -- pre-rework's 0% was
+    fortuitous (the old structure happened to leave these reads unassigned or
+    on the long arm). The consensus **output is unaffected** (`multi_gaa30_100`
+    passes throughout, 30->29 within tolerance). A future
+    confidence-gated read-exclusion capability (flag a read as too partial to
+    confidently assign, and omit it from every allele's `read_indices` rather
+    than guessing) would address this class honestly, and aligns with the
+    diagnostics/confidence layer's purpose -- noted as future work, out of
+    scope here.
   - **Public API unchanged:** only `consensus_multi`'s allele count/grouping
     output changes (the intended correction). `BubbleSite`'s field semantics,
     `collect_bubble_sites`, `find_bubbles`, and every public signature are
@@ -69,6 +90,42 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     appearing in `Node.out_edges`; under the separate-`bypass_edges`-HashMap
     representation they never do, so neither fix is needed (see the design doc's
     re-audit). This phase is solely the multi-allele bypass-awareness fix.
+
+### Notes
+
+- **Phase 4 of `design/bypass_edge_delete_rework.md` (interior-filter
+  simplification) was attempted and NOT applied -- interior-filter Axis 1 is
+  still load-bearing under the pure-bypass representation; no code change.**
+  Phase 4 aimed to remove the interior filter's Axis 1 (the "no fork in reach"
+  branch: keep a node iff `coverage > delete_count`), on the hypothesis that
+  Phase 2's bypass-aware `heaviest_path` already routes around every
+  delete-dominant node Axis 1 used to trim, leaving Axis 1 dead code. The
+  revised design flagged this as an empirical question, not a proven no-op
+  (bypass edges live in a separate map, so `nearest_fork` never fires on them
+  and Axis 1 still structurally applies to delete-adjacent nodes).
+  - **Empirical result: Axis 1 is still doing real work.** Replacing it with
+    unconditional inclusion fabricated an extra base on
+    `diag_dab1_sca37_attttc_lookahead_arm_length_bias` (real DAB1 SCA37 HiFi
+    data): a homopolymer `A` node most reads skip (coverage 3, delete_count 23)
+    stayed on the consensus, producing `...CCACAAAAAT...` (5 A's) instead of the
+    correct `...CCACAAAAT...` (4 A's). `heaviest_path`'s bypass routing does
+    **not** exclude it, because in a homopolymer run the deleted position is
+    ambiguous: different reads delete different equivalent `A` nodes, so the
+    bypass weight scatters across them and no single bypass edge outweighs the
+    through-path. The delete-dominant node therefore reaches the interior filter
+    on the spine with no genuine base-divergence fork in reach (`nearest_fork`
+    is `None`), and Axis 1's `coverage > delete_count` is the only thing that
+    trims it. Removal was reverted (`git checkout -- src/graph.rs`); the DAB1
+    assertion was left unchanged (a changed correct output is a stop-and-report
+    finding, not something to edit around).
+  - **Outcome:** the bypass rework delivered its correctness wins (Phases 1-3:
+    pure-bypass representation, bypass-aware heaviest-path with
+    `credibility_penalty` retired, and the multi-allele over-split fix) but
+    **not** the interior-filter simplification -- Axis 1 remains necessary for
+    the homopolymer-length class it was built for, which pure bypass does not
+    subsume. This is the honest, and arguably more valuable, finding than a
+    forced removal would have been. With Phase 4 concluded, the rework is
+    functionally complete.
 
 ### Changed
 
