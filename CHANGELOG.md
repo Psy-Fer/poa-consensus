@@ -9,6 +9,56 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- **`heaviest_path` now routes around widely-skipped nodes via bypass edges,
+  and `credibility_penalty` is retired (Phase 2 of
+  `design/bypass_edge_delete_rework.md`).** Each node's `bypass_edges` entries
+  (recorded in Phase 1) are now relaxed in `heaviest_path`'s forward DP as
+  additional competing outgoing options alongside `out_edges`: an ordinary
+  out-edge scores `(ew.matched - 1)` as before, while a bypass edge scores
+  `(weight - 1)` on the plain `i32` weight taken directly from the
+  `bypass_edges` map (a bypass weight does not live in an `EdgeWeight`, so it is
+  never routed through `.matched`). Bypass edges are relaxed *after* out-edges,
+  so an exact tie keeps the through-edge (prefer keeping a node over skipping it
+  when evidence is balanced).
+  - **`credibility_penalty` removed.** It existed only to counteract the
+    reconvergence "laundering" (a delete-dominant node's downstream matched edge
+    re-inflating its arm) that the pre-pure-bypass representation created. Under
+    pure bypass (Phase 1) the deleting reads never touch the skipped node's
+    downstream edge, so that laundering cannot occur and the penalty is
+    redundant (design Audit item 1). The forced regression test
+    `heaviest_path_prefers_matched_over_delete_inflated_arm` is what would catch
+    an unsafe removal (6 reads deleting a reference `G`, 4 genuinely matching a
+    SNP `C` at the same position); it passes with its assertion unchanged. The
+    mechanism now carrying it is the de-laundered graph itself: the skipped
+    `G`'s through-path scores 0 (its downstream edge kept only the seed's
+    `matched=1`, not the old laundered 7), so the SNP `C`'s genuine 4-match arm
+    wins on its own merits (the bypass edge, present at weight 6, also beats
+    through-`G` but is not the deciding factor here since `C` beats it too).
+  - **Topological safety (re-confirmed):** a bypass edge `(from, to)` always
+    satisfies `rank_of[from] < rank_of[to]` (it is redundant with the real
+    `from -> ...skipped... -> to` path still present in the graph, so it can
+    introduce no cycle); `heaviest_path` is forward-relaxation in topological
+    order, so relaxing `from`'s bypass edges into `cum[rank_of[to]]` when `from`
+    is processed correctly makes the bypass an incoming option for `to`. A
+    `debug_assert` enforces the rank order.
+  - **Coexistence with the interior filter is deliberate** (Phase 4 will use it
+    as A/B evidence): the interior filter still runs, so where `heaviest_path`
+    now skips a delete-dominant node directly (instead of being forced through
+    it and trimmed afterward, as in Phase 1), the final output is unchanged --
+    the filter simply has less to do. `find_bubbles`/`find_structural_bubbles`/
+    `compute_stats` are untouched (Phase 3/4 territory).
+  - **Validation.** Full suite passes (201 lib + all integration + doctests)
+    with every output-correctness assertion unchanged. `bench/validate.py`
+    stays 18/20 (the two known failures only -- `cag50_d20` pre-existing and
+    `multi_skew_cag20_40` the accepted Phase-1 multi-allele over-split that
+    Phase 3 will address; no new failures), and several single-allele scenarios
+    *improved* versus Phase 1 alone (`cag20_d20_r10` 20->20, `cag100_d20`
+    100->100, `cag200_d20` 200->200), confirming the bypass wiring routes
+    correctly where Phase 1 had left ±1 drift. `bench/compare_callers.py` stays
+    16/16.
+
 ### Added
 
 - **Pure-bypass representation for Delete ops (Phase 1 of

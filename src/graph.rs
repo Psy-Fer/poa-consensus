@@ -2743,23 +2743,37 @@ fn add_to_graph(
 /// evidence for node inclusion there, so it would be inconsistent for this
 /// function's arm-*selection* to treat it as partial evidence instead.
 ///
-/// Matched-only scoring alone is *necessary but not sufficient*: it correctly
-/// favours the better-evidenced arm at the fork itself, but that local
-/// advantage can be exactly cancelled at the arms' reconvergence point. A
-/// node reached mostly by Delete still genuinely gets Matched by those same
-/// reads on its *next* edge (they skip this node, but truly do match
-/// whatever follows) -- so that next edge's own matched weight is real, and
-/// once summed downstream it can "launder" the weak node's arm back to
-/// parity with a genuinely-stronger competing arm (worked example, and why
-/// it isn't a coincidence of specific numbers, in
-/// design/graph_data_model_rework.md's Phase 1 implementation notes / the
-/// CHANGELOG entry for this fix). `credibility_penalty` closes that gap:
-/// subtract, once per node on the path, however much a node's own
-/// `delete_count` exceeds its `coverage` -- zero for the vast majority of
-/// (legitimately Match-dominant) nodes, so ordinary spine construction is
-/// unaffected; only nodes that are themselves net-Delete-dominant are
-/// penalised, stopping their downstream edge from re-inflating their case.
-fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usize, u8, i32)> {
+/// **Bypass edges (Phase 2 of `design/bypass_edge_delete_rework.md`) are the
+/// mechanism that lets the DP route around a widely-skipped node.** A run of
+/// reads that Deleted past a node reconnected via a `bypass_edges` entry
+/// `from -> to` (recorded in Phase 1); here each such entry is relaxed as an
+/// additional competing outgoing option of `from`, scored `(weight - 1)` on
+/// the plain `i32` bypass weight directly -- NOT via `EdgeWeight.matched`, a
+/// bypass weight does not live in an `EdgeWeight` at all. So a node most reads
+/// skip is out-competed by the bypass around it, exactly as abPOA/SPOA's plain
+/// heaviest-bundling does, and there is no laundering to counteract: under pure
+/// bypass (Phase 1) the deleting reads never touch the skipped node's
+/// downstream matched edge, so that edge cannot re-inflate the weak node's arm
+/// at a reconvergence point. This is why the old `credibility_penalty` (which
+/// discounted net-Delete-dominant nodes to counter exactly that laundering) is
+/// **retired** here -- Audit item 1's redundancy proof holds once the laundered
+/// edge is gone. (`heaviest_path_prefers_matched_over_delete_inflated_arm` is
+/// the ground truth: it now lands on the SNP arm via the bypass edge + no
+/// penalty, rather than via the penalty on a de-laundered graph.)
+///
+/// A bypass edge `(from, to)` always satisfies `rank_of[from] < rank_of[to]`
+/// (it is redundant with the real `from -> ...skipped... -> to` path that
+/// still exists in the graph, so it can introduce no cycle) -- asserted below.
+/// The DP is forward-relaxation in topological order, so relaxing `from`'s
+/// bypass edges into `cum[rank_of[to]]` when `from` is processed correctly
+/// makes the bypass an incoming option for `to` (its `cum` is not finalized
+/// until every strictly-earlier rank, `from` included, has been processed).
+fn heaviest_path(
+    nodes: &[Node],
+    topo: &[usize],
+    rank_of: &[usize],
+    bypass_edges: &HashMap<usize, Vec<(usize, i32)>>,
+) -> Vec<(usize, u8, i32)> {
     let n = topo.len();
     let mut cum: Vec<(i64, Option<usize>, i32)> = vec![(0, None, 0); n];
 
@@ -2767,12 +2781,32 @@ fn heaviest_path(nodes: &[Node], topo: &[usize], rank_of: &[usize]) -> Vec<(usiz
         let node_idx = topo[t];
         let node = &nodes[node_idx];
         let curr = cum[t].0;
-        let credibility_penalty = (node.delete_count as i64 - node.coverage as i64).max(0);
         for &(succ_idx, ew) in &node.out_edges {
             let succ_t = rank_of[succ_idx];
-            let candidate = curr + (ew.matched - 1) as i64 - credibility_penalty;
+            let candidate = curr + (ew.matched - 1) as i64;
             if candidate > cum[succ_t].0 {
                 cum[succ_t] = (candidate, Some(t), ew.matched);
+            }
+        }
+        // Bypass edges are relaxed AFTER out-edges, so an exact tie between a
+        // bypass and a through-edge to the same target keeps the through-edge
+        // (strict `>` below) -- i.e. prefer keeping a node over skipping it
+        // when the evidence is exactly balanced, leaving such a node on the
+        // spine for the interior filter to judge (pre-Phase-4 behaviour).
+        if let Some(bypasses) = bypass_edges.get(&node_idx) {
+            for &(succ_idx, weight) in bypasses {
+                let succ_t = rank_of[succ_idx];
+                debug_assert!(
+                    t < succ_t,
+                    "bypass edge {node_idx}->{succ_idx} (rank {t}->{succ_t}) must respect \
+                     topological order; it is redundant with the real \
+                     from->...->to path through the skipped nodes, so a violation means \
+                     the graph is not a DAG"
+                );
+                let candidate = curr + (weight - 1) as i64;
+                if candidate > cum[succ_t].0 {
+                    cum[succ_t] = (candidate, Some(t), weight);
+                }
             }
         }
     }
@@ -3825,7 +3859,7 @@ impl PoaGraph {
         // built from an outdated spine can produce wrong anchor chains.
         let reads_since_update = self.n_reads.saturating_sub(self.spine_updated_at);
         if self.cached_spine.is_empty() || reads_since_update >= self.spine_interval {
-            let new_spine = heaviest_path(&self.nodes, &topo, &rank_of);
+            let new_spine = heaviest_path(&self.nodes, &topo, &rank_of, &self.bypass_edges);
             let diff = spine_diff(&self.cached_spine, &new_spine);
             self.cached_spine = new_spine;
             self.spine_updated_at = self.n_reads;
@@ -3926,7 +3960,7 @@ impl PoaGraph {
 
         let filtered: Vec<(usize, u8, i32)> = match self.config.consensus_mode {
             ConsensusMode::HeaviestPath => {
-                let path = heaviest_path(&self.nodes, &topo, &rank_of);
+                let path = heaviest_path(&self.nodes, &topo, &rank_of, &self.bypass_edges);
 
                 // Boundary trim: find the first/last node whose Match
                 // coverage clears an absolute population floor. This has
@@ -4208,7 +4242,7 @@ impl PoaGraph {
         read: &[u8],
     ) -> Result<(Vec<AlignOp>, usize, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
-        let spine = heaviest_path(&self.nodes, &topo, &rank_of);
+        let spine = heaviest_path(&self.nodes, &topo, &rank_of, &self.bypass_edges);
         let (ops, _retried) = align_with_retry(
             &self.nodes,
             &topo,
@@ -4228,7 +4262,7 @@ impl PoaGraph {
         read: &[u8],
     ) -> Result<(Vec<AlignOp>, Vec<usize>), PoaError> {
         let (topo, rank_of) = topological_order(&self.nodes);
-        let spine = heaviest_path(&self.nodes, &topo, &rank_of);
+        let spine = heaviest_path(&self.nodes, &topo, &rank_of, &self.bypass_edges);
         let (ops, _retried) = align_with_retry(
             &self.nodes,
             &topo,
@@ -4267,7 +4301,7 @@ impl PoaGraph {
         use crate::types::{GraphEdgeInfo, GraphNodeInfo, GraphTopology};
 
         let (topo, rank_of) = topological_order(&self.nodes);
-        let spine = heaviest_path(&self.nodes, &topo, &rank_of);
+        let spine = heaviest_path(&self.nodes, &topo, &rank_of, &self.bypass_edges);
 
         let nodes: Vec<GraphNodeInfo> = topo
             .iter()
@@ -5125,7 +5159,7 @@ mod band_too_narrow_tests {
         let (seed, query) = fixture();
         let g = PoaGraph::new(&seed, PoaConfig::default()).unwrap();
         let (topo, rank_of) = topological_order(&g.nodes);
-        let spine = heaviest_path(&g.nodes, &topo, &rank_of);
+        let spine = heaviest_path(&g.nodes, &topo, &rank_of, &g.bypass_edges);
         let mut scratch = AlignScratch::new();
 
         for &band_width in &[10usize, 50, 100] {
@@ -5188,7 +5222,7 @@ mod band_too_narrow_tests {
         let (seed, query) = fixture();
         let g = PoaGraph::new(&seed, PoaConfig::default()).unwrap();
         let (topo, rank_of) = topological_order(&g.nodes);
-        let spine = heaviest_path(&g.nodes, &topo, &rank_of);
+        let spine = heaviest_path(&g.nodes, &topo, &rank_of, &g.bypass_edges);
         let mut scratch = AlignScratch::new();
 
         for &band_width in &[10usize, 50, 100] {
