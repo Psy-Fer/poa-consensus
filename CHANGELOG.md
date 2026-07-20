@@ -126,6 +126,16 @@ contamination, partial-read coverage).
   build and score alternate-seed and majority-frequency candidates. Partial
   mitigation, not a complete fix (the tracked `cag50_d20` case still misses).
 
+- **Spurious debug-assertion panic in bypass-edge topological validation.** A
+  read that resumed a deletion run onto a node it had itself created earlier in
+  the same read (e.g. via an Insert before the deletes) tripped a `debug_assert!`
+  that indexed the pre-read topological-rank snapshot with the fresh node's
+  out-of-range index, panicking debug (and CI) builds. The bypass edge itself was
+  always correct (forward by construction); the assert now skips the rank check
+  for such within-read endpoints (matching `try_reuse_arm`'s existing guard).
+  Debug-only fix — release builds (where `debug_assert!` is compiled out) were
+  unaffected and output is byte-identical.
+
 ### Notes
 
 - The band-retry unbanded-rebuild **memory cliff** on multi-kb non-repetitive

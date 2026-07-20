@@ -2676,13 +2676,25 @@ fn add_to_graph(
         if bypass_pending.is_some() && resume_node.is_some() {
             if resume_is_bypass {
                 if let (Some(Some(from)), Some(to)) = (bypass_pending, resume_node) {
+                    // `rank_of` is the pre-read topological snapshot. A bypass
+                    // run whose entry predecessor `from` is a node this SAME
+                    // read created earlier (e.g. an Insert that ran before the
+                    // Delete run) has `from >= rank_of.len()` and cannot be
+                    // rank-checked against the snapshot. Such a bypass is
+                    // forward by construction -- ops are applied in alignment
+                    // order, so an Insert-created `from` precedes the
+                    // later-matched existing `to` -- so only assert the
+                    // topological order when both endpoints are in the
+                    // snapshot. Mirrors `try_reuse_arm`'s own `>= rank_of.len()`
+                    // guard. Debug-only: the recorded bypass edge is identical
+                    // either way (this was a spurious `debug_assert` panic in
+                    // debug/CI builds; release builds, where `debug_assert` is
+                    // compiled out, always recorded the correct edge).
                     debug_assert!(
-                        rank_of[from] < rank_of[to],
-                        "bypass edge {from}->{to} (rank {}->{}) must respect topological \
-                         order -- it is redundant with the real entry-pred->...->resume \
-                         path through the skipped nodes",
-                        rank_of[from],
-                        rank_of[to]
+                        from >= rank_of.len() || to >= rank_of.len() || rank_of[from] < rank_of[to],
+                        "bypass edge {from}->{to} between in-snapshot nodes must respect \
+                         topological order -- it is redundant with the real \
+                         entry-pred->...->resume path through the skipped nodes"
                     );
                     // Anti-laundering guard: a bypass resume must NOT have
                     // created a matched edge into the resume node for this
