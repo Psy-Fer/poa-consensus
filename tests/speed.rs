@@ -4,10 +4,10 @@
 /// Each workload is a function that builds a PoaGraph from N reads and calls
 /// consensus(). Wall time and peak heap allocation are measured across REPS
 /// repetitions. No external deps.
-use poa_consensus::PoaConfig;
+use poa_consensus::{PoaConfig, PoaGraph};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ─── Tracking allocator ───────────────────────────────────────────────────────
 
@@ -367,5 +367,229 @@ fn speed_comparison() {
         "AAGGG×30 +250bp flank (50r × 650bp, 5% err)",
         workload_aaggg_flanked_250,
     );
+    println!();
+}
+
+// ═══ Performance matrix: isolate cost drivers (length × depth × band) ══════════
+//
+// The workloads above are fixed scenarios. This second harness varies ONE axis
+// at a time so the scaling in each dimension is visible, reports median + spread
+// (not a single noisy sample), and attributes cost to a phase (DP alignment vs
+// graph construction vs consensus extraction = heaviest_path + coverage trim +
+// interior filter). Run with:
+//   cargo test --release --test speed perf_matrix -- --nocapture
+
+/// depth reads of `len` bp, 5% substitution error, deterministic.
+fn gen_reads(len: usize, depth: usize, seed: u64) -> Vec<Vec<u8>> {
+    let base = make_seq(len, seed);
+    (0..depth)
+        .map(|i| mutate(&base, 0.05, seed.wrapping_add(1_000 + i as u64)))
+        .collect()
+}
+
+fn cfg_adaptive() -> PoaConfig {
+    PoaConfig {
+        min_reads: 3,
+        band_width: 50,
+        adaptive_band: true,
+        ..Default::default()
+    }
+}
+
+fn cfg_unbanded() -> PoaConfig {
+    PoaConfig {
+        min_reads: 3,
+        band_width: 0,
+        adaptive_band: false,
+        warn_on_long_unbanded: false,
+        ..Default::default()
+    }
+}
+
+fn cfg_fixed(w: usize) -> PoaConfig {
+    PoaConfig {
+        min_reads: 3,
+        band_width: w,
+        adaptive_band: false,
+        ..Default::default()
+    }
+}
+
+/// Run `f` `reps` times (after one warmup), returning (median, min, max) wall
+/// time and the peak heap increase (MB) observed across the timed reps.
+fn bench<F: Fn()>(reps: usize, f: F) -> (Duration, Duration, Duration, f64) {
+    f(); // warmup + allocator baseline
+    reset_peak();
+    let mut times = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        f();
+        times.push(t0.elapsed());
+    }
+    let peak_mb = peak_alloc() as f64 / (1024.0 * 1024.0);
+    times.sort();
+    (
+        times[times.len() / 2],
+        times[0],
+        times[times.len() - 1],
+        peak_mb,
+    )
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// One end-to-end consensus() measurement row (median ms, spread ms, peak MB).
+fn row_consensus(label: &str, reads: &[Vec<u8>], cfg: &PoaConfig, reps: usize) {
+    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+    let (med, lo, hi, peak) = bench(reps, || {
+        let _ = poa_consensus::consensus(&refs, 0, cfg).unwrap();
+    });
+    println!(
+        "  {label:<40} {:>9.3} ms  [{:>7.3}–{:<7.3}]  {peak:>7.1} MB",
+        ms(med),
+        ms(lo),
+        ms(hi),
+    );
+}
+
+/// Phase attribution: total consensus() vs build (new+add_read) vs extract
+/// (consensus() on a prebuilt graph) vs pure DP alignment (align_read_ops of
+/// every read against the full graph). Build ≈ DP + graph mutation; extract =
+/// heaviest_path + coverage trim + interior filter.
+fn phase_breakdown(label: &str, reads: &[Vec<u8>], cfg: &PoaConfig, reps: usize) {
+    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+
+    let (total, _, _, total_pk) = bench(reps, || {
+        let _ = poa_consensus::consensus(&refs, 0, cfg).unwrap();
+    });
+    let (build, _, _, build_pk) = bench(reps, || {
+        let mut g = PoaGraph::new(&reads[0], cfg.clone()).unwrap();
+        for r in &reads[1..] {
+            g.add_read(r).unwrap();
+        }
+        std::hint::black_box(&g);
+    });
+
+    // Build once (untimed) for extract + pure-align measurements.
+    let mut g = PoaGraph::new(&reads[0], cfg.clone()).unwrap();
+    for r in &reads[1..] {
+        g.add_read(r).unwrap();
+    }
+    let (extract, _, _, extract_pk) = bench(reps, || {
+        let _ = g.consensus().unwrap();
+    });
+    let (align, _, _, _) = bench(reps, || {
+        for r in &refs {
+            let _ = g.align_read_ops(r);
+        }
+    });
+
+    println!("  {label}");
+    println!(
+        "     total consensus()          {:>9.3} ms   peak {:>7.1} MB",
+        ms(total),
+        total_pk
+    );
+    println!(
+        "     build (new + add_read)     {:>9.3} ms   peak {:>7.1} MB   ({:.0}% of total)",
+        ms(build),
+        build_pk,
+        100.0 * ms(build) / ms(total).max(1e-9)
+    );
+    println!(
+        "       └ DP align (full graph)  {:>9.3} ms                    ({:.0}% of build)",
+        ms(align),
+        100.0 * ms(align) / ms(build).max(1e-9)
+    );
+    println!(
+        "     extract (HB + trim + filt) {:>9.3} ms   peak {:>7.1} MB   ({:.0}% of total)",
+        ms(extract),
+        extract_pk,
+        100.0 * ms(extract) / ms(total).max(1e-9)
+    );
+}
+
+#[test]
+fn perf_matrix() {
+    println!("\n=== POA performance matrix (release; median over reps, [min–max]) ===");
+
+    // ── Read-length scaling (depth 20, adaptive band) ─────────────────────────
+    println!("\n  READ-LENGTH scaling  (depth 20, adaptive band; 5% error)");
+    println!("  {}", "-".repeat(80));
+    for &(len, reps) in &[(150usize, 15usize), (600, 9), (2000, 5), (5000, 3)] {
+        let reads = gen_reads(len, 20, 0x100 + len as u64);
+        row_consensus(
+            &format!("len {len:>5}bp × 20 reads"),
+            &reads,
+            &cfg_adaptive(),
+            reps,
+        );
+    }
+
+    // ── Depth scaling (600bp, adaptive band) ──────────────────────────────────
+    println!("\n  DEPTH scaling  (600bp reads, adaptive band; 5% error)");
+    println!("  {}", "-".repeat(80));
+    for &(depth, reps) in &[(10usize, 11usize), (20, 9), (50, 5)] {
+        let reads = gen_reads(600, depth, 0x200 + depth as u64);
+        row_consensus(
+            &format!("600bp × {depth:>3} reads"),
+            &reads,
+            &cfg_adaptive(),
+            reps,
+        );
+    }
+
+    // ── Band-config comparison (600bp, depth 20) ──────────────────────────────
+    println!("\n  BAND-CONFIG  (600bp × 20 reads; 5% error)");
+    println!("  {}", "-".repeat(80));
+    let r600 = gen_reads(600, 20, 0x300);
+    row_consensus("adaptive (w=10+0.01L, floor 50)", &r600, &cfg_adaptive(), 9);
+    row_consensus("fixed band w=200", &r600, &cfg_fixed(200), 9);
+    row_consensus("unbanded (band_width=0)", &r600, &cfg_unbanded(), 9);
+
+    // ── Band-config at larger size (2kb, depth 15) — where banding pays off ────
+    println!("\n  BAND-CONFIG at 2kb  (2000bp × 15 reads; 5% error)");
+    println!("  {}", "-".repeat(80));
+    let r2k = gen_reads(2000, 15, 0x400);
+    row_consensus("adaptive (w≈30)", &r2k, &cfg_adaptive(), 5);
+    row_consensus("fixed band w=200", &r2k, &cfg_fixed(200), 5);
+    row_consensus("unbanded (band_width=0)", &r2k, &cfg_unbanded(), 3);
+
+    // ── Phase attribution ─────────────────────────────────────────────────────
+    println!("\n  PHASE ATTRIBUTION  (adaptive band; where does time/memory go?)");
+    println!("  {}", "-".repeat(80));
+    phase_breakdown(
+        "600bp × 20 reads",
+        &gen_reads(600, 20, 0x500),
+        &cfg_adaptive(),
+        9,
+    );
+    phase_breakdown(
+        "2000bp × 15 reads",
+        &gen_reads(2000, 15, 0x600),
+        &cfg_adaptive(),
+        5,
+    );
+    phase_breakdown(
+        "150bp × 50 reads (sub-kb STR regime)",
+        &gen_reads(150, 50, 0x700),
+        &cfg_adaptive(),
+        11,
+    );
+
+    // Overall process peak RSS (monotonic high-water mark; heap peaks above are
+    // per-workload and resettable, this is the whole-process ceiling).
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmHWM") {
+                println!(
+                    "\n  process peak RSS (VmHWM): {}",
+                    line.trim_start_matches("VmHWM:").trim()
+                );
+            }
+        }
+    }
     println!();
 }

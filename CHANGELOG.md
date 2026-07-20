@@ -9,7 +9,46 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+_Investigation note (no code change):_ investigated the band-retry perf cliff
+(`build_graph`'s whole-graph unbanded rebuild, which fires when a read trips the
+adaptive band on long reads: ~2.7 GB / 10.6 s at 10 kb, ~390 s on a 5 kb 42-read
+pool). A measurement spike confirmed the rebuild is **correctness-necessary**
+(not redundant — dropping it regresses `cag200` and non-repetitive
+`rand2k`/`rand5k_deep`) and **not safely gate-able** (no cheap decision-point
+signal separates rebuild-needed from rebuild-redundant cases). Documented as a
+known multi-kb cost affecting non-repetitive throughput vs abPOA; the sub-kb STR
+target regime is unaffected. A real fix is deferred to a drift-free
+WFA2/POASTA-style aligner that would make the rebuild unnecessary. See
+CLAUDE.md (Scale Considerations) and TODO.md for the full data.
+
 ### Fixed
+
+- **`Consensus::read_indices` from the free functions now indexes the caller's
+  input `reads` slice, not the graph's internal seed-first ordering.** The field
+  was always documented as "indices into the original `reads` slice," but for
+  the free functions (`consensus_multi`, `consensus_adaptive`) with a non-zero
+  `seed_idx` it actually returned graph-internal indices: `build_graph` puts
+  `reads[seed_idx]` at internal index 0 and the remaining reads follow in input
+  order, so internal index `k` did not equal input index `k`. The free
+  functions now translate each returned `read_indices` entry back through that
+  permutation (`perm = [seed_idx] ++ (input indices excluding seed_idx)`), so
+  the values match the documented contract and are directly usable for
+  per-read/haplotype mapping against the caller's own slice (the intended use
+  case, e.g. bladerunner passing a medoid seed index).
+  - **Behavioral change / release note:** this changes the *values* a public
+    field carries for free-function callers that used `seed_idx != 0`. Any
+    caller that was compensating for the old internal indexing (e.g. inverting
+    the permutation themselves) must drop that workaround. Callers using
+    `seed_idx == 0` are unaffected (the permutation is the identity there).
+    The **stateful API** (`PoaGraph::consensus_multi` on a graph built via
+    `new()` + `add_read()`) is unchanged and still returns add-order indices,
+    which are already the caller's own ordering; the rustdoc now states this
+    unified contract explicitly. Worth calling out in release notes if a
+    version is cut.
+  - Regression test:
+    `consensus_multi_read_indices_map_to_input_slice_with_nonzero_seed`
+    (uses `seed_idx != 0`, where the pre-existing `seed_idx = 0` coverage could
+    not detect the mismatch).
 
 - **Multi-allele over-split under pure bypass: `consensus_multi` no longer
   splits a single length-variant allele into two "alleles" when its

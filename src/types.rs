@@ -201,10 +201,23 @@ pub struct Consensus {
     /// consensus.  Inspect `arm_read_counts` and `arm_sequences` to decide
     /// whether to re-run with [`PoaGraph::consensus_multi`].
     pub bubble_sites: Vec<BubbleSite>,
-    /// Indices (into the original `reads` slice) of the reads that contributed
-    /// to this consensus.  Populated by [`PoaGraph::consensus_multi`] and the
+    /// Indices of the reads that contributed to this consensus, in the caller's
+    /// own read ordering.  Populated by [`PoaGraph::consensus_multi`] and the
     /// [`consensus_multi`] free function; **empty for single-allele outputs**
     /// ([`PoaGraph::consensus`], [`consensus`]).
+    ///
+    /// The exact meaning of each index depends on how the graph was built:
+    ///
+    /// * **Free functions** ([`consensus_multi`], [`consensus_adaptive`]): indices
+    ///   into the input `reads` slice you passed, regardless of `seed_idx`.
+    /// * **Stateful API** ([`PoaGraph::consensus_multi`] on a graph you built with
+    ///   [`PoaGraph::new`] + [`PoaGraph::add_read`]): the order you supplied reads,
+    ///   with the [`PoaGraph::new`] seed at index 0 and each [`PoaGraph::add_read`]
+    ///   call following in order.
+    ///
+    /// (These coincide when `seed_idx == 0`.  For non-zero `seed_idx` the free
+    /// functions translate the internal seed-first ordering back to your input
+    /// slice so the indices are directly usable.)
     ///
     /// An empty `Vec` means "all reads contributed" — no phasing was performed.
     /// A non-empty `Vec` identifies exactly which reads belong to this allele,

@@ -476,10 +476,13 @@ fn diag_dmd_ctt_repeat_interior_filter_global_threshold_bias() {
 }
 
 #[test]
-#[ignore = "known residual: interior filter can still fabricate sequence when \
-            the majority of reads reach a node via Delete rather than Match \
-            (see diag_dmd_ctt_repeat_interior_filter_global_threshold_bias \
-            for the related, fixed case)"]
+// Formerly #[ignore]d as a known residual of the majority-Delete interior-filter
+// fabrication (Known Bug #6). Now a live regression test: the fabrication is
+// genuinely fixed. Bisected — this exact read set + seed produced the impossible
+// "CTTTTC" run at commit d24f133 (test's own introduction) and still at 19b81e8,
+// then went green at 64a839f ("RFC1 leading interrupt bug", 2026-07-08), the
+// backward-fork-search rescue (Known Bug #8, FORK_SEARCH_HOPS=64). Fixed by that
+// earlier interior-filter work, NOT by the later bypass-edge Delete rework.
 fn diag_dmd_ctt_majority_delete_residual() {
     let reads = vec![
         b(
@@ -2857,6 +2860,60 @@ fn consensus_multi_read_indices_populated() {
             "each allele must have read indices"
         );
     }
+}
+
+#[test]
+fn consensus_multi_read_indices_map_to_input_slice_with_nonzero_seed() {
+    // Regression for the read_indices index-semantics bug: the free-function
+    // `consensus_multi` must return read_indices as indices into the INPUT
+    // `reads` slice, regardless of `seed_idx`. The pre-existing coverage above
+    // uses seed_idx=0, where build_graph's seed-first permutation is the
+    // identity, so it could not catch an internal-vs-input mismatch. This uses
+    // seed_idx != 0, where the permutation is non-trivial:
+    //   perm = [seed_idx] ++ (input indices excluding seed_idx)
+    // A reads occupy input indices 0..=4, B reads 5..=9; with seed_idx=7 the
+    // A group's *internal* indices are {1,2,3,4,5} -- so without translation
+    // this test's [0,1,2,3,4] assertion fails, catching the bug.
+    let a: &[u8] = b"GCTAGCTAGCTACTAGCTAGCT"; // allele A (base 'A' at pos 11)
+    let bv: &[u8] = b"GCTAGCTAGCTGCTAGCTAGCT"; // allele B (base 'G' at pos 11)
+    let reads: Vec<&[u8]> = vec![a, a, a, a, a, bv, bv, bv, bv, bv];
+    let seed_idx = 7; // a B read; non-zero so the permutation is not identity
+
+    let alleles =
+        poa_consensus::consensus_multi(&reads, seed_idx, &poa_consensus::PoaConfig::default())
+            .unwrap();
+    assert_eq!(alleles.len(), 2, "expected two alleles");
+
+    // Identify each allele by its consensus sequence and check its read_indices
+    // are exactly the INPUT-slice indices of the reads that built it.
+    let a_allele = alleles
+        .iter()
+        .find(|c| c.sequence == a)
+        .expect("expected an allele whose consensus equals allele A");
+    let b_allele = alleles
+        .iter()
+        .find(|c| c.sequence == bv)
+        .expect("expected an allele whose consensus equals allele B");
+
+    let mut a_idx = a_allele.read_indices.clone();
+    a_idx.sort_unstable();
+    let mut b_idx = b_allele.read_indices.clone();
+    b_idx.sort_unstable();
+
+    assert_eq!(
+        a_idx,
+        vec![0, 1, 2, 3, 4],
+        "A allele's read_indices must be the INPUT indices of the A reads (0..=4), \
+         not internal seed-first indices; got {:?}",
+        a_allele.read_indices
+    );
+    assert_eq!(
+        b_idx,
+        vec![5, 6, 7, 8, 9],
+        "B allele's read_indices must be the INPUT indices of the B reads (5..=9), \
+         not internal seed-first indices; got {:?}",
+        b_allele.read_indices
+    );
 }
 
 #[test]

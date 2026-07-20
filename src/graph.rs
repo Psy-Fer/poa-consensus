@@ -4536,6 +4536,13 @@ impl PoaGraph {
     /// allele-length differences create a visible Insert-arm bubble; structural phasing
     /// then retries on the unbanded graph. If still no structural bubble, falls back to
     /// single-best SNP bubble partitioning for substitution haplotypes.
+    ///
+    /// Each returned [`Consensus`]'s `read_indices` are in this graph's own
+    /// read ordering: the [`PoaGraph::new`] seed is index 0 and each
+    /// [`PoaGraph::add_read`] call follows in order. The free-function
+    /// [`crate::consensus_multi`] wrapper translates these back to the input
+    /// slice's indexing; when calling this method directly the add-order
+    /// indexing is left as-is.
     pub fn consensus_multi(&self) -> Result<Vec<Consensus>, PoaError> {
         if self.n_reads < self.config.min_reads {
             return Err(PoaError::InsufficientDepth {

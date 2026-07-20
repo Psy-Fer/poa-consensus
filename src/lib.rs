@@ -407,6 +407,35 @@ fn build_graph(reads: &[&[u8]], seed_idx: usize, config: PoaConfig) -> Result<Po
     Ok(graph)
 }
 
+/// Translate the `read_indices` on each [`Consensus`] from graph-internal
+/// indices back to indices into the caller's input `reads` slice.
+///
+/// [`build_graph`] builds the graph as `PoaGraph::new(reads[seed_idx])`
+/// (making the seed graph-internal index 0) followed by `add_read` on every
+/// other read in input order. The internal-to-input mapping is therefore
+/// `perm = [seed_idx] ++ (input indices 0..n, excluding seed_idx)`, i.e.
+/// `input_idx = perm[internal_idx]`. This must mirror `build_graph`'s ordering
+/// exactly; if that ordering ever changes, update this in lockstep.
+///
+/// Single-allele consensuses carry an empty `read_indices`, so remapping them
+/// is a no-op. Only the free-function wrappers (which own the input slice and
+/// the `seed_idx`) apply this; the stateful `PoaGraph::consensus_multi` leaves
+/// `read_indices` in add-order, which is already the caller's own ordering.
+fn remap_read_indices_to_input(consensuses: &mut [Consensus], seed_idx: usize, n_reads: usize) {
+    let mut perm = Vec::with_capacity(n_reads);
+    perm.push(seed_idx);
+    for i in 0..n_reads {
+        if i != seed_idx {
+            perm.push(i);
+        }
+    }
+    for c in consensuses.iter_mut() {
+        for idx in c.read_indices.iter_mut() {
+            *idx = perm[*idx];
+        }
+    }
+}
+
 /// Index of the read whose length is closest to the population's median
 /// (by position in the length-sorted order, not interpolated) -- used by
 /// `consensus_adaptive`'s seed-sensitivity retry to pick a re-seeding
@@ -567,7 +596,9 @@ pub fn consensus_multi(
     config: &PoaConfig,
 ) -> Result<Vec<Consensus>, PoaError> {
     validate(reads, seed_idx)?;
-    build_graph(reads, seed_idx, config.clone())?.consensus_multi()
+    let mut alleles = build_graph(reads, seed_idx, config.clone())?.consensus_multi()?;
+    remap_read_indices_to_input(&mut alleles, seed_idx, reads.len());
+    Ok(alleles)
 }
 
 /// Two-pass adaptive consensus.
@@ -652,8 +683,10 @@ pub fn consensus_adaptive(
         && stats.bubble_count <= 3
         && stats.max_bubble_depth >= allele_threshold
     {
+        let mut consensuses = graph.consensus_multi()?;
+        remap_read_indices_to_input(&mut consensuses, seed_idx, n);
         return Ok(AdaptiveResult {
-            consensuses: graph.consensus_multi()?,
+            consensuses,
             action: AdaptiveAction::MultiAllele,
         });
     }
