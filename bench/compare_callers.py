@@ -643,6 +643,71 @@ def _rt_str(elapsed_s):
     return f"{elapsed_s:.1f}s"
 
 
+# ── POASTA (4th caller) ───────────────────────────────────────────────────────
+#
+# POASTA (Broad Institute; `cargo install poasta`) is a pure-Rust exact
+# gap-affine A* POA aligner. It has NO built-in consensus mode -- it emits a POA
+# graph / MSA / GFA / DOT. We therefore derive a consensus from its tabular-MSA
+# output (`-O fasta`) by per-column majority vote (harness-derived, NOT a
+# built-in consensus -- noted in the report, as it affects comparison fairness).
+#
+# IMPORTANT FAIRNESS CAVEAT: POASTA 0.1.0 only implements GLOBAL alignment;
+# `--alignment-span semi-global` and `ends-free` panic ("not yet implemented").
+# The other three callers run semi-global (CLAUDE.md's documented default for
+# extracted reads). So POASTA is at a disadvantage on partial / non-spanning
+# reads (global forces both ends to align). Every POASTA cell is thus global-mode;
+# treat partial-read scenarios (e.g. cmp_partial_*, gen_short_reads_long_region)
+# as not directly comparable for POASTA.
+
+def _msa_majority_consensus(msa_bytes: bytes) -> Optional[bytes]:
+    """Per-column majority-vote consensus from a tabular MSA (aligned FASTA with
+    '-' gaps). Emits the plurality base per column; a column is dropped only when
+    the gap count strictly exceeds every base count (ties favour emitting a base)."""
+    rows: list[bytes] = []
+    cur: list[bytes] = []
+    for line in msa_bytes.split(b"\n"):
+        if line.startswith(b">"):
+            if cur:
+                rows.append(b"".join(cur))
+                cur = []
+        else:
+            cur.append(line.strip())
+    if cur:
+        rows.append(b"".join(cur))
+    rows = [r for r in rows if r]
+    if not rows:
+        return None
+    ncol = max(len(r) for r in rows)
+    out = bytearray()
+    for c in range(ncol):
+        base_counts: dict[int, int] = {}
+        gap = 0
+        for r in rows:
+            if c < len(r):
+                ch = r[c]
+                if ch == 0x2D:  # '-'
+                    gap += 1
+                else:
+                    base_counts[ch] = base_counts.get(ch, 0) + 1
+        if not base_counts:
+            continue
+        top_ch, top_n = max(base_counts.items(), key=lambda kv: kv[1])
+        if top_n >= gap:
+            out.append(top_ch)
+    return bytes(out)
+
+
+def run_poasta(ext: Path, work: Path, tag: str = "poasta"):
+    """Run POASTA (global MSA) isolated, derive a majority-vote consensus.
+    Returns (cons_bytes | None, status, elapsed_s | None, peak_kb | None)."""
+    out, status, rt, peak = _run_isolated(
+        ["poasta", "align", "-O", "fasta", str(ext)], work, tag)
+    cons = _msa_majority_consensus(out) if (status == "ok" and out) else None
+    if status == "ok" and not cons:
+        status = "empty"
+    return cons, status, rt, peak
+
+
 def _build_longtier_scenarios() -> list["v.Scenario"]:
     import random
     S: list["v.Scenario"] = []
@@ -725,12 +790,14 @@ def run_longtier(args):
     print(f"  per-caller caps: timeout={LONG_TIMEOUT_S}s, virtual-memory={LONG_MEM_KB // (1024*1024)}GB "
           f"(box has 31GB); a caller failing at scale is informative, not a run-breaker")
     print(f"{'='*110}")
-    header = f"  {'SCENARIO':<32} {'MODEL':<8} {'TRUTH':<10} {'poa-consensus':<28} {'abPOA':<28} {'SPOA':<28}"
+    header = (f"  {'SCENARIO':<32} {'MODEL':<8} {'TRUTH':<10} {'poa-consensus':<28} "
+              f"{'abPOA':<28} {'SPOA':<28} {'POASTA(global)':<28}")
     print(header)
-    print(f"  {'-'*32} {'-'*8} {'-'*10} {'-'*28} {'-'*28} {'-'*28}")
+    print(f"  {'-'*32} {'-'*8} {'-'*10} {'-'*28} {'-'*28} {'-'*28} {'-'*28}")
 
     tally = {"all_agree_ok": 0, "poa_better": 0, "poa_worse": 0, "all_fail": 0, "error": 0}
     cat = {"poa_better": [], "poa_worse": [], "all_fail": [], "error": []}
+    ptally = {"ok": 0, "fail": 0, "na": 0, "beats_poa": 0, "poa_beats": 0, "tie": 0}
     scale_rows = []   # (name, region_bp, n_reads, per-caller (status,rt,peak))
     t_start = time.time()
 
@@ -796,14 +863,17 @@ def run_longtier(args):
             [sys.executable, "-c", _CHILD, str(extracted_path), "SPOA"], work, "spoa")
         sp_cons = sp_out.strip() if (sp_status == "ok" and sp_out) else None
 
+        p_cons, p_status, p_rt, p_peak = run_poasta(extracted_path, work)
+
         results = [
             evaluate_caller("poa-consensus", poa_cons, truth),
             evaluate_caller("abPOA", ab_cons, truth),
             evaluate_caller("SPOA", sp_cons, truth),
+            evaluate_caller("POASTA", p_cons, truth),
         ]
         # Overlay the isolation status when a caller did not complete, so the
         # cell shows *why* (timeout/oom) rather than a bare N/A.
-        statuses = [poa_status, ab_status, sp_status]
+        statuses = [poa_status, ab_status, sp_status, p_status]
         for r, st in zip(results, statuses):
             if st != "ok":
                 r["status"] = "N/A"
@@ -817,9 +887,10 @@ def run_longtier(args):
         scale_rows.append((scenario.name, region_bp, n_reads,
                            (poa_status, poa_rt, poa_peak),
                            (ab_status, ab_rt, ab_peak),
-                           (sp_status, sp_rt, sp_peak)))
+                           (sp_status, sp_rt, sp_peak),
+                           (p_status, p_rt, p_peak)))
 
-        # Tally: a caller that timed out / OOMed counts as a FAIL for it.
+        # Tally (3-way, unchanged): a caller that timed out / OOMed counts as FAIL.
         def _ok(r, st):
             return st == "ok" and r["status"] == "OK"
         poa_ok = _ok(results[0], poa_status)
@@ -836,8 +907,24 @@ def run_longtier(args):
             tally["all_fail"] += 1
             cat["all_fail"].append((scenario, truth, results))
 
+        # POASTA standing (separate).
+        p_ok = _ok(results[3], p_status)
+        if results[3]["status"] == "N/A":
+            ptally["na"] += 1
+        elif p_ok:
+            ptally["ok"] += 1
+        else:
+            ptally["fail"] += 1
+        if p_ok and not poa_ok:
+            ptally["beats_poa"] += 1
+        elif poa_ok and not p_ok:
+            ptally["poa_beats"] += 1
+        elif poa_ok and p_ok:
+            ptally["tie"] += 1
+
         print(f"  {scenario.name:<32} {scenario.model:<8} {truth.display:<10} "
-              f"{_cell(results[0]):<28} {_cell(results[1]):<28} {_cell(results[2]):<28}")
+              f"{_cell(results[0]):<28} {_cell(results[1]):<28} {_cell(results[2]):<28} "
+              f"{_cell(results[3]):<28}")
 
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
@@ -851,17 +938,22 @@ def run_longtier(args):
     print(f"    poa-consensus FAIL, external(s) OK:  {tally['poa_worse']}   <- chase these")
     print(f"    all three FAIL:                      {tally['all_fail']}   <- shared scale ceiling")
 
+    print(f"    ---- POASTA (global; harness-derived consensus): OK={ptally['ok']} "
+          f"FAIL={ptally['fail']} not-completed={ptally['na']}; "
+          f"beats-poa={ptally['beats_poa']} poa-beats={ptally['poa_beats']} tie={ptally['tie']}")
+
     # ── Scale / runtime / memory table ───────────────────────────────────────
     print(f"\n  SCALE / RUNTIME / PEAK-MEMORY table (per caller):")
     print(f"  {'SCENARIO':<32} {'REGION':>7} {'READS':>5}  "
-          f"{'poa: st/rt/mem':<26} {'abPOA: st/rt/mem':<26} {'SPOA: st/rt/mem':<26}")
-    print(f"  {'-'*32} {'-'*7} {'-'*5}  {'-'*26} {'-'*26} {'-'*26}")
-    for name, region_bp, n_reads, poa_t, ab_t, sp_t in scale_rows:
+          f"{'poa: st/rt/mem':<26} {'abPOA: st/rt/mem':<26} {'SPOA: st/rt/mem':<26} "
+          f"{'POASTA: st/rt/mem':<26}")
+    print(f"  {'-'*32} {'-'*7} {'-'*5}  {'-'*26} {'-'*26} {'-'*26} {'-'*26}")
+    for name, region_bp, n_reads, poa_t, ab_t, sp_t, p_t in scale_rows:
         def _fmt(t):
             st, rt, pk = t
             return f"{st}/{_rt_str(rt)}/{_mem_str(pk)}"
         print(f"  {name:<32} {region_bp:>6}b {n_reads:>5}  "
-              f"{_fmt(poa_t):<26} {_fmt(ab_t):<26} {_fmt(sp_t):<26}")
+              f"{_fmt(poa_t):<26} {_fmt(ab_t):<26} {_fmt(sp_t):<26} {_fmt(p_t):<26}")
 
     def _line(scenario, truth, results):
         def _c(r):
@@ -951,15 +1043,19 @@ def main():
              if skipped_multi else "")
           + ")")
     print(f"{'='*100}")
-    header = f"  {'SCENARIO':<32} {'MODEL':<9} {'TRUTH':<14} {'poa-consensus':<30} {'abPOA':<30} {'SPOA':<30}"
+    header = (f"  {'SCENARIO':<32} {'MODEL':<9} {'TRUTH':<14} {'poa-consensus':<30} "
+              f"{'abPOA':<30} {'SPOA':<30} {'POASTA(global,derived)':<30}")
     print(header)
-    print(f"  {'-'*32} {'-'*9} {'-'*13} {'-'*30} {'-'*30} {'-'*30}")
+    print(f"  {'-'*32} {'-'*9} {'-'*13} {'-'*30} {'-'*30} {'-'*30} {'-'*30}")
 
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
     tally = {"all_agree_ok": 0, "poa_better": 0, "poa_worse": 0, "all_fail": 0, "error": 0}
     cat = {"poa_better": [], "poa_worse": [], "all_fail": [], "error": []}
+    # POASTA standing (tracked separately; the 3-way tally above is unchanged).
+    ptally = {"ok": 0, "fail": 0, "na": 0, "beats_poa": 0, "poa_beats": 0, "tie": 0}
+    pcat = {"beats_poa": [], "poa_beats": [], "notok": []}
     rows = []
     t_start = time.time()
 
@@ -989,6 +1085,12 @@ def main():
                 evaluate_caller("abPOA", run_abpoa(seqs), truth),
                 evaluate_caller("SPOA", run_spoa(seqs), truth),
             ]
+            # POASTA: 4th caller, isolated subprocess, harness-derived consensus.
+            p_cons, p_status, p_rt, p_peak = run_poasta(extracted_path, work)
+            p_res = evaluate_caller("POASTA", p_cons, truth)
+            if p_status != "ok":
+                p_res["status"] = "N/A"
+                p_res["iso"] = p_status
         except Exception as exc:
             print(f"  {scenario.name:<32} ERROR: {exc}")
             tally["error"] += 1
@@ -1012,8 +1114,27 @@ def main():
             tally["all_fail"] += 1
             cat["all_fail"].append((scenario, truth, results))
 
+        # POASTA standing vs poa-consensus (separate; does not affect 3-way tally).
+        p_ok = p_res["status"] == "OK"
+        if p_res["status"] == "N/A":
+            ptally["na"] += 1
+            pcat["notok"].append((scenario.name, p_res.get("iso", "N/A")))
+        elif p_ok:
+            ptally["ok"] += 1
+        else:
+            ptally["fail"] += 1
+        if p_ok and not poa_ok:
+            ptally["beats_poa"] += 1
+            pcat["beats_poa"].append((scenario, truth, results, p_res))
+        elif poa_ok and not p_ok:
+            ptally["poa_beats"] += 1
+            pcat["poa_beats"].append((scenario, truth, results, p_res))
+        elif poa_ok and p_ok:
+            ptally["tie"] += 1
+
+        p_cell = p_res.get("iso", "").upper() or cell(p_res)
         print(f"  {scenario.name:<32} {scenario.model:<9} {truth.display:<14} "
-              f"{cell(results[0]):<30} {cell(results[1]):<30} {cell(results[2]):<30}")
+              f"{cell(results[0]):<30} {cell(results[1]):<30} {cell(results[2]):<30} {p_cell:<30}")
 
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
@@ -1046,6 +1167,31 @@ def main():
         print(f"\n  ERRORED / SKIPPED (nothing silently dropped):")
         for name, exc in cat["error"]:
             print(f"    - {name}: {exc}")
+
+    # ── POASTA standing (4th caller; global mode, harness-derived consensus) ──
+    print(f"\n  POASTA standing (global-only in v0.1.0, MSA majority-vote consensus; "
+          f"NOT directly comparable on partial-read scenarios):")
+    print(f"    POASTA OK: {ptally['ok']}   FAIL: {ptally['fail']}   "
+          f"not-completed (timeout/oom/error/empty): {ptally['na']}")
+    print(f"    POASTA OK where poa FAILED:  {ptally['beats_poa']}")
+    print(f"    poa OK where POASTA FAILED:  {ptally['poa_beats']}")
+    print(f"    both OK (tie):               {ptally['tie']}")
+    if pcat["beats_poa"]:
+        print(f"    POASTA beats poa-consensus on:")
+        for scenario, truth, results, p_res in pcat["beats_poa"]:
+            pc = p_res.get("iso", "").upper() or cell(p_res)
+            print(f"      - {scenario.name:<34} ({scenario.model}, {truth.display}): "
+                  f"poa[{cell(results[0])}]  POASTA[{pc}]")
+    if pcat["poa_beats"]:
+        print(f"    poa-consensus beats POASTA on:")
+        for scenario, truth, results, p_res in pcat["poa_beats"]:
+            pc = p_res.get("iso", "").upper() or cell(p_res)
+            print(f"      - {scenario.name:<34} ({scenario.model}, {truth.display}): "
+                  f"poa[{cell(results[0])}]  POASTA[{pc}]")
+    if pcat["notok"]:
+        print(f"    POASTA did not complete (timeout/oom/error/empty):")
+        for name, st in pcat["notok"]:
+            print(f"      - {name}: {st}")
 
     elapsed = time.time() - t_start
     print(f"\n  Total runtime: {elapsed:.1f}s ({elapsed/60:.1f} min) over "
