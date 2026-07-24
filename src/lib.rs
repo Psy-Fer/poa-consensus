@@ -370,21 +370,28 @@ pub use types::{
 
 /// Build a POA graph from `reads`, seeded on `reads[seed_idx]`.
 ///
-/// `rebuild_unbanded_on_band_retry` controls the whole-graph unbanded rebuild
-/// described below. It must be `true` **only** for the multi-allele path
-/// ([`consensus_multi`]): there the rebuild's consistent bubble structure is
-/// load-bearing for phasing. It must be `false` for every single-allele path,
-/// where the rebuild is actively harmful -- on a single-allele periodic/
-/// homogeneous repeat the unbanded rebuild drifts the graph enough that the
-/// consensus over-calls the repeat length (a wider corridor admits more
-/// phase-slip), whereas the protective narrow adaptive band keeps it correct.
-/// See `design/vntr_overcall_delete_edge_visibility.md`.
+/// `multi_allele` selects the two mode-dependent behaviours whose correct
+/// setting differs between single- and multi-allele consensus (see
+/// [`PoaConfig::multi_allele`]): it is written into the graph's config so the
+/// aligner keeps the diagonal-skip fast path (multi-allele allele-locking) or
+/// disables it (single-allele accuracy on periodic repeats), and it gates the
+/// whole-graph unbanded rebuild below. It must be `true` **only** for the
+/// multi-allele path ([`consensus_multi`]) -- there the rebuild's consistent
+/// bubble structure is load-bearing for phasing -- and `false` for every
+/// single-allele path, where both the rebuild (drifts the graph, over-calls
+/// length) and diagonal-skip (matches through phantom units) are harmful. See
+/// `design/vntr_overcall_delete_edge_visibility.md`.
 fn build_graph(
     reads: &[&[u8]],
     seed_idx: usize,
-    config: PoaConfig,
-    rebuild_unbanded_on_band_retry: bool,
+    mut config: PoaConfig,
+    multi_allele: bool,
 ) -> Result<PoaGraph, PoaError> {
+    // Thread the single/multi-allele mode through the config so the aligner
+    // (which only sees `PoaConfig`) can condition diagonal-skip on it. Overrides
+    // whatever the caller set, since build_graph's own argument is authoritative
+    // for which consensus path this is.
+    config.multi_allele = multi_allele;
     let mut graph = PoaGraph::new(reads[seed_idx], config.clone())?;
     for (i, read) in reads.iter().enumerate() {
         if i != seed_idx {
@@ -408,10 +415,7 @@ fn build_graph(
     // Gated to the multi-allele path (see the parameter doc); skipped when
     // the config was already fully unbanded (nothing to gain, and this
     // recursion would otherwise never terminate).
-    if rebuild_unbanded_on_band_retry
-        && graph.used_band_retry()
-        && (config.band_width > 0 || config.adaptive_band)
-    {
+    if multi_allele && graph.used_band_retry() && (config.band_width > 0 || config.adaptive_band) {
         let mut cfg2 = config.clone();
         cfg2.band_width = 0;
         cfg2.adaptive_band = false;

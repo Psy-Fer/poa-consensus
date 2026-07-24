@@ -56,11 +56,14 @@ fn consensus_len(reads: &[Vec<u8>]) -> usize {
     cons.sequence.len()
 }
 
-// MUC1 flVNTR unit is ~60 bp; allow ~2 units of tolerance for ONT noise at the
-// repeat/flank boundaries. The baseline over-call is +5 units (300 bp), so this
-// tolerance decisively separates correct from over-called.
+// MUC1 flVNTR unit is ~60 bp. `TOL` (2 units) is a loose positive-control
+// bound; `TIGHT` (half a unit) is the exactness guard for hap2, which the
+// production single-allele path calls exactly (4868). The over-call this
+// regression guards against is +59 bp (~1 unit), so TIGHT catches it while
+// TOL would not.
 const UNIT: usize = 60;
 const TOL: usize = 2 * UNIT;
+const TIGHT: usize = UNIT / 2;
 
 // ── hap2: 77-unit allele — the over-call regression guard ─────────────────────
 
@@ -70,16 +73,19 @@ fn hg002_muc1_hap2_length_not_overcalled() {
     assert_eq!(reads.len(), 16, "fixture read count");
 
     // Ground truth: 77 units; correct consensus length 4868 bp (abPOA / SPOA /
-    // poa-consensus 0.2.1 all agree). Median read length is the same.
+    // poa-consensus 0.2.1 all agree). The single-allele path (diagonal-skip
+    // disabled — see PoaConfig::multi_allele) calls this exactly; the previous
+    // greedy-only path over-called by +59 bp (~1 unit). TIGHT tolerance so a
+    // regression to that over-call fails the test.
     const TRUTH: usize = 4868;
     let median = median_len(&reads);
     let len = consensus_len(&reads);
 
     assert!(
-        len.abs_diff(TRUTH) <= TOL,
-        "hap2 consensus length {len} bp is not within {TOL} bp of the 77-unit \
-         truth {TRUTH} bp (median read {median}); a large positive deviation is \
-         the length-biased heaviest-path over-call this test guards against",
+        len.abs_diff(TRUTH) <= TIGHT,
+        "hap2 consensus length {len} bp is not within {TIGHT} bp of the 77-unit \
+         truth {TRUTH} bp (median read {median}); a positive deviation is the \
+         periodic-repeat over-call this test guards against",
     );
 }
 

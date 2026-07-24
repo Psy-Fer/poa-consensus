@@ -341,15 +341,14 @@ fn diag_phase_shift_majority_trims_first_base() {
     ];
     let result = s(&consensus(&reads, 0));
     // Known Bug #1 (phase-shift majority, no flanking anchor): the majority is
-    // the same 6 bp sequence in a different rotational phase, but without a
-    // flanking anchor the correct length (6) is not recoverable. This is a
-    // degenerate no-flank case whose exact output is an artifact of the
-    // consensus-extraction algorithm, not a correctness guarantee. Greedy
-    // heaviest bundling yields a 5 bp merge here (the length-biased longest
-    // path happened to yield 6). The real fix is flanking-anchor
-    // pre-processing (extract_flanked_region); see Known Bugs #1/#2. This
-    // assertion tracks the current degenerate output, not a target.
-    assert_eq!(result.len(), 5, "got: '{}'", result);
+    // the same 6 bp sequence in a different rotational phase. With diagonal-skip
+    // disabled for single-allele consensus (the default; see
+    // PoaConfig::multi_allele), the full windowed DP recovers the correct
+    // length 6 here -- the greedy forward-match that previously merged it to
+    // 5 bp is exactly the periodic over-call the gating fixes. (Rotation
+    // ambiguity in general still wants flanking-anchor pre-processing,
+    // extract_flanked_region; see Known Bugs #1/#2.)
+    assert_eq!(result.len(), 6, "got: '{}'", result);
 }
 
 #[test]
@@ -3256,8 +3255,13 @@ fn diagonal_skip_rate_increases_with_read_count() {
     let seq = b"ACGTACGATCGATCGTAGCTAGCTAGCTACGATCGATCGATCGTACGATCG\
                 TAGCTAGCTAGCATCGATCGATCGTACGATCGTAGCTAGCTAGCTACGATC";
 
+    // The diagonal-skip fast path is gated to multi-allele mode (in
+    // single-allele mode it is disabled — its greedy forward-match over-calls
+    // periodic repeats; see PoaConfig::multi_allele). This test verifies the
+    // optimization itself, so it builds in multi-allele mode where it is active.
     let cfg = PoaConfig {
         min_reads: 3,
+        multi_allele: true,
         ..Default::default()
     };
 
@@ -3340,11 +3344,14 @@ fn multi_node_minority_arm_fully_marked_as_dead_end() {
         b("ACTGGATCGATATGCGATTCAGTCGA").to_vec(), // back to the plain sequence
     ];
 
+    // Diagonal-skip (and its bubble-arm lookahead) is gated to multi-allele
+    // mode; build there to exercise it (see PoaConfig::multi_allele).
     let cfg = PoaConfig {
         band_width: 50,
         adaptive_band: true,
         min_reads: 2,
         alignment_mode: AlignmentMode::SemiGlobal,
+        multi_allele: true,
         ..Default::default()
     };
     let mut graph = PoaGraph::new(&reads[0], cfg).unwrap();

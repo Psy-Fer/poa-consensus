@@ -1290,6 +1290,20 @@ fn align(
 
     // Bubble membership: Some((entry_t, exit_t)) or None for spine.
     let bubble_ranges = compute_bubble_ranges(nodes, topo);
+
+    // ── Diagonal-skip gating ──────────────────────────────────────────────────
+    // The O(1) diagonal-skip fast path is a greedy forward-match: at a spine
+    // node it commits to matching when the base equals the read's next base,
+    // never evaluating the insert/delete alternatives. In a single-allele
+    // periodic repeat this force-matches reads THROUGH phantom extra repeat
+    // units (every unit base matches), inflating their coverage and over-calling
+    // the length. In multi-allele mode the same greedy match is PROTECTIVE -- it
+    // locks each read onto its own length-allele track and stops short-allele
+    // reads drifting onto the longer allele's extra units. So diagonal-skip is
+    // disabled for single-allele consensus (accuracy) and kept for multi-allele
+    // (allele separation). See design/vntr_overcall_delete_edge_visibility.md.
+    let diag_skip_disabled = !cfg.multi_allele;
+
     // j position of each bubble's entry node's predecessors — filled dynamically.
     let mut bubble_entry_j = vec![0usize; n];
 
@@ -1443,7 +1457,7 @@ fn align(
             NODE_COUNTER.with(|c| c.set(c.get() + 1));
         }
 
-        if !is_source && on_spine[node_idx] {
+        if !is_source && on_spine[node_idx] && !diag_skip_disabled {
             if let Some(prev_sp) = spine_prev[node_idx] {
                 // Relaxed in-edge check: fast for the common single-predecessor case;
                 // falls through to a loop only when there are extra predecessors that
@@ -4724,7 +4738,16 @@ impl PoaGraph {
             }
             let seed_slot = choose_seed(group, &self.reads);
             let seed = &self.reads[group[seed_slot]];
-            let mut sub = PoaGraph::new(seed, self.config.clone())?;
+            // Per-allele consensus is a SINGLE-allele problem: the reads have
+            // already been partitioned to one allele, so build the sub-graph in
+            // single-allele mode (diagonal-skip disabled). Multi-allele mode's
+            // diagonal-skip is needed only for the *separation* on the shared
+            // graph (keeping reads on their allele track); within a partitioned
+            // group its greedy forward-match reintroduces the periodic over/
+            // under-call. See PoaConfig::multi_allele.
+            let mut sub_cfg = self.config.clone();
+            sub_cfg.multi_allele = false;
+            let mut sub = PoaGraph::new(seed, sub_cfg)?;
             for (slot, &read_idx) in group.iter().enumerate() {
                 if slot == seed_slot {
                     continue;
@@ -5198,7 +5221,16 @@ mod bypass_edge_tests {
 
     #[test]
     fn deletion_run_spanning_a_preexisting_fork() {
-        let mut g = PoaGraph::new(&b(SEED), cfg_global_unbanded()).unwrap();
+        // Build in multi-allele mode so the diagonal-skip fast path is active
+        // (it is disabled for single-allele; see PoaConfig::multi_allele). The
+        // exact equal-cost placement of a fork-spanning deletion run depends on
+        // it: with diag-skip the run attaches at 5->9 (this test's scenario);
+        // in single-allele mode the full DP picks the equal-cost 4->8. Either
+        // way it is ONE consolidated bypass of weight 2 -- the property under
+        // test. Pinned to the diag-skip alignment for a stable fork-spanning case.
+        let mut cfg = cfg_global_unbanded();
+        cfg.multi_allele = true;
+        let mut g = PoaGraph::new(&b(SEED), cfg).unwrap();
 
         // First, an insertion read that gives node 7 ('T') a second out-edge
         // (to the first inserted node), making it a genuine fork. This read
