@@ -368,7 +368,23 @@ pub use types::{
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-fn build_graph(reads: &[&[u8]], seed_idx: usize, config: PoaConfig) -> Result<PoaGraph, PoaError> {
+/// Build a POA graph from `reads`, seeded on `reads[seed_idx]`.
+///
+/// `rebuild_unbanded_on_band_retry` controls the whole-graph unbanded rebuild
+/// described below. It must be `true` **only** for the multi-allele path
+/// ([`consensus_multi`]): there the rebuild's consistent bubble structure is
+/// load-bearing for phasing. It must be `false` for every single-allele path,
+/// where the rebuild is actively harmful -- on a single-allele periodic/
+/// homogeneous repeat the unbanded rebuild drifts the graph enough that the
+/// consensus over-calls the repeat length (a wider corridor admits more
+/// phase-slip), whereas the protective narrow adaptive band keeps it correct.
+/// See `design/vntr_overcall_delete_edge_visibility.md`.
+fn build_graph(
+    reads: &[&[u8]],
+    seed_idx: usize,
+    config: PoaConfig,
+    rebuild_unbanded_on_band_retry: bool,
+) -> Result<PoaGraph, PoaError> {
     let mut graph = PoaGraph::new(reads[seed_idx], config.clone())?;
     for (i, read) in reads.iter().enumerate() {
         if i != seed_idx {
@@ -389,9 +405,13 @@ fn build_graph(reads: &[&[u8]], seed_idx: usize, config: PoaConfig) -> Result<Po
     // allele that vanished when every read used the same unbanded config
     // from the start. Rebuild the whole graph unbanded, from scratch, for
     // internal consistency, rather than trusting a mixed-band graph as-is.
-    // Skipped when the config was already fully unbanded (nothing to gain,
-    // and this recursion would otherwise never terminate).
-    if graph.used_band_retry() && (config.band_width > 0 || config.adaptive_band) {
+    // Gated to the multi-allele path (see the parameter doc); skipped when
+    // the config was already fully unbanded (nothing to gain, and this
+    // recursion would otherwise never terminate).
+    if rebuild_unbanded_on_band_retry
+        && graph.used_band_retry()
+        && (config.band_width > 0 || config.adaptive_band)
+    {
         let mut cfg2 = config.clone();
         cfg2.band_width = 0;
         cfg2.adaptive_band = false;
@@ -472,7 +492,7 @@ fn seed_sensitivity_retry(
     // Remedy 1 (pre-existing): tighten the coverage floor, same seed.
     let mut cfg_tight = config.clone();
     cfg_tight.min_coverage_fraction = cfg_tight.min_coverage_fraction.max(0.6);
-    if let Ok(c) = build_graph(reads, seed_idx, cfg_tight).and_then(|g| g.consensus()) {
+    if let Ok(c) = build_graph(reads, seed_idx, cfg_tight, false).and_then(|g| g.consensus()) {
         candidates.push((c, AdaptiveAction::NoisyTighten));
     }
 
@@ -483,7 +503,7 @@ fn seed_sensitivity_retry(
     if let Some(median_idx) = median_length_read_index(reads) {
         if median_idx != seed_idx {
             if let Ok(c) =
-                build_graph(reads, median_idx, config.clone()).and_then(|g| g.consensus())
+                build_graph(reads, median_idx, config.clone(), false).and_then(|g| g.consensus())
             {
                 candidates.push((c, AdaptiveAction::AlternateSeedRetry));
             }
@@ -497,7 +517,7 @@ fn seed_sensitivity_retry(
     // assumed).
     let mut cfg_mf = config.clone();
     cfg_mf.consensus_mode = ConsensusMode::MajorityFrequency;
-    if let Ok(c) = build_graph(reads, seed_idx, cfg_mf).and_then(|g| g.consensus()) {
+    if let Ok(c) = build_graph(reads, seed_idx, cfg_mf, false).and_then(|g| g.consensus()) {
         candidates.push((c, AdaptiveAction::MajorityFrequencyRetry));
     }
 
@@ -545,7 +565,7 @@ pub fn consensus_fit_scored(
     config: &PoaConfig,
 ) -> Result<AdaptiveResult, PoaError> {
     validate(reads, seed_idx)?;
-    let graph = build_graph(reads, seed_idx, config.clone())?;
+    let graph = build_graph(reads, seed_idx, config.clone(), false)?;
     let stats = graph.stats();
     let c1 = graph.consensus()?;
     if stats.single_support_fraction > 0.3 {
@@ -583,7 +603,7 @@ pub fn consensus(
     config: &PoaConfig,
 ) -> Result<Consensus, PoaError> {
     validate(reads, seed_idx)?;
-    build_graph(reads, seed_idx, config.clone())?.consensus()
+    build_graph(reads, seed_idx, config.clone(), false)?.consensus()
 }
 
 /// Build a multi-allele consensus from `reads`.
@@ -596,7 +616,7 @@ pub fn consensus_multi(
     config: &PoaConfig,
 ) -> Result<Vec<Consensus>, PoaError> {
     validate(reads, seed_idx)?;
-    let mut alleles = build_graph(reads, seed_idx, config.clone())?.consensus_multi()?;
+    let mut alleles = build_graph(reads, seed_idx, config.clone(), true)?.consensus_multi()?;
     remap_read_indices_to_input(&mut alleles, seed_idx, reads.len());
     Ok(alleles)
 }
@@ -670,7 +690,7 @@ pub fn consensus_adaptive(
     validate(reads, seed_idx)?;
 
     // ── Pass 1 ───────────────────────────────────────────────────────────────
-    let graph = build_graph(reads, seed_idx, config.clone())?;
+    let graph = build_graph(reads, seed_idx, config.clone(), false)?;
     let stats = graph.stats();
 
     // ── Decision ─────────────────────────────────────────────────────────────
@@ -716,7 +736,7 @@ pub fn consensus_adaptive(
             let mut cfg2 = config.clone();
             cfg2.band_width = 0;
             cfg2.adaptive_band = false;
-            let c2 = build_graph(reads, seed_idx, cfg2)?.consensus()?;
+            let c2 = build_graph(reads, seed_idx, cfg2, false)?.consensus()?;
             let recovered = (c2.sequence.len() as f64) >= 0.6 * median_len as f64;
             return Ok(AdaptiveResult {
                 consensuses: vec![c2],
@@ -770,7 +790,7 @@ pub fn consensus_adaptive(
         let mut cfg2 = config.clone();
         cfg2.alignment_mode = AlignmentMode::SemiGlobal;
         return Ok(AdaptiveResult {
-            consensuses: vec![build_graph(reads, seed_idx, cfg2)?.consensus()?],
+            consensuses: vec![build_graph(reads, seed_idx, cfg2, false)?.consensus()?],
             action: AdaptiveAction::SemiGlobalFallback,
         });
     }
@@ -818,8 +838,8 @@ pub fn bridged_consensus(
     validate(left_reads, left_seed_idx)?;
     validate(right_reads, right_seed_idx)?;
 
-    let left = build_graph(left_reads, left_seed_idx, config.clone())?.consensus()?;
-    let right = build_graph(right_reads, right_seed_idx, config.clone())?.consensus()?;
+    let left = build_graph(left_reads, left_seed_idx, config.clone(), false)?.consensus()?;
+    let right = build_graph(right_reads, right_seed_idx, config.clone(), false)?.consensus()?;
 
     let join = left.sequence.len();
 
