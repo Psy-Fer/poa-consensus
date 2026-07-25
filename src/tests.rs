@@ -340,7 +340,14 @@ fn diag_phase_shift_majority_trims_first_base() {
         b("AAGAAG"),
     ];
     let result = s(&consensus(&reads, 0));
-    // The majority is the same sequence in a different phase; correct length is 6.
+    // Known Bug #1 (phase-shift majority, no flanking anchor): the majority is
+    // the same 6 bp sequence in a different rotational phase. With diagonal-skip
+    // disabled for single-allele consensus (the default; see
+    // PoaConfig::multi_allele), the full windowed DP recovers the correct
+    // length 6 here -- the greedy forward-match that previously merged it to
+    // 5 bp is exactly the periodic over-call the gating fixes. (Rotation
+    // ambiguity in general still wants flanking-anchor pre-processing,
+    // extract_flanked_region; see Known Bugs #1/#2.)
     assert_eq!(result.len(), 6, "got: '{}'", result);
 }
 
@@ -1168,8 +1175,13 @@ fn coverage_vec_reflects_partial_read_depth() {
     // The Consensus::coverage field must show lower values at positions that
     // only spanning reads covered and higher values where partial reads also
     // contributed.
-    let spanning = b("ACGTACGTACGT"); // 12 bp
-    let partial = b("ACGTACGT"); //  8 bp (covers prefix nodes)
+    //
+    // Uses a non-repetitive sequence so the partial reads have an unambiguous
+    // alignment position (the prefix). A tandem repeat here would be phase-
+    // ambiguous under semi-global -- the partials could equally align to the
+    // suffix -- which does not exercise the depth-reflection this test is about.
+    let spanning = b("ACGTGCATTCAG"); // 12 bp, non-repetitive
+    let partial = b("ACGTGCAT"); //  8 bp (covers prefix nodes)
     let cfg = PoaConfig {
         alignment_mode: AlignmentMode::SemiGlobal,
         min_coverage_fraction: 0.1,
@@ -1380,14 +1392,17 @@ fn bridged_consensus_unknown_gap() {
 #[test]
 fn path_weights_reflect_edge_support() {
     // 1 spanning seed + 4 partial reads covering the first 8 of 12 nodes.
-    // Interior edges (0-7) should have weight 5 (seed + 4 partial).
-    // The partial reads end at node 7, so the consensus (heaviest path) stops
-    // there.  All 8 weights should be ≥ 2 (shared) and n_reads should be 5.
-    let spanning = b("ACGTACGTACGT");
-    let partial = b("ACGTACGT");
+    // Interior edges (0-7) have weight 5 (seed + 4 partial); the seed-only
+    // suffix (nodes 8-11) has weight 1. Under a realistic coverage floor
+    // (0.5) the low-support suffix is boundary-trimmed, so the consensus is
+    // the well-supported prefix and every path weight reflects multi-read
+    // support (≥ 2). Non-repetitive sequence so the partials align
+    // unambiguously to the prefix (a tandem repeat would be phase-ambiguous).
+    let spanning = b("ACGTGCATTCAG");
+    let partial = b("ACGTGCAT");
     let cfg = PoaConfig {
         alignment_mode: AlignmentMode::SemiGlobal,
-        min_coverage_fraction: 0.1,
+        min_coverage_fraction: 0.5,
         ..Default::default()
     };
     let mut graph = PoaGraph::new(&spanning, cfg).unwrap();
@@ -3240,8 +3255,13 @@ fn diagonal_skip_rate_increases_with_read_count() {
     let seq = b"ACGTACGATCGATCGTAGCTAGCTAGCTACGATCGATCGATCGTACGATCG\
                 TAGCTAGCTAGCATCGATCGATCGTACGATCGTAGCTAGCTAGCTACGATC";
 
+    // The diagonal-skip fast path is gated to multi-allele mode (in
+    // single-allele mode it is disabled — its greedy forward-match over-calls
+    // periodic repeats; see PoaConfig::multi_allele). This test verifies the
+    // optimization itself, so it builds in multi-allele mode where it is active.
     let cfg = PoaConfig {
         min_reads: 3,
+        multi_allele: true,
         ..Default::default()
     };
 
@@ -3324,11 +3344,14 @@ fn multi_node_minority_arm_fully_marked_as_dead_end() {
         b("ACTGGATCGATATGCGATTCAGTCGA").to_vec(), // back to the plain sequence
     ];
 
+    // Diagonal-skip (and its bubble-arm lookahead) is gated to multi-allele
+    // mode; build there to exercise it (see PoaConfig::multi_allele).
     let cfg = PoaConfig {
         band_width: 50,
         adaptive_band: true,
         min_reads: 2,
         alignment_mode: AlignmentMode::SemiGlobal,
+        multi_allele: true,
         ..Default::default()
     };
     let mut graph = PoaGraph::new(&reads[0], cfg).unwrap();

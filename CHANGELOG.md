@@ -7,6 +7,58 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.4.0] - 2026-07-25
+
+Periodic-repeat consensus accuracy: fixes a length over-call on tandem-repeat /
+VNTR loci (e.g. MUC1) where the consensus gained phantom repeat units.
+
+### Breaking
+
+- **`PoaConfig` has a new field, `multi_allele: bool`.** Callers that construct
+  `PoaConfig` exhaustively (all fields, no `..PoaConfig::default()`) must add it;
+  callers using `..PoaConfig::default()` are unaffected. Default is `false`.
+- **Single-allele consensus output values change.** On periodic / tandem-repeat
+  loci the consensus now calls the correct (shorter) length instead of
+  over-calling with phantom repeat units. Any caller pinned to the exact previous
+  output bytes will see different (more correct) results; consensus *length* on
+  such loci changes.
+
+### Added
+
+- **`PoaConfig::multi_allele: bool`** (default `false`). Declares whether a graph
+  is being built for multi-allele consensus, selecting two mode-dependent
+  behaviours (diagonal-skip and the unbanded band-retry rebuild). The functional
+  wrappers set it automatically (`consensus_multi` builds with it `true`);
+  single-allele paths leave it `false`. Stateful callers who will call
+  `PoaGraph::consensus_multi` should set it `true`.
+
+### Changed
+
+- **Consensus path selection now uses greedy heaviest bundling** (abPOA-style
+  max-out-edge chain) instead of the cumulative `(weight-1)` longest-weighted
+  path. The old scoring carried a length bias — every extra node whose edges
+  each cleared weight 2 added positive cumulative score — so a periodic locus
+  threaded the path through phantom repeat-unit nodes and over-called the length.
+- **Diagonal-skip fast path is disabled for single-allele consensus** (kept for
+  multi-allele). Its greedy forward-match force-matches reads through phantom
+  units in single-allele periodic repeats (over-call); in multi-allele mode the
+  same match protects allele-length separation. Trade-off: single-allele
+  alignment is ~1.2–2× slower (loses the O(1) fast path) in exchange for exact
+  periodic-repeat length.
+- **The whole-graph unbanded rebuild on band-retry is gated to multi-allele
+  mode.** On single-allele periodic repeats it drifted the graph and worsened
+  the over-call; it is retained for multi-allele bubble-structure consistency.
+- **`consensus_multi` builds each per-allele sub-graph in single-allele mode.**
+  Once reads are partitioned to one allele, that group's consensus is a
+  single-allele problem and gets the same over-call protection.
+
+Net effect on real MUC1 data: the reported over-call is resolved (e.g. HG002
+hap2 5168 → 4868 bp exact, matching abPOA/SPOA); `bench/validate.py` 20/20 and
+`bench/compare_callers.py` 16/16 with no regressions. See
+`design/vntr_overcall_delete_edge_visibility.md`.
+
+---
+
 ## [0.3.0] - 2026-07-20
 
 This release centers on the **bypass-edge deletion rework**: a deletion is now
