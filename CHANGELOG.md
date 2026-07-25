@@ -7,10 +7,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [0.4.0] - 2026-07-25
 
 Periodic-repeat consensus accuracy: fixes a length over-call on tandem-repeat /
 VNTR loci (e.g. MUC1) where the consensus gained phantom repeat units.
+
+### Breaking
+
+- **`PoaConfig` has a new field, `multi_allele: bool`.** Callers that construct
+  `PoaConfig` exhaustively (all fields, no `..PoaConfig::default()`) must add it;
+  callers using `..PoaConfig::default()` are unaffected. Default is `false`.
+- **Single-allele consensus output values change.** On periodic / tandem-repeat
+  loci the consensus now calls the correct (shorter) length instead of
+  over-calling with phantom repeat units. Any caller pinned to the exact previous
+  output bytes will see different (more correct) results; consensus *length* on
+  such loci changes.
 
 ### Added
 
@@ -19,8 +30,7 @@ VNTR loci (e.g. MUC1) where the consensus gained phantom repeat units.
   behaviours (diagonal-skip and the unbanded band-retry rebuild). The functional
   wrappers set it automatically (`consensus_multi` builds with it `true`);
   single-allele paths leave it `false`. Stateful callers who will call
-  `PoaGraph::consensus_multi` should set it `true`. Non-breaking for callers
-  using `..PoaConfig::default()`.
+  `PoaGraph::consensus_multi` should set it `true`.
 
 ### Changed
 
