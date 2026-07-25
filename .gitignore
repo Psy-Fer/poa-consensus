@@ -33,6 +33,8 @@ ref/
 test_plots/
 bench/work/
 bench/work*/
+muc1/
+tests/hg002.muc1*
 *.pyc
 
 # mdBook build output

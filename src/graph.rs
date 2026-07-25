@@ -1290,6 +1290,20 @@ fn align(
 
     // Bubble membership: Some((entry_t, exit_t)) or None for spine.
     let bubble_ranges = compute_bubble_ranges(nodes, topo);
+
+    // ── Diagonal-skip gating ──────────────────────────────────────────────────
+    // The O(1) diagonal-skip fast path is a greedy forward-match: at a spine
+    // node it commits to matching when the base equals the read's next base,
+    // never evaluating the insert/delete alternatives. In a single-allele
+    // periodic repeat this force-matches reads THROUGH phantom extra repeat
+    // units (every unit base matches), inflating their coverage and over-calling
+    // the length. In multi-allele mode the same greedy match is PROTECTIVE -- it
+    // locks each read onto its own length-allele track and stops short-allele
+    // reads drifting onto the longer allele's extra units. So diagonal-skip is
+    // disabled for single-allele consensus (accuracy) and kept for multi-allele
+    // (allele separation). See design/vntr_overcall_delete_edge_visibility.md.
+    let diag_skip_disabled = !cfg.multi_allele;
+
     // j position of each bubble's entry node's predecessors — filled dynamically.
     let mut bubble_entry_j = vec![0usize; n];
 
@@ -1443,7 +1457,7 @@ fn align(
             NODE_COUNTER.with(|c| c.set(c.get() + 1));
         }
 
-        if !is_source && on_spine[node_idx] {
+        if !is_source && on_spine[node_idx] && !diag_skip_disabled {
             if let Some(prev_sp) = spine_prev[node_idx] {
                 // Relaxed in-edge check: fast for the common single-predecessor case;
                 // falls through to a loop only when there are extra predecessors that
@@ -2845,6 +2859,80 @@ fn heaviest_path(
     path
 }
 
+/// abPOA-style greedy heaviest bundling for consensus path selection.
+///
+/// At each node (processed in reverse topological order) pick the single
+/// heaviest outgoing option -- an ordinary out-edge (scored on `matched`) or a
+/// deletion bypass edge (scored on its weight) -- tie-broken by the downstream
+/// `score`; `score[t] = max_w + score[max_child]`. Then walk the `max_child`
+/// chain forward from the source.
+///
+/// This deliberately does NOT use the cumulative `(weight-1)` longest-weighted
+/// path of [`heaviest_path`] (still used for the alignment-centering spine
+/// cache). That normalization carries a length bias -- every extra node whose
+/// in/out edges each clear weight 2 adds positive cumulative score -- so in a
+/// periodic locus the longest path threads through phantom repeat-unit nodes
+/// and over-calls the length. The greedy max-out-edge chain has no such reward
+/// and stays on the modal path. See
+/// `design/vntr_overcall_delete_edge_visibility.md`.
+fn greedy_heaviest_walk(
+    nodes: &[Node],
+    topo: &[usize],
+    rank_of: &[usize],
+    bypass_edges: &HashMap<usize, Vec<(usize, i32)>>,
+) -> Vec<(usize, u8, i32)> {
+    let n = topo.len();
+    let mut score = vec![0i64; n];
+    let mut max_child = vec![usize::MAX; n];
+    let mut chosen_w = vec![0i32; n];
+    for t in (0..n).rev() {
+        let node_idx = topo[t];
+        let out_candidates = nodes[node_idx]
+            .out_edges
+            .iter()
+            .map(|&(succ, ew)| (rank_of[succ], ew.matched));
+        let bypass_candidates = bypass_edges
+            .get(&node_idx)
+            .into_iter()
+            .flatten()
+            .map(|&(succ, w)| (rank_of[succ], w));
+        let mut best: Option<(i32, usize)> = None; // (weight, child_rank)
+        for (child_t, w) in out_candidates.chain(bypass_candidates) {
+            let better = match best {
+                None => true,
+                Some((bw, bc)) => w > bw || (w == bw && score[child_t] > score[bc]),
+            };
+            if better {
+                best = Some((w, child_t));
+            }
+        }
+        if let Some((w, child_t)) = best {
+            score[t] = w as i64 + score[child_t];
+            max_child[t] = child_t;
+            chosen_w[t] = w;
+        }
+    }
+    // Source = the node with no in-edges (seed start); fall back to topo[0].
+    let src_t = (0..n)
+        .find(|&t| nodes[topo[t]].in_edges.is_empty())
+        .unwrap_or(0);
+    let mut path = Vec::new();
+    let mut t = src_t;
+    // Report the INCOMING edge weight per node (matching `heaviest_path`'s
+    // convention). The source has no incoming edge, so use its coverage.
+    let mut incoming_w = nodes[topo[src_t]].coverage as i32;
+    loop {
+        let node_idx = topo[t];
+        path.push((node_idx, nodes[node_idx].base, incoming_w));
+        if max_child[t] == usize::MAX {
+            break;
+        }
+        incoming_w = chosen_w[t];
+        t = max_child[t];
+    }
+    path
+}
+
 // ─── Majority-frequency consensus ────────────────────────────────────────────
 
 fn majority_frequency(nodes: &[Node], topo: &[usize], min_cov: u32) -> Vec<(usize, u8, i32)> {
@@ -4088,7 +4176,12 @@ impl PoaGraph {
 
         let filtered: Vec<(usize, u8, i32)> = match self.config.consensus_mode {
             ConsensusMode::HeaviestPath => {
-                let path = heaviest_path(&self.nodes, &topo, &rank_of, &self.bypass_edges);
+                // Consensus path selection uses greedy heaviest bundling
+                // (abPOA-style), NOT the length-biased `(weight-1)` longest path
+                // (`heaviest_path`, kept for the alignment-centering spine
+                // cache): the length bias over-calls periodic repeats. See
+                // design/vntr_overcall_delete_edge_visibility.md.
+                let path = greedy_heaviest_walk(&self.nodes, &topo, &rank_of, &self.bypass_edges);
 
                 // Boundary trim: find the first/last node whose Match
                 // coverage clears an absolute population floor. This has
@@ -4645,7 +4738,16 @@ impl PoaGraph {
             }
             let seed_slot = choose_seed(group, &self.reads);
             let seed = &self.reads[group[seed_slot]];
-            let mut sub = PoaGraph::new(seed, self.config.clone())?;
+            // Per-allele consensus is a SINGLE-allele problem: the reads have
+            // already been partitioned to one allele, so build the sub-graph in
+            // single-allele mode (diagonal-skip disabled). Multi-allele mode's
+            // diagonal-skip is needed only for the *separation* on the shared
+            // graph (keeping reads on their allele track); within a partitioned
+            // group its greedy forward-match reintroduces the periodic over/
+            // under-call. See PoaConfig::multi_allele.
+            let mut sub_cfg = self.config.clone();
+            sub_cfg.multi_allele = false;
+            let mut sub = PoaGraph::new(seed, sub_cfg)?;
             for (slot, &read_idx) in group.iter().enumerate() {
                 if slot == seed_slot {
                     continue;
@@ -5119,7 +5221,16 @@ mod bypass_edge_tests {
 
     #[test]
     fn deletion_run_spanning_a_preexisting_fork() {
-        let mut g = PoaGraph::new(&b(SEED), cfg_global_unbanded()).unwrap();
+        // Build in multi-allele mode so the diagonal-skip fast path is active
+        // (it is disabled for single-allele; see PoaConfig::multi_allele). The
+        // exact equal-cost placement of a fork-spanning deletion run depends on
+        // it: with diag-skip the run attaches at 5->9 (this test's scenario);
+        // in single-allele mode the full DP picks the equal-cost 4->8. Either
+        // way it is ONE consolidated bypass of weight 2 -- the property under
+        // test. Pinned to the diag-skip alignment for a stable fork-spanning case.
+        let mut cfg = cfg_global_unbanded();
+        cfg.multi_allele = true;
+        let mut g = PoaGraph::new(&b(SEED), cfg).unwrap();
 
         // First, an insertion read that gives node 7 ('T') a second out-edge
         // (to the first inserted node), making it a genuine fork. This read
