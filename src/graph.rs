@@ -177,6 +177,43 @@ fn edge_weight(nodes: &[Node], from: usize, to: usize) -> i32 {
         .unwrap_or(0)
 }
 
+/// abPOA-style log-odds path score for the edge `from -> to`, added into the
+/// alignment DP recurrence to break the scoring degeneracy in homogeneous
+/// repeats: matching a base to a phase-shifted repeat node scores identically
+/// (+match) to the correct node, so the aligner can fold a read onto the wrong
+/// unit. This adds `round(log(edge_weight / predecessor_total_out_weight))` --
+/// the log of the fraction of reads that took this exact edge -- to every
+/// transition across it. It is <= 0: the modal (fully-supported) edge gets ~0,
+/// a minority/phase-shifted edge gets a negative penalty (clamped at -20), so a
+/// read prefers the well-supported diagonal. Normalising by the predecessor's
+/// outflow (not raw weight) keeps the term from scaling with depth and swamping
+/// the +-1 substitution score. Mirrors abPOA `abpoa_get_incre_path_score`.
+///
+/// Scores on `matched` weight (real base support), not `total()`: delete
+/// traffic through a node is not evidence that a base belongs on this diagonal.
+#[inline]
+fn incre_path_score(nodes: &[Node], from: usize, to: usize) -> i32 {
+    let edge_w = nodes[from]
+        .out_edges
+        .iter()
+        .find(|&&(t, _)| t == to)
+        .map(|&(_, ew)| ew.matched)
+        .unwrap_or(0);
+    if edge_w <= 0 {
+        return 0;
+    }
+    let node_w: i32 = nodes[from]
+        .out_edges
+        .iter()
+        .map(|&(_, ew)| ew.matched)
+        .sum();
+    if node_w <= 0 {
+        return 0;
+    }
+    let s = (edge_w as f64 / node_w as f64).ln().round() as i32;
+    s.max(-20)
+}
+
 #[inline]
 fn safe_add(a: i32, b: i32) -> i32 {
     if a == UNSET {
@@ -1303,6 +1340,10 @@ fn align(
     // disabled for single-allele consensus (accuracy) and kept for multi-allele
     // (allele separation). See design/vntr_overcall_delete_edge_visibility.md.
     let diag_skip_disabled = !cfg.multi_allele;
+    // abPOA-style log-odds read-support term in the DP recurrence. Single-allele
+    // only: biasing toward the heaviest existing arm would corrupt multi-allele
+    // bubble phasing. See PoaConfig::path_score_bias.
+    let path_score_on = cfg.path_score_bias && !cfg.multi_allele;
 
     // j position of each bubble's entry node's predecessors — filled dynamically.
     let mut bubble_entry_j = vec![0usize; n];
@@ -1641,7 +1682,16 @@ fn align(
                 for &p in &nodes[node_idx].in_edges {
                     let pt = rank_of[p];
                     let ew = edge_weight(nodes, p, node_idx);
-                    let vm = safe_add(gs(&m, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width), sc);
+                    let ps = if path_score_on {
+                        incre_path_score(nodes, p, node_idx)
+                    } else {
+                        0
+                    };
+                    let sc_ps = safe_add(sc, ps);
+                    let vm = safe_add(
+                        gs(&m, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width),
+                        sc_ps,
+                    );
                     if vm != UNSET && (vm > best || (vm == best && ew > best_edge_w)) {
                         best = vm;
                         best_pred = pt as u32;
@@ -1649,7 +1699,7 @@ fn align(
                     }
                     let vi = safe_add(
                         gs(&ins, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width),
-                        sc,
+                        sc_ps,
                     );
                     if vi != UNSET && (vi > best || (vi == best && ew > best_edge_w)) {
                         best = vi;
@@ -1666,7 +1716,7 @@ fn align(
                             j_hi_arr[pt],
                             row_width,
                         ),
-                        sc,
+                        sc_ps,
                     );
                     if vd != UNSET && (vd > best || (vd == best && ew > best_edge_w)) {
                         best = vd;
@@ -1727,9 +1777,14 @@ fn align(
                 for &p in &nodes[node_idx].in_edges {
                     let pt = rank_of[p];
                     let ew = edge_weight(nodes, p, node_idx);
+                    let ps = if path_score_on {
+                        incre_path_score(nodes, p, node_idx)
+                    } else {
+                        0
+                    };
                     let vm = safe_add(
                         gs(&m, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
-                        go + ge,
+                        safe_add(go + ge, ps),
                     );
                     if vm != UNSET && (vm > best || (vm == best && ew > best_edge_w)) {
                         best = vm;
@@ -1738,7 +1793,7 @@ fn align(
                     }
                     let vi = safe_add(
                         gs(&ins, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
-                        go + ge,
+                        safe_add(go + ge, ps),
                     );
                     if vi != UNSET && (vi > best || (vi == best && ew > best_edge_w)) {
                         best = vi;
@@ -1747,7 +1802,7 @@ fn align(
                     }
                     let vd = safe_add(
                         gsd(&del, &del0, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
-                        ge,
+                        safe_add(ge, ps),
                     );
                     if vd != UNSET && (vd > best || (vd == best && ew > best_edge_w)) {
                         best = vd;

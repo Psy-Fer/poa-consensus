@@ -342,6 +342,7 @@ pub mod error;
 pub mod flank;
 pub mod graph;
 pub mod orient;
+pub mod poa2;
 pub mod seed;
 pub mod types;
 
@@ -607,7 +608,29 @@ pub fn consensus(
     config: &PoaConfig,
 ) -> Result<Consensus, PoaError> {
     validate(reads, seed_idx)?;
-    build_graph(reads, seed_idx, config.clone(), false)?.consensus()
+    if reads.len() < config.min_reads {
+        return Err(PoaError::InsufficientDepth {
+            got: reads.len(),
+            min: config.min_reads,
+        });
+    }
+    // Cutover Step 2: single-allele consensus now runs on the clean engine
+    // (poa2). The clean engine is seed-robust, so it picks its own backbone --
+    // the MEDIAN-length read -- rather than trusting the caller's `seed_idx`
+    // hint (a length-outlier seed would bias a periodic repeat toward that
+    // outlier's length; median avoids it). `seed_idx` is still validated for
+    // bounds above, preserving the error contract.
+    let _ = seed_idx;
+    let mut order: Vec<usize> = (0..reads.len()).collect();
+    order.sort_by_key(|&i| reads[i].len());
+    let med = order[order.len() / 2];
+    let mut g = crate::poa2::Poa::new(reads[med], config.clone());
+    for (i, r) in reads.iter().enumerate() {
+        if i != med {
+            g.add_read(r);
+        }
+    }
+    Ok(g.consensus_full())
 }
 
 /// Build a multi-allele consensus from `reads`.
@@ -620,6 +643,16 @@ pub fn consensus_multi(
     config: &PoaConfig,
 ) -> Result<Vec<Consensus>, PoaError> {
     validate(reads, seed_idx)?;
+    // Multi-allele runs on the LEGACY graph engine. A poa2-native multi-allele
+    // was attempted (see crate::poa2::consensus_multi, kept as WIP) but does not
+    // reach legacy's real-data parity: poa2's node-fusion folds periodic repeats
+    // so a shorter allele's length difference smears across many equal-length
+    // phase bubbles, and every phasing signal tried (structural-only,
+    // all-bubbles, length-refinement) regresses a different subset of the real
+    // HiFi multi scenarios (multi_gaa30_100 / multi_skew_cag20_40 /
+    // multi_cag20_50). Matching legacy — itself the product of two documented
+    // investigation rounds — needs flanking-anchor pre-processing, a separate
+    // effort. Single-allele is fully on poa2; multi stays on legacy until then.
     let mut alleles = build_graph(reads, seed_idx, config.clone(), true)?.consensus_multi()?;
     remap_read_indices_to_input(&mut alleles, seed_idx, reads.len());
     Ok(alleles)
