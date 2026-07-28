@@ -117,6 +117,29 @@ poa-consensus reads.fa --no-adaptive-band # disable adaptive band (on by default
 poa-consensus reads.fa --quiet            # suppress warnings; errors always printed
 ```
 
+The full `PoaConfig` surface and the diagnostic thresholds are exposed as
+flags, grouped in `--help` under **Band**, **Scoring**, **Coverage / consensus**,
+**Alignment**, **Multi-allele**, and **Diagnostics**. Defaults match the library
+defaults, so plain `poa-consensus reads.fa` is unchanged. Examples:
+
+```
+# Scoring and band tuning
+poa-consensus reads.fa --match 2 --mismatch -2 --gap-open -3 --gap-extend -1
+poa-consensus reads.fa --band-width 100 --adaptive-band-b 12 --adaptive-band-f 0.02
+
+# Coverage / consensus
+poa-consensus reads.fa --min-reads 5 --min-coverage-fraction 0.6
+poa-consensus reads.fa --consensus-mode majority        # heaviest (default) | majority
+
+# Multi-allele (raise min-allele-freq on noisy ONT data)
+poa-consensus reads.fa --multi --min-allele-freq 0.4 --phasing-bubble-min-span 8
+
+# Diagnostics thresholds
+poa-consensus reads.fa --depth-warn-threshold 15 --truncation-ratio-threshold 0.5
+
+poa-consensus --help                                     # full grouped list
+```
+
 ## Feature flags
 
 | Flag   | Adds                                       |

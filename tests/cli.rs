@@ -269,3 +269,75 @@ fn cli_bad_format_exits_nonzero() {
     let out = child.wait_with_output().expect("wait");
     assert!(!out.status.success());
 }
+
+// ── new config flags (task #4: full config surface) ───────────────────────────
+
+#[test]
+fn cli_help_lists_grouped_config() {
+    build_cli();
+    let out = poa_bin().arg("--help").output().expect("run --help");
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "Band:",
+        "Scoring:",
+        "Multi-allele:",
+        "Diagnostics:",
+        "--match",
+        "--gap-open",
+        "--consensus-mode",
+        "--min-allele-freq",
+        "--truncation-ratio-threshold",
+    ] {
+        assert!(help.contains(needle), "--help missing {needle:?}");
+    }
+}
+
+#[test]
+fn cli_custom_scoring_and_mode_runs() {
+    build_cli();
+    // Negative scoring values must parse (allow_negative_numbers), and the
+    // alternate consensus mode must run and still produce a consensus record.
+    let out = poa_bin()
+        .args([
+            "--match",
+            "2",
+            "--mismatch",
+            "-2",
+            "--gap-open",
+            "-3",
+            "--gap-extend",
+            "-1",
+            "--consensus-mode",
+            "majority",
+            "--min-coverage-fraction",
+            "0.5",
+        ])
+        .arg(fixture("simple.fa"))
+        .output()
+        .expect("run with custom scoring");
+    assert!(out.status.success(), "exit: {}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(">consensus"),
+        "no consensus record: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| !l.starts_with('>') && !l.is_empty()),
+        "empty consensus sequence"
+    );
+}
+
+#[test]
+fn cli_invalid_consensus_mode_exits_nonzero() {
+    build_cli();
+    let out = poa_bin()
+        .args(["--consensus-mode", "bogus"])
+        .arg(fixture("simple.fa"))
+        .output()
+        .expect("run with bad mode");
+    assert!(
+        !out.status.success(),
+        "expected failure for invalid --consensus-mode"
+    );
+}

@@ -1,12 +1,31 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::process;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use poa_consensus::{
-    AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, SeedSelection, auto_orient, diagnose,
-    select_seed,
+    AlignmentMode, ConsensusMode, DiagnoseConfig, PoaConfig, PoaError, SeedSelection, auto_orient,
+    diagnose, select_seed,
 };
+
+/// Consensus extraction mode, mirrored from [`ConsensusMode`] for the CLI.
+#[derive(Clone, Copy, ValueEnum)]
+enum ConsensusModeArg {
+    /// Heaviest-path (edge-weight) traversal. Best default for STR/VNTR data.
+    Heaviest,
+    /// Most-frequent-base per column (MSA majority). Better for near-equal-length
+    /// HiFi read sets; counts Delete traversals explicitly.
+    Majority,
+}
+
+impl From<ConsensusModeArg> for ConsensusMode {
+    fn from(m: ConsensusModeArg) -> Self {
+        match m {
+            ConsensusModeArg::Heaviest => ConsensusMode::HeaviestPath,
+            ConsensusModeArg::Majority => ConsensusMode::MajorityFrequency,
+        }
+    }
+}
 
 /// Build a consensus sequence from FASTA or FASTQ reads using Partial Order
 /// Alignment.
@@ -15,7 +34,7 @@ use poa_consensus::{
 /// seed is chosen automatically via a terminal k-mer anchor heuristic (see
 /// `SeedSelection::Auto`); override with --seed.
 #[derive(Parser)]
-#[command(name = "poa-consensus", version)]
+#[command(name = "poa-consensus", version, allow_negative_numbers = true)]
 struct Args {
     /// Input FASTA or FASTQ file. Use '-' for stdin.
     #[arg(default_value = "-")]
@@ -23,40 +42,135 @@ struct Args {
 
     /// Seed read index (0-based). Defaults to an automatically chosen seed
     /// (terminal k-mer anchor heuristic; falls back to the longest read).
+    /// Note: the single-allele path re-seeds on the median-length read
+    /// internally, so --seed only affects seed validation and multi-allele.
     #[arg(short, long)]
     seed: Option<usize>,
-
-    /// Fixed band width floor for banded DP (0 = unbanded).  Combined with
-    /// adaptive band (default on), effective width is max(band_width, adaptive
-    /// formula).  Set to 0 with --no-adaptive-band for fully unbanded DP.
-    #[arg(short = 'b', long, default_value_t = 50)]
-    band_width: usize,
-
-    /// Disable adaptive band width.  Adaptive band (default on) uses the
-    /// formula w = 10 + 0.01 × read_len as a floor alongside --band-width.
-    #[arg(long)]
-    no_adaptive_band: bool,
-
-    /// Minimum reads required to attempt consensus.
-    #[arg(long, default_value_t = 3)]
-    min_reads: usize,
 
     /// Multi-allele mode: output one FASTA record per detected allele.
     #[arg(short = 'm', long)]
     multi: bool,
-
-    /// Global alignment: penalise terminal gaps (use when reads are guaranteed
-    /// to span the full locus from identical start/end positions).  The default
-    /// is semi-global (free terminal gaps), which is correct for extracted STR
-    /// reads that may start or end at slightly different positions.
-    #[arg(long)]
-    global: bool,
 
     /// Suppress all warnings and notes on stderr.  The consensus sequence is
     /// still written to stdout.  Errors that prevent consensus building are
     /// always printed regardless of this flag.
     #[arg(short = 'q', long)]
     quiet: bool,
+
+    // ── Band ──────────────────────────────────────────────────────────────────
+    /// Fixed band width floor for banded DP (0 = unbanded).  Combined with
+    /// adaptive band (default on), effective width is max(band_width, adaptive
+    /// formula).  Set to 0 with --no-adaptive-band for fully unbanded DP.
+    #[arg(short = 'b', long, default_value_t = 50, help_heading = "Band")]
+    band_width: usize,
+
+    /// Disable adaptive band width.  Adaptive band (default on) uses the
+    /// formula w = b + f × read_len as a floor alongside --band-width.
+    #[arg(long, help_heading = "Band")]
+    no_adaptive_band: bool,
+
+    /// Adaptive band base component `b` in w = b + f × read_len (abPOA default).
+    #[arg(long, default_value_t = 10, help_heading = "Band")]
+    adaptive_band_b: usize,
+
+    /// Adaptive band length-proportional component `f` in w = b + f × read_len.
+    #[arg(long, default_value_t = 0.01, help_heading = "Band")]
+    adaptive_band_f: f32,
+
+    // ── Scoring ───────────────────────────────────────────────────────────────
+    /// Match score (positive).
+    #[arg(
+        long = "match",
+        value_name = "SCORE",
+        default_value_t = 1,
+        help_heading = "Scoring"
+    )]
+    match_score: i32,
+
+    /// Mismatch score (negative).
+    #[arg(long = "mismatch", value_name = "SCORE", default_value_t = -1, help_heading = "Scoring")]
+    mismatch_score: i32,
+
+    /// Gap-open penalty (negative; charged once when a gap opens).
+    #[arg(long, value_name = "PENALTY", default_value_t = -2, help_heading = "Scoring")]
+    gap_open: i32,
+
+    /// Gap-extend penalty (negative; per base inside a gap).
+    #[arg(long, value_name = "PENALTY", default_value_t = -1, help_heading = "Scoring")]
+    gap_extend: i32,
+
+    /// Disable the abPOA-style read-support (path-score) bias.  On by default:
+    /// it biases alignment toward well-supported diagonals so homogeneous VNTRs
+    /// don't fabricate phantom bases at the repeat boundary.  Affects the legacy
+    /// multi-allele path (single-allele runs on the clean engine, which does not
+    /// use it).
+    #[arg(long, help_heading = "Scoring")]
+    no_path_score_bias: bool,
+
+    // ── Coverage / consensus ──────────────────────────────────────────────────
+    /// Minimum reads required to attempt consensus.
+    #[arg(long, default_value_t = 3, help_heading = "Coverage / consensus")]
+    min_reads: usize,
+
+    /// Fraction of reads that must cover a node for it to appear in the
+    /// consensus.  0 uses the strict-majority default (n/2 + 1).max(2).
+    #[arg(long, default_value_t = 0.0, help_heading = "Coverage / consensus")]
+    min_coverage_fraction: f64,
+
+    /// Consensus extraction mode.
+    #[arg(long, value_enum, default_value_t = ConsensusModeArg::Heaviest, help_heading = "Coverage / consensus")]
+    consensus_mode: ConsensusModeArg,
+
+    // ── Alignment ─────────────────────────────────────────────────────────────
+    /// Global alignment: penalise terminal gaps (use when reads are guaranteed
+    /// to span the full locus from identical start/end positions).  The default
+    /// is semi-global (free terminal gaps), which is correct for extracted STR
+    /// reads that may start or end at slightly different positions.
+    #[arg(long, help_heading = "Alignment")]
+    global: bool,
+
+    // ── Multi-allele ──────────────────────────────────────────────────────────
+    /// Minimum fraction of reads supporting a bubble arm for it to count as an
+    /// allele candidate.  Raise to ~0.40 on noisy ONT data to avoid spurious
+    /// second-allele calls.
+    #[arg(long, default_value_t = 0.2, help_heading = "Multi-allele")]
+    min_allele_freq: f64,
+
+    /// Minimum arm span (nodes) for a bubble to count as a structural variant
+    /// for cross-bubble phasing; below this uses single-bubble (SNP) partitioning.
+    #[arg(long, default_value_t = 10, help_heading = "Multi-allele")]
+    phasing_bubble_min_span: usize,
+
+    // ── Diagnostics ───────────────────────────────────────────────────────────
+    /// Suppress the long-read unbanded warning (reads > ~1 kb with band 0).
+    #[arg(long, help_heading = "Diagnostics")]
+    no_long_unbanded_warning: bool,
+
+    /// Read count below which a depth warning is emitted.
+    #[arg(long, default_value_t = 10, help_heading = "Diagnostics")]
+    depth_warn_threshold: usize,
+
+    /// Read count below which the depth warning is marked critical.
+    #[arg(long, default_value_t = 5, help_heading = "Diagnostics")]
+    depth_critical_threshold: usize,
+
+    /// Per-allele depth warning threshold (multi-allele mode).
+    #[arg(long, default_value_t = 15, help_heading = "Diagnostics")]
+    depth_allele_threshold: usize,
+
+    /// Weight-fraction below which an interior-support warning fires.
+    #[arg(long, default_value_t = 0.15, help_heading = "Diagnostics")]
+    interior_support_threshold: f32,
+
+    /// Fraction of the consensus skipped from each end when checking interior
+    /// support (the middle 1 - 2×margin is checked).
+    #[arg(long, default_value_t = 0.20, help_heading = "Diagnostics")]
+    boundary_margin: f32,
+
+    /// consensus_len / median_read_len ratio below which a truncation warning
+    /// fires.  0 disables the check.
+    #[arg(long, default_value_t = 0.6, help_heading = "Diagnostics")]
+    truncation_ratio_threshold: f32,
 }
 
 fn main() {
@@ -124,18 +238,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = PoaConfig {
         band_width: args.band_width,
         adaptive_band,
+        adaptive_band_b: args.adaptive_band_b,
+        adaptive_band_f: args.adaptive_band_f,
+        match_score: args.match_score,
+        mismatch_score: args.mismatch_score,
+        gap_open: args.gap_open,
+        gap_extend: args.gap_extend,
+        min_coverage_fraction: args.min_coverage_fraction,
+        min_allele_freq: args.min_allele_freq,
         min_reads: args.min_reads,
         alignment_mode: if args.global {
             AlignmentMode::Global
         } else {
             AlignmentMode::SemiGlobal
         },
+        consensus_mode: args.consensus_mode.into(),
+        warn_on_long_unbanded: !args.no_long_unbanded_warning,
+        phasing_bubble_min_span: args.phasing_bubble_min_span,
         // Bias alignment toward well-supported diagonals so homogeneous VNTRs
         // don't fabricate phantom bases at the repeat boundary (Known Bug #3).
-        // No-op on the multi-allele phasing graph (gated to single-allele in
-        // align()); the per-allele sub-consensuses still benefit.
-        path_score_bias: true,
+        // On by default; affects the legacy multi-allele path (single-allele
+        // runs on the clean poa2 engine, which does not read this flag).
+        path_score_bias: !args.no_path_score_bias,
+        // multi_allele is managed by the library (consensus_multi sets it true);
+        // the CLI's --multi selects the code path rather than setting this.
         ..PoaConfig::default()
+    };
+
+    // Diagnostic thresholds shared by both the single- and multi-allele paths.
+    // `is_allele_partition` is flipped on per allele in the multi branch.
+    let diag_cfg = DiagnoseConfig {
+        depth_warn_threshold: args.depth_warn_threshold,
+        depth_critical_threshold: args.depth_critical_threshold,
+        depth_allele_threshold: args.depth_allele_threshold,
+        interior_support_threshold: args.interior_support_threshold,
+        boundary_margin: args.boundary_margin,
+        truncation_ratio_threshold: args.truncation_ratio_threshold,
+        is_allele_partition: false,
     };
 
     let band_desc = if adaptive_band {
@@ -157,7 +296,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let total = alleles.len();
         let allele_cfg = DiagnoseConfig {
             is_allele_partition: true,
-            ..DiagnoseConfig::default()
+            ..diag_cfg.clone()
         };
         for (i, allele) in alleles.iter().enumerate() {
             if !args.quiet {
@@ -194,7 +333,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         order.sort_by_key(|&i| slices[i].len());
         let med = order[order.len() / 2];
         if !args.quiet {
-            emit_warnings(&diagnose(&result, &DiagnoseConfig::default()), "consensus");
+            emit_warnings(&diagnose(&result, &diag_cfg), "consensus");
         }
         writeln!(out, ">consensus reads={n} seed={med} band={band_desc}")?;
         out.write_all(&result.sequence)?;
