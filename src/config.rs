@@ -61,6 +61,26 @@ pub struct PoaConfig {
     /// [`PoaGraph::new`]: crate::PoaGraph::new
     /// [`PoaGraph::consensus_multi`]: crate::PoaGraph::consensus_multi
     pub multi_allele: bool,
+    /// Add an abPOA-style log-odds **read-support term** to the alignment DP.
+    ///
+    /// In a homogeneous tandem repeat, matching a base to a phase-shifted repeat
+    /// node scores identically (`+match_score`) to matching the correct node, so
+    /// the aligner can silently fold a read onto the wrong repeat unit and
+    /// fabricate a phantom base at the flank/repeat boundary (Known Bug #3; see
+    /// `design/flank_fabrication_bug3.md`). This is a *scoring degeneracy*, and
+    /// no band width or centering fixes it. When enabled, every DP transition
+    /// across an edge `p -> n` is biased by
+    /// `round(log(edge_matched_weight / total_out_matched_weight(p)))` -- the log
+    /// of the fraction of reads that took that edge, `<= 0`, clamped at `-20` --
+    /// so a read prefers the well-supported (modal) diagonal on a tie. Mirrors
+    /// abPOA's `--inc-path-score` / `-G` option.
+    ///
+    /// Only takes effect on the **single-allele** path (`multi_allele == false`):
+    /// biasing alignment toward the heaviest existing arm would corrupt
+    /// multi-allele bubble phasing. Off by default (like abPOA's `-G`); the CLI
+    /// enables it for its single-allele consensus path. Costs a `ln()` per DP
+    /// transition, so it is opt-in.
+    pub path_score_bias: bool,
 }
 
 impl Default for PoaConfig {
@@ -82,6 +102,7 @@ impl Default for PoaConfig {
             warn_on_long_unbanded: true,
             phasing_bubble_min_span: 10,
             multi_allele: false,
+            path_score_bias: false,
         }
     }
 }

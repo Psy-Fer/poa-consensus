@@ -4,8 +4,8 @@ use std::process;
 use clap::Parser;
 
 use poa_consensus::{
-    AdaptiveAction, AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, SeedSelection, auto_orient,
-    consensus_fit_scored, diagnose, select_seed,
+    AlignmentMode, DiagnoseConfig, PoaConfig, PoaError, SeedSelection, auto_orient, diagnose,
+    select_seed,
 };
 
 /// Build a consensus sequence from FASTA or FASTQ reads using Partial Order
@@ -130,6 +130,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             AlignmentMode::SemiGlobal
         },
+        // Bias alignment toward well-supported diagonals so homogeneous VNTRs
+        // don't fabricate phantom bases at the repeat boundary (Known Bug #3).
+        // No-op on the multi-allele phasing graph (gated to single-allele in
+        // align()); the per-allele sub-consensuses still benefit.
+        path_score_bias: true,
         ..PoaConfig::default()
     };
 
@@ -173,75 +178,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(out)?;
         }
     } else {
-        // Single-allele path with seed-sensitivity retry, then truncation retry.
-        //
-        // Pass 1 goes through `consensus_fit_scored` rather than the plain
-        // `consensus()`: when the pass-1 graph looks noisy/fragmented
-        // (`single_support_fraction > 0.3` -- common on genuinely repetitive
-        // loci, not just broken ones), it builds a few candidate remedies
-        // (tightened coverage floor, a different seed near the read
-        // population's median length, MajorityFrequency mode) and empirically
-        // scores each against the actual reads, keeping whichever fits best
-        // (see `consensus_fit_scored`'s doc comment for the full mechanism and
-        // validated limitations -- it is not a complete fix). Otherwise it is
-        // exactly equivalent to `consensus()`.
-        //
-        // After that, `diagnose()` checks whether the result is suspiciously
-        // short relative to the median input read length (ratio <
-        // DiagnoseConfig::truncation_ratio_threshold, default 0.60).  When that
-        // fires AND banded DP was used AND median_read_len <= 5000 bp, rebuild
-        // with band_width = 0.  Unbanded forces the traceback to the correct
-        // graph endpoint, recovering from the wrong-diagonal failure mode. This
-        // targets a different, more severe failure mode (catastrophic band
-        // truncation) than the seed-sensitivity retry above (a few missing
-        // repeat units), so both stay in place independently.
-        //
-        // Note: consensus_adaptive is intentionally NOT used here.  That function
-        // also checks for multi-allele bubbles, which can fire on het SNPs in
-        // non-repetitive controls and produce unexpected results in a caller that
-        // expects single-allele output.  `consensus_fit_scored` is the standalone
-        // entry point that gives the seed-sensitivity retry without that.
-        let was_banded = config.band_width > 0 || config.adaptive_band;
-        let fit_scored = consensus_fit_scored(&slices, seed_idx, &config)
+        // Single-allele: the clean poa2 engine (via `consensus()`). It seeds on
+        // the median-length read (seed-robust; avoids the legacy short-seed
+        // under-call), and node fusion + the static-diagonal-union band prevent
+        // the repeat "fold" at construction time. That construction-level
+        // correctness is what retired the legacy workarounds this branch used to
+        // carry -- the seed-sensitivity retry (`consensus_fit_scored`), the
+        // banded-truncation unbanded-rebuild retry, and the interior filter --
+        // none of which the clean engine needs.
+        let result = poa_consensus::consensus(&slices, seed_idx, &config)
             .inspect_err(|e| explain_error(e, n))?;
-        if !args.quiet {
-            match fit_scored.action {
-                AdaptiveAction::PassThrough => {}
-                ref a => eprintln!(
-                    "poa-consensus: note: consensus looked noisy (fragmented graph evidence); \
-                     seed-sensitivity retry chose an alternate rebuild ({a:?})"
-                ),
-            }
-        }
-        let mut result = fit_scored.consensuses.into_iter().next().expect(
-            "consensus_fit_scored always returns exactly one consensus in single-allele mode",
-        );
-        if was_banded {
-            let diag = diagnose(&result, &DiagnoseConfig::default());
-            if let Some(ref t) = diag.truncation_suspected {
-                if t.median_read_len <= 5_000 {
-                    let mut cfg2 = config.clone();
-                    cfg2.band_width = 0;
-                    cfg2.adaptive_band = false;
-                    if let Ok(r2) = poa_consensus::consensus(&slices, seed_idx, &cfg2) {
-                        result = r2;
-                    }
-                } else if !args.quiet {
-                    eprintln!(
-                        "poa-consensus: warning: consensus ({} bp) is {:.0}% of median \
-                         read length ({} bp) — suspected banded DP truncation on a long \
-                         read set; retry with --band-width 0 to correct",
-                        t.consensus_len,
-                        t.ratio * 100.0,
-                        t.median_read_len,
-                    );
-                }
-            }
-        }
+        // `consensus()` picks the median-length read as seed internally; recompute
+        // it here purely for the informational FASTA header.
+        let mut order: Vec<usize> = (0..slices.len()).collect();
+        order.sort_by_key(|&i| slices[i].len());
+        let med = order[order.len() / 2];
         if !args.quiet {
             emit_warnings(&diagnose(&result, &DiagnoseConfig::default()), "consensus");
         }
-        writeln!(out, ">consensus reads={n} seed={seed_idx} band={band_desc}")?;
+        writeln!(out, ">consensus reads={n} seed={med} band={band_desc}")?;
         out.write_all(&result.sequence)?;
         writeln!(out)?;
     }
