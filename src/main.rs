@@ -217,8 +217,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             let slices: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
-            select_seed(&slices, &SeedSelection::Auto)
-                .inspect_err(|e| explain_error(e, reads.len()))?
+            match select_seed(&slices, &SeedSelection::Auto) {
+                Ok(idx) => idx,
+                // `select_seed`'s terminal-k-mer spanning heuristic is unreliable
+                // at high error / long repeats and can false-positive
+                // `NoSpanningReads` on genuinely-spanning noisy reads. The library
+                // `consensus()` re-seeds on the median-length read internally and
+                // does not require spanning, so rather than refuse output (abPOA
+                // and SPOA both produce a best-effort consensus here), fall back to
+                // the longest read as the orientation seed and warn.
+                Err(e) => {
+                    if !args.quiet {
+                        eprintln!(
+                            "poa-consensus: warning: automatic seed selection was inconclusive \
+                             ({e}); proceeding with the longest read as seed. If reads are truly \
+                             split into non-overlapping left/right groups, use bridged_consensus."
+                        );
+                    }
+                    (0..reads.len())
+                        .max_by_key(|&i| reads[i].len())
+                        .unwrap_or(0)
+                }
+            }
         }
     };
 
