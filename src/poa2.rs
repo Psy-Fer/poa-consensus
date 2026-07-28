@@ -1599,6 +1599,12 @@ fn phasing_floor(n_reads: usize, config: &PoaConfig) -> u32 {
     ((n_reads as f64 * config.min_allele_freq).ceil() as u32).max(2)
 }
 
+/// Minimum median read-length gap (bp) between two groups to accept a LENGTH
+/// split. Above a broad allele's own stutter-bisection spacing (a few bp) but
+/// well below any genuine repeat-count difference (tens of bp). Rejects the
+/// stutter over-split without needing to know the repeat unit size.
+const LINKAGE_MIN_LEN_GAP: f64 = 12.0;
+
 /// Consistency bar for confirming a SAME-LENGTH (substitution) split,
 /// where length gives no signal: a clean haplotype split (even one SNP) is
 /// ~1.0 consistent, error sub-clusters of one allele ~0.7, so this admits the
@@ -1801,7 +1807,14 @@ fn groups_to_consensuses(
 fn groups_distinct(reads: &[&[u8]], gi: &[usize], gj: &[usize], config: &PoaConfig) -> bool {
     let lens_i: Vec<usize> = gi.iter().map(|&r| reads[r].len()).collect();
     let lens_j: Vec<usize> = gj.iter().map(|&r| reads[r].len()).collect();
-    if length_separated(&lens_i, &lens_j) {
+    // Length variant: separated (median gap vs MAD) AND the median gap clears an
+    // absolute floor. The floor rejects a broad stutter spread bisected into
+    // adjacent sub-clusters (a few bp apart) while keeping real alleles, which
+    // differ by many repeat units. (`length_separated` alone is fooled by the
+    // bisection; a pure outlier-gap test is fooled the other way — real alleles'
+    // stutter/partial tails fill the valley on noisy data.)
+    let median_gap = (median_usize(&lens_i) - median_usize(&lens_j)).abs();
+    if length_separated(&lens_i, &lens_j) && median_gap >= LINKAGE_MIN_LEN_GAP {
         return true;
     }
     // Same length: confirm the split against the linkage signal on a pooled graph.
