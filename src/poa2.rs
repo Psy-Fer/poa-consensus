@@ -643,6 +643,239 @@ impl Poa {
             .collect()
     }
 
+    /// Fit score for a candidate consensus: build a throwaway graph seeded on
+    /// `candidate`, align every read to it, and return the mean per-base total of
+    /// Insert + Delete ops (content the candidate doesn't explain / doesn't
+    /// confirm). Lower = better fit; 0.0 = every read matches exactly. Used to
+    /// pick between heaviest-path and majority-frequency candidates per call.
+    fn fit_score(candidate: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> f64 {
+        if candidate.is_empty() {
+            return f64::MAX;
+        }
+        let g = Poa::new(candidate, cfg.clone());
+        let (topo, rank) = g.topo_order();
+        let mut indel = 0usize;
+        let mut bases = 0usize;
+        for r in reads {
+            for op in g.align(r, &topo, &rank) {
+                if matches!(op, Op::Ins(_) | Op::Del(_)) {
+                    indel += 1;
+                }
+            }
+            bases += r.len();
+        }
+        indel as f64 / bases.max(1) as f64
+    }
+
+    /// Best of heaviest-path and majority-frequency, chosen by `fit_score`
+    /// against the reads. The two consensus modes win different cases (heaviest
+    /// on clean/short, majority on high-error length-variable repeats); scoring
+    /// both against the actual reads and keeping the better fit gets the best of
+    /// each without an oracle.
+    pub fn consensus_best_fit(&self, reads: &[&[u8]]) -> Vec<u8> {
+        let hp = self.consensus();
+        let mf = self.consensus_majority();
+        if hp == mf {
+            return hp;
+        }
+        let fh = Self::fit_score(&hp, reads, &self.cfg);
+        let fm = Self::fit_score(&mf, reads, &self.cfg);
+        if fm < fh { mf } else { hp }
+    }
+
+    /// Rich `Consensus` output using the best-fit sequence (heaviest-path vs
+    /// majority-frequency, chosen by `fit_score`). When heaviest-path wins (the
+    /// common case) this is exactly `consensus_full()`. When majority-frequency
+    /// wins, the emitted sequence is the MF one and the per-position fields
+    /// (coverage, path_weights, gaps) are recomputed from the MF columns so the
+    /// output stays self-consistent; graph-structural fields (graph_stats,
+    /// bubble_sites) are unchanged since they describe the graph, not the path.
+    pub fn consensus_full_best_fit(&self, reads: &[&[u8]]) -> crate::types::Consensus {
+        use crate::types::{CoverageGap, GapKind};
+        let base = self.consensus_full();
+        let (mf_seq, mf_cov) = self.consensus_majority_cov();
+        if base.sequence == mf_seq {
+            return base;
+        }
+        let fh = Self::fit_score(&base.sequence, reads, &self.cfg);
+        let fm = Self::fit_score(&mf_seq, reads, &self.cfg);
+        if fh <= fm {
+            return base; // heaviest-path wins (ties keep the path-based output)
+        }
+        // Majority-frequency wins: rebuild per-position fields from MF columns.
+        // path_weights proxy: the incoming support at each base = min of adjacent
+        // column coverages (there is no single node path for an MF consensus).
+        let mut path_weights = Vec::with_capacity(mf_cov.len());
+        for i in 0..mf_cov.len() {
+            let w = if i == 0 {
+                mf_cov[0]
+            } else {
+                mf_cov[i - 1].min(mf_cov[i])
+            };
+            path_weights.push(w as i32);
+        }
+        let mut gaps = Vec::new();
+        let cl = mf_cov.len();
+        let mut i = 0;
+        while i < cl {
+            if mf_cov[i] <= 1 {
+                let s = i;
+                while i < cl && mf_cov[i] <= 1 {
+                    i += 1;
+                }
+                if s > 0 && i < cl {
+                    gaps.push(CoverageGap {
+                        start: s,
+                        end: i,
+                        kind: GapKind::Spanning,
+                    });
+                }
+            } else {
+                i += 1;
+            }
+        }
+        crate::types::Consensus {
+            sequence: mf_seq,
+            coverage: mf_cov,
+            path_weights,
+            n_reads: base.n_reads,
+            graph_stats: base.graph_stats,
+            gaps,
+            bubble_sites: base.bubble_sites,
+            read_indices: vec![],
+        }
+    }
+
+    /// Assign every node an MSA column index (union `aligned` siblings into one
+    /// column, then topologically order the resulting column DAG). Returns
+    /// (node_column, n_columns) or None if the column DAG is not acyclic (falls
+    /// back to heaviest-path in that case).
+    fn msa_columns(&self) -> Option<(Vec<usize>, usize)> {
+        let n = self.nodes.len();
+        // Union-find over aligned siblings.
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        for i in 0..n {
+            for &a in &self.nodes[i].aligned {
+                let (ri, ra) = (find(&mut parent, i), find(&mut parent, a));
+                if ri != ra {
+                    parent[ri] = ra;
+                }
+            }
+        }
+        // Group DAG: edges between column-groups (dedup, drop self-edges).
+        let mut group_out: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut indeg = vec![0usize; n];
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..n {
+            let gi = find(&mut parent, i);
+            for e in &self.nodes[i].out {
+                let gj = find(&mut parent, e.to);
+                if gi != gj && seen.insert((gi, gj)) {
+                    group_out[gi].push(gj);
+                    indeg[gj] += 1;
+                }
+            }
+        }
+        // Kahn on the group roots (a group's representative is its find() root).
+        let roots: Vec<usize> = (0..n).filter(|&i| find(&mut parent, i) == i).collect();
+        let mut stack: Vec<usize> = roots.iter().copied().filter(|&g| indeg[g] == 0).collect();
+        stack.sort_unstable();
+        let mut col_of_group = vec![usize::MAX; n];
+        let mut ncol = 0usize;
+        while let Some(g) = stack.pop() {
+            col_of_group[g] = ncol;
+            ncol += 1;
+            let mut outs = group_out[g].clone();
+            outs.sort_unstable();
+            for gj in outs {
+                indeg[gj] -= 1;
+                if indeg[gj] == 0 {
+                    stack.push(gj);
+                }
+            }
+        }
+        if ncol != roots.len() {
+            return None; // cycle in the column DAG -> unusable
+        }
+        let mut node_col = vec![0usize; n];
+        for (i, nc) in node_col.iter_mut().enumerate() {
+            let g = find(&mut parent, i);
+            *nc = col_of_group[g];
+        }
+        Some((node_col, ncol))
+    }
+
+    /// Most-frequent-base (column-majority MSA) consensus — SPOA/abPOA style.
+    /// Each read votes its base at every column it occupies and a gap at every
+    /// column it skips; a column emits its plurality base only if a real base
+    /// beats the gap count. This counts deletions explicitly (unlike edge-weight
+    /// heaviest-path), so a minority insertion becomes a gap-majority column and
+    /// is correctly dropped -- the mechanism that fixes homopolymer over-call.
+    pub fn consensus_majority(&self) -> Vec<u8> {
+        self.consensus_majority_cov().0
+    }
+
+    /// Majority-frequency consensus plus per-emitted-column coverage (the count
+    /// of reads present at that column). Falls back to heaviest-path (with its
+    /// path coverage) if the column DAG is unusable.
+    fn consensus_majority_cov(&self) -> (Vec<u8>, Vec<u32>) {
+        let (node_col, ncol) = match self.msa_columns() {
+            Some(x) => x,
+            None => {
+                let path = self.heaviest_path_nodes();
+                let seq = path.iter().map(|&nd| self.nodes[nd].base).collect();
+                let cov = path.iter().map(|&nd| self.nodes[nd].cov).collect();
+                return (seq, cov);
+            }
+        };
+        // Per-column base tallies (A,C,G,T) plus present-read count.
+        let mut tally = vec![[0u32; 4]; ncol];
+        let mut present = vec![0u32; ncol];
+        let code = |b: u8| match b {
+            b'A' => 0usize,
+            b'C' => 1,
+            b'G' => 2,
+            _ => 3,
+        };
+        for path in &self.read_paths {
+            // A read occupies each column at most once; guard duplicates.
+            let mut last_col = usize::MAX;
+            for &nd in path {
+                let c = node_col[nd];
+                if c == last_col {
+                    continue;
+                }
+                last_col = c;
+                tally[c][code(self.nodes[nd].base)] += 1;
+                present[c] += 1;
+            }
+        }
+        let bases = [b'A', b'C', b'G', b'T'];
+        let mut out = Vec::with_capacity(ncol);
+        let mut cov = Vec::with_capacity(ncol);
+        // Column index already IS topological order (0..ncol).
+        for c in 0..ncol {
+            let gap = self.n_reads as u32 - present[c].min(self.n_reads as u32);
+            let (bi, &bc) = tally[c]
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &v)| v)
+                .unwrap();
+            if bc > gap {
+                out.push(bases[bi]);
+                cov.push(bc); // reads supporting the emitted base at this column
+            }
+        }
+        (out, cov)
+    }
+
     /// Materialise an arm from `start` until the first reconvergence (2+ in-edges)
     /// or fork or dead end, capped at `cap` bases. Returns (sequence, node_count).
     fn materialize_arm(&self, start: usize, cap: usize) -> (Vec<u8>, usize) {
@@ -1584,6 +1817,36 @@ pub fn linkage_consensus_multi(
     groups_to_consensuses(reads, &groups, config)
 }
 
+/// For each read, align it to a fresh graph seeded on `candidate` and return
+/// its `(n_insert, n_delete)` op counts. Public hook so the analysis layer
+/// (`analysis::consensus_fit`) can score a candidate against reads without
+/// depending on any engine internals.
+pub fn align_indel_counts(
+    candidate: &[u8],
+    reads: &[&[u8]],
+    cfg: &PoaConfig,
+) -> Vec<(usize, usize)> {
+    if candidate.is_empty() {
+        return Vec::new();
+    }
+    let g = Poa::new(candidate, cfg.clone());
+    let (topo, rank) = g.topo_order();
+    reads
+        .iter()
+        .map(|r| {
+            let (mut ins, mut del) = (0usize, 0usize);
+            for op in g.align(r, &topo, &rank) {
+                match op {
+                    Op::Ins(_) => ins += 1,
+                    Op::Del(_) => del += 1,
+                    Op::Match(_) => {}
+                }
+            }
+            (ins, del)
+        })
+        .collect()
+}
+
 /// Max recursion depth (allele count is bounded by 2^depth; 3 covers up to ~8).
 const LINKAGE_MAX_DEPTH: usize = 3;
 /// A read bipartition is only trusted as a real allele split when it is this
@@ -1971,6 +2234,161 @@ mod tests {
         g.add_read(ins);
         // heaviest path should follow the 3-read backbone, not the 1-read insert
         assert_eq!(g.consensus(), base.to_vec());
+    }
+
+    #[test]
+    #[ignore = "probe; run with --ignored --nocapture"]
+    fn probe_homopolymer_dump() {
+        // A homopolymer-bearing repeat (AAAAG = A4 G) where reads carry
+        // per-unit A-run indel error, mimicking the AAAAG over-call. Dump the
+        // graph so we can SEE whether insertion nodes proliferate into parallel
+        // A-nodes vs fuse into a clean column chain.
+        // Load the ACTUAL failing read set + truth from the compare grid.
+        let dir = std::env::var("PROBE_DIR").unwrap_or_else(|_| "/tmp/poa_compare_grid".into());
+        let name = std::env::var("PROBE_CASE").unwrap_or_else(|_| "AAAAG_u60_d20_e8_s1".into());
+        let truth = std::fs::read(format!("{dir}/{name}.truth")).expect("truth file");
+        let fa = std::fs::read_to_string(format!("{dir}/{name}.reads.fa")).expect("reads file");
+        let mut reads: Vec<Vec<u8>> = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        for line in fa.lines() {
+            if line.starts_with('>') {
+                if !cur.is_empty() {
+                    reads.push(std::mem::take(&mut cur));
+                }
+            } else {
+                cur.extend_from_slice(line.trim().as_bytes());
+            }
+        }
+        if !cur.is_empty() {
+            reads.push(cur);
+        }
+        // Median-length seed, matching the CLI.
+        let mut order: Vec<usize> = (0..reads.len()).collect();
+        order.sort_by_key(|&i| reads[i].len());
+        let seed_idx = order[order.len() / 2];
+        let mut g = Poa::new(&reads[seed_idx], cfg());
+        for (i, r) in reads.iter().enumerate() {
+            if i != seed_idx {
+                g.add_read(r);
+            }
+        }
+        let cons = g.consensus();
+        let ed = crate::poa2::tests::lev(&cons, &truth);
+        let mf = g.consensus_majority();
+        let edm = crate::poa2::tests::lev(&mf, &truth);
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        let bf = g.consensus_best_fit(&refs);
+        let edbf = crate::poa2::tests::lev(&bf, &truth);
+        eprintln!(
+            "case {name}: truth {} | heaviest {} edit {ed} | majority {} edit {edm} | bestfit edit {edbf}",
+            truth.len(),
+            cons.len(),
+            mf.len()
+        );
+        // First divergence position (simple prefix scan).
+        let div = cons
+            .iter()
+            .zip(truth.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        eprintln!("first divergence at pos {div}");
+        eprintln!(
+            "  truth[{}..]: {}",
+            div,
+            String::from_utf8_lossy(&truth[div..(div + 40).min(truth.len())])
+        );
+        eprintln!(
+            "  cons [{}..]: {}",
+            div,
+            String::from_utf8_lossy(&cons[div..(div + 40).min(cons.len())])
+        );
+        // Dump the heaviest-path nodes in a window around the divergence, with
+        // their full out-edge fan (to see competing arms the picker chose among).
+        let path = g.heaviest_path_nodes();
+        let lo = div.saturating_sub(6);
+        let hi = (div + 20).min(path.len());
+        eprintln!("heaviest-path nodes [{lo}..{hi}] (base cov del | out-edges):");
+        for (pi, &nd) in path.iter().enumerate().take(hi).skip(lo) {
+            let n = &g.nodes[nd];
+            let outs: Vec<String> = n
+                .out
+                .iter()
+                .map(|e| format!("{}'{}'(w{})", e.to, g.nodes[e.to].base as char, e.weight))
+                .collect();
+            eprintln!(
+                "  p{pi:<3} n{nd:<4} '{}' cov{:<2} del{:<2} -> {}",
+                n.base as char,
+                n.cov,
+                n.del,
+                outs.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "grid sweep; run with --ignored --nocapture (one process, avoids per-exec sandbox tax)"]
+    fn grid_sweep_consensus_modes() {
+        let dir = std::env::var("PROBE_DIR").unwrap_or_else(|_| "/tmp/poa_compare_grid".into());
+        let manifest = std::fs::read_to_string(format!("{dir}/manifest.txt")).expect("manifest");
+        let (mut th, mut tm, mut tb) = (0usize, 0usize, 0usize);
+        let mut n = 0usize;
+        for name in manifest.lines().filter(|l| !l.trim().is_empty()) {
+            let truth = match std::fs::read(format!("{dir}/{name}.truth")) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let fa = std::fs::read_to_string(format!("{dir}/{name}.reads.fa")).unwrap();
+            let mut reads: Vec<Vec<u8>> = Vec::new();
+            let mut cur: Vec<u8> = Vec::new();
+            for line in fa.lines() {
+                if line.starts_with('>') {
+                    if !cur.is_empty() {
+                        reads.push(std::mem::take(&mut cur));
+                    }
+                } else {
+                    cur.extend_from_slice(line.trim().as_bytes());
+                }
+            }
+            if !cur.is_empty() {
+                reads.push(cur);
+            }
+            if reads.len() < 3 {
+                continue;
+            }
+            let mut order: Vec<usize> = (0..reads.len()).collect();
+            order.sort_by_key(|&i| reads[i].len());
+            let med = order[order.len() / 2];
+            let mut g = Poa::new(&reads[med], cfg());
+            for (i, r) in reads.iter().enumerate() {
+                if i != med {
+                    g.add_read(r);
+                }
+            }
+            let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            th += lev(&g.consensus(), &truth);
+            tm += lev(&g.consensus_majority(), &truth);
+            tb += lev(&g.consensus_best_fit(&refs), &truth);
+            n += 1;
+        }
+        eprintln!(
+            "GRID SWEEP ({n} configs, full-Levenshtein vs truth):\n  heaviest={th}  majority={tm}  best_fit={tb}"
+        );
+    }
+
+    /// Small Levenshtein for the probe (no external dep).
+    pub fn lev(a: &[u8], b: &[u8]) -> usize {
+        let (n, m) = (a.len(), b.len());
+        let mut prev: Vec<usize> = (0..=m).collect();
+        let mut cur = vec![0usize; m + 1];
+        for i in 1..=n {
+            cur[0] = i;
+            for j in 1..=m {
+                let c = usize::from(a[i - 1] != b[j - 1]);
+                cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + c);
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        prev[m]
     }
 }
 

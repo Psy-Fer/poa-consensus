@@ -82,21 +82,21 @@ struct Args {
     #[arg(
         long = "match",
         value_name = "SCORE",
-        default_value_t = 1,
+        default_value_t = 2,
         help_heading = "Scoring"
     )]
     match_score: i32,
 
     /// Mismatch score (negative).
-    #[arg(long = "mismatch", value_name = "SCORE", default_value_t = -1, help_heading = "Scoring")]
+    #[arg(long = "mismatch", value_name = "SCORE", default_value_t = -4, help_heading = "Scoring")]
     mismatch_score: i32,
 
     /// Gap-open penalty (negative; charged once when a gap opens).
-    #[arg(long, value_name = "PENALTY", default_value_t = -2, help_heading = "Scoring")]
+    #[arg(long, value_name = "PENALTY", default_value_t = -4, help_heading = "Scoring")]
     gap_open: i32,
 
     /// Gap-extend penalty (negative; per base inside a gap).
-    #[arg(long, value_name = "PENALTY", default_value_t = -1, help_heading = "Scoring")]
+    #[arg(long, value_name = "PENALTY", default_value_t = -3, help_heading = "Scoring")]
     gap_extend: i32,
 
     // ── Coverage / consensus ──────────────────────────────────────────────────
@@ -225,18 +225,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // `consensus()` re-seeds on the median-length read internally and
                 // does not require spanning, so rather than refuse output (abPOA
                 // and SPOA both produce a best-effort consensus here), fall back to
-                // the longest read as the orientation seed and warn.
+                // the median-length read as the orientation seed and warn.
                 Err(e) => {
                     if !args.quiet {
                         eprintln!(
                             "poa-consensus: warning: automatic seed selection was inconclusive \
-                             ({e}); proceeding with the longest read as seed. If reads are truly \
-                             split into non-overlapping left/right groups, use bridged_consensus."
+                             ({e}); proceeding with the median-length read as seed. If reads are \
+                             truly split into non-overlapping left/right groups, use bridged_consensus."
                         );
                     }
-                    (0..reads.len())
-                        .max_by_key(|&i| reads[i].len())
-                        .unwrap_or(0)
+                    // Median-length read — matches consensus()'s own internal seed
+                    // choice, and far more robust than the longest (an outlier more
+                    // likely to carry excess error or extra repeat units).
+                    let mut order: Vec<usize> = (0..reads.len()).collect();
+                    order.sort_by_key(|&i| reads[i].len());
+                    order[order.len() / 2]
                 }
             }
         }

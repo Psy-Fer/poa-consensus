@@ -70,10 +70,17 @@ impl Default for PoaConfig {
             adaptive_band: true,
             adaptive_band_b: 10,
             adaptive_band_f: 0.01,
-            match_score: 1,
-            mismatch_score: -1,
-            gap_open: -2,
-            gap_extend: -1,
+            // abPOA-style scoring: gaps and mismatches are harsh relative to
+            // match (+2), so the aligner does not open cheap spurious gaps in
+            // homopolymer/periodic runs. The old +1/-1/-2/-1 made gaps too cheap
+            // (a gap-open cost only 2 matches), scattering homopolymer alignments
+            // at high error and over-calling repeats; abPOA-like scoring roughly
+            // halves that error with no regression on clean inputs (validated on
+            // the robustness matrix + 3-way comparison, 2026-07-28).
+            match_score: 2,
+            mismatch_score: -4,
+            gap_open: -4,
+            gap_extend: -3,
             min_coverage_fraction: 0.0,
             min_allele_freq: 0.2,
             min_reads: 1,

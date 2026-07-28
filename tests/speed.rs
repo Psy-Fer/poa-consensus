@@ -4,7 +4,7 @@
 /// Each workload is a function that builds a PoaGraph from N reads and calls
 /// consensus(). Wall time and peak heap allocation are measured across REPS
 /// repetitions. No external deps.
-use poa_consensus::{PoaConfig, PoaGraph};
+use poa_consensus::PoaConfig;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -454,63 +454,6 @@ fn row_consensus(label: &str, reads: &[Vec<u8>], cfg: &PoaConfig, reps: usize) {
     );
 }
 
-/// Phase attribution: total consensus() vs build (new+add_read) vs extract
-/// (consensus() on a prebuilt graph) vs pure DP alignment (align_read_ops of
-/// every read against the full graph). Build ≈ DP + graph mutation; extract =
-/// heaviest_path + coverage trim + interior filter.
-fn phase_breakdown(label: &str, reads: &[Vec<u8>], cfg: &PoaConfig, reps: usize) {
-    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
-
-    let (total, _, _, total_pk) = bench(reps, || {
-        let _ = poa_consensus::consensus(&refs, 0, cfg).unwrap();
-    });
-    let (build, _, _, build_pk) = bench(reps, || {
-        let mut g = PoaGraph::new(&reads[0], cfg.clone()).unwrap();
-        for r in &reads[1..] {
-            g.add_read(r).unwrap();
-        }
-        std::hint::black_box(&g);
-    });
-
-    // Build once (untimed) for extract + pure-align measurements.
-    let mut g = PoaGraph::new(&reads[0], cfg.clone()).unwrap();
-    for r in &reads[1..] {
-        g.add_read(r).unwrap();
-    }
-    let (extract, _, _, extract_pk) = bench(reps, || {
-        let _ = g.consensus().unwrap();
-    });
-    let (align, _, _, _) = bench(reps, || {
-        for r in &refs {
-            let _ = g.align_read_ops(r);
-        }
-    });
-
-    println!("  {label}");
-    println!(
-        "     total consensus()          {:>9.3} ms   peak {:>7.1} MB",
-        ms(total),
-        total_pk
-    );
-    println!(
-        "     build (new + add_read)     {:>9.3} ms   peak {:>7.1} MB   ({:.0}% of total)",
-        ms(build),
-        build_pk,
-        100.0 * ms(build) / ms(total).max(1e-9)
-    );
-    println!(
-        "       └ DP align (full graph)  {:>9.3} ms                    ({:.0}% of build)",
-        ms(align),
-        100.0 * ms(align) / ms(build).max(1e-9)
-    );
-    println!(
-        "     extract (HB + trim + filt) {:>9.3} ms   peak {:>7.1} MB   ({:.0}% of total)",
-        ms(extract),
-        extract_pk,
-        100.0 * ms(extract) / ms(total).max(1e-9)
-    );
-}
-
 #[test]
 fn perf_matrix() {
     println!("\n=== POA performance matrix (release; median over reps, [min–max]) ===");
@@ -556,28 +499,6 @@ fn perf_matrix() {
     row_consensus("adaptive (w≈30)", &r2k, &cfg_adaptive(), 5);
     row_consensus("fixed band w=200", &r2k, &cfg_fixed(200), 5);
     row_consensus("unbanded (band_width=0)", &r2k, &cfg_unbanded(), 3);
-
-    // ── Phase attribution ─────────────────────────────────────────────────────
-    println!("\n  PHASE ATTRIBUTION  (adaptive band; where does time/memory go?)");
-    println!("  {}", "-".repeat(80));
-    phase_breakdown(
-        "600bp × 20 reads",
-        &gen_reads(600, 20, 0x500),
-        &cfg_adaptive(),
-        9,
-    );
-    phase_breakdown(
-        "2000bp × 15 reads",
-        &gen_reads(2000, 15, 0x600),
-        &cfg_adaptive(),
-        5,
-    );
-    phase_breakdown(
-        "150bp × 50 reads (sub-kb STR regime)",
-        &gen_reads(150, 50, 0x700),
-        &cfg_adaptive(),
-        11,
-    );
 
     // Overall process peak RSS (monotonic high-water mark; heap peaks above are
     // per-workload and resettable, this is the whole-process ceiling).

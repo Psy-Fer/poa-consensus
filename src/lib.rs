@@ -47,37 +47,20 @@
 //! # Ok::<(), poa_consensus::PoaError>(())
 //! ```
 //!
-//! ### Stateful API (inspect graph between reads)
+//! ### Inspecting graph statistics
+//!
+//! Every [`Consensus`] carries a [`GraphStats`] describing the graph it was
+//! built from (bubble count, coverage, noise level).  Use it to assess read
+//! set quality or to decide whether a second, differently-configured call is
+//! warranted.
 //!
 //! ```rust
-//! use poa_consensus::{PoaGraph, PoaConfig};
+//! use poa_consensus::{consensus, PoaConfig};
 //!
 //! let reads: &[&[u8]] = &[b"CATCATCAT", b"CATCATCAT", b"CATCGTCAT"];
 //!
-//! let mut graph = PoaGraph::new(reads[0], PoaConfig::default())?;
-//! for read in &reads[1..] {
-//!     graph.add_read(read)?;
-//! }
-//! let consensus = graph.consensus()?;
-//! let stats     = graph.stats();
-//! println!("bubbles: {}", stats.bubble_count);
-//! # Ok::<(), poa_consensus::PoaError>(())
-//! ```
-//!
-//! ### Two-pass adaptive mode
-//!
-//! ```rust
-//! use poa_consensus::{consensus_adaptive, PoaConfig};
-//!
-//! let reads: Vec<&[u8]> = vec![
-//!     b"CATCATCAT", b"CATCATCAT", b"CATCATCAT",
-//!     b"CATCGTCAT", b"CATCGTCAT", b"CATCGTCAT",
-//! ];
-//! // Pass 1 builds the graph and computes GraphStats.
-//! // Pass 2 is selected automatically: multi-allele split, noise tightening,
-//! // or semi-global switch, depending on what the stats reveal.
-//! let result  = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
-//! let alleles = result.consensuses;   // Vec<Consensus>; one or two elements
+//! let result = consensus(reads, 0, &PoaConfig::default())?;
+//! println!("bubbles: {}", result.graph_stats.bubble_count);
 //! # Ok::<(), poa_consensus::PoaError>(())
 //! ```
 //!
@@ -130,8 +113,7 @@
 //!
 //! A band that is too narrow returns `Err(PoaError::BandTooNarrow)` when the
 //! terminal column is unreachable.  The library never silently produces a wrong
-//! alignment — it errors instead.  [`PoaGraph::warnings_emitted`] counts how
-//! many times a long-unbanded warning fired during `add_read` calls.
+//! alignment — it errors instead.
 //!
 //! ## Coverage and depth
 //!
@@ -340,18 +322,11 @@ pub mod analysis;
 pub mod config;
 pub mod error;
 pub mod flank;
-pub mod graph;
 pub mod orient;
 pub mod phasing;
 pub mod poa2;
 pub mod seed;
 pub mod types;
-
-#[cfg(feature = "plot")]
-pub mod plot;
-
-#[cfg(test)]
-mod tests;
 
 pub use analysis::{
     ConsensusWarnings, DiagnoseConfig, InteriorSupportWarning, LowDepthWarning,
@@ -360,7 +335,6 @@ pub use analysis::{
 pub use config::{AlignmentMode, ConsensusMode, PoaConfig};
 pub use error::PoaError;
 pub use flank::extract_flanked_region;
-pub use graph::{AlignOp, PoaGraph};
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
 pub use seed::{SeedSelection, select_seed};
 pub use types::{
@@ -369,220 +343,6 @@ pub use types::{
 };
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
-
-/// Build a POA graph from `reads`, seeded on `reads[seed_idx]`.
-///
-/// `multi_allele` selects the two mode-dependent behaviours whose correct
-/// setting differs between single- and multi-allele consensus (see
-/// [`PoaConfig::multi_allele`]): it is written into the graph's config so the
-/// aligner keeps the diagonal-skip fast path (multi-allele allele-locking) or
-/// disables it (single-allele accuracy on periodic repeats), and it gates the
-/// whole-graph unbanded rebuild below. It must be `true` **only** for the
-/// multi-allele path ([`consensus_multi`]) -- there the rebuild's consistent
-/// bubble structure is load-bearing for phasing -- and `false` for every
-/// single-allele path, where both the rebuild (drifts the graph, over-calls
-/// length) and diagonal-skip (matches through phantom units) are harmful. See
-/// `design/vntr_overcall_delete_edge_visibility.md`.
-fn build_graph(
-    reads: &[&[u8]],
-    seed_idx: usize,
-    mut config: PoaConfig,
-    multi_allele: bool,
-) -> Result<PoaGraph, PoaError> {
-    // Thread the single/multi-allele mode through the config so the aligner
-    // (which only sees `PoaConfig`) can condition diagonal-skip on it. Overrides
-    // whatever the caller set, since build_graph's own argument is authoritative
-    // for which consensus path this is.
-    config.multi_allele = multi_allele;
-    let mut graph = PoaGraph::new(reads[seed_idx], config.clone())?;
-    for (i, read) in reads.iter().enumerate() {
-        if i != seed_idx {
-            graph.add_read(read)?;
-        }
-    }
-
-    // If any read needed a wider-than-configured band during the
-    // incremental build (`align_with_retry`'s pass 2 or 3 -- see
-    // `PoaGraph::used_band_retry`'s doc comment), the resulting graph is a
-    // mix of different reads settling with different effective band
-    // widths. In a periodic/repetitive locus this can settle different
-    // reads onto different, individually-plausible diagonals (the same
-    // mechanism as Known Bug #3's "silent wrong alignment on narrow band
-    // in repetitive regions"), fragmenting bubble structure that a
-    // uniformly-unbanded build would not -- confirmed on real data
-    // (`multi_gaa30_100`): a mixed-band graph produced a spurious 3rd
-    // allele that vanished when every read used the same unbanded config
-    // from the start. Rebuild the whole graph unbanded, from scratch, for
-    // internal consistency, rather than trusting a mixed-band graph as-is.
-    // Gated to the multi-allele path (see the parameter doc); skipped when
-    // the config was already fully unbanded (nothing to gain, and this
-    // recursion would otherwise never terminate).
-    if multi_allele && graph.used_band_retry() && (config.band_width > 0 || config.adaptive_band) {
-        let mut cfg2 = config.clone();
-        cfg2.band_width = 0;
-        cfg2.adaptive_band = false;
-        let mut graph2 = PoaGraph::new(reads[seed_idx], cfg2)?;
-        for (i, read) in reads.iter().enumerate() {
-            if i != seed_idx {
-                graph2.add_read(read)?;
-            }
-        }
-        return Ok(graph2);
-    }
-
-    Ok(graph)
-}
-
-/// Translate the `read_indices` on each [`Consensus`] from graph-internal
-/// indices back to indices into the caller's input `reads` slice.
-///
-/// [`build_graph`] builds the graph as `PoaGraph::new(reads[seed_idx])`
-/// (making the seed graph-internal index 0) followed by `add_read` on every
-/// other read in input order. The internal-to-input mapping is therefore
-/// `perm = [seed_idx] ++ (input indices 0..n, excluding seed_idx)`, i.e.
-/// `input_idx = perm[internal_idx]`. This must mirror `build_graph`'s ordering
-/// exactly; if that ordering ever changes, update this in lockstep.
-///
-/// Single-allele consensuses carry an empty `read_indices`, so remapping them
-/// is a no-op. Only the free-function wrappers (which own the input slice and
-/// the `seed_idx`) apply this; the stateful `PoaGraph::consensus_multi` leaves
-/// `read_indices` in add-order, which is already the caller's own ordering.
-fn remap_read_indices_to_input(consensuses: &mut [Consensus], seed_idx: usize, n_reads: usize) {
-    let mut perm = Vec::with_capacity(n_reads);
-    perm.push(seed_idx);
-    for i in 0..n_reads {
-        if i != seed_idx {
-            perm.push(i);
-        }
-    }
-    for c in consensuses.iter_mut() {
-        for idx in c.read_indices.iter_mut() {
-            *idx = perm[*idx];
-        }
-    }
-}
-
-/// Index of the read whose length is closest to the population's median
-/// (by position in the length-sorted order, not interpolated) -- used by
-/// `consensus_adaptive`'s seed-sensitivity retry to pick a re-seeding
-/// candidate that is unlikely to be an atypically short (or long) outlier.
-fn median_length_read_index(reads: &[&[u8]]) -> Option<usize> {
-    if reads.is_empty() {
-        return None;
-    }
-    let mut idx: Vec<usize> = (0..reads.len()).collect();
-    idx.sort_by_key(|&i| reads[i].len());
-    Some(idx[idx.len() / 2])
-}
-
-/// Shared implementation behind `consensus_adaptive`'s
-/// `single_support_fraction > 0.3` branch and the standalone
-/// [`consensus_fit_scored`]. Builds several candidate remedies from `reads`,
-/// scores each against the actual read population with
-/// [`analysis::consensus_fit`], and returns the best-fitting one. `c1` is the
-/// caller's already-built pass-1 consensus (on `seed_idx`), passed in rather
-/// than rebuilt so `consensus_adaptive` doesn't pay for a redundant graph
-/// build it already has the result of.
-///
-/// See `consensus_adaptive`'s "Seed-sensitivity retry" doc section for the
-/// full rationale and empirical validation notes.
-fn seed_sensitivity_retry(
-    reads: &[&[u8]],
-    seed_idx: usize,
-    config: &PoaConfig,
-    c1: &Consensus,
-) -> Result<AdaptiveResult, PoaError> {
-    let mut candidates: Vec<(Consensus, AdaptiveAction)> =
-        vec![(c1.clone(), AdaptiveAction::PassThrough)];
-
-    // Remedy 1 (pre-existing): tighten the coverage floor, same seed.
-    let mut cfg_tight = config.clone();
-    cfg_tight.min_coverage_fraction = cfg_tight.min_coverage_fraction.max(0.6);
-    if let Ok(c) = build_graph(reads, seed_idx, cfg_tight, false).and_then(|g| g.consensus()) {
-        candidates.push((c, AdaptiveAction::NoisyTighten));
-    }
-
-    // Remedy 2: re-seed on a read near the population's median length
-    // instead of whatever `seed_idx` the caller (or `select_seed::Auto`)
-    // picked -- avoids the short-seed insert-fragmentation mechanism above
-    // outright, rather than trying to recover from it after the fact.
-    if let Some(median_idx) = median_length_read_index(reads) {
-        if median_idx != seed_idx {
-            if let Ok(c) =
-                build_graph(reads, median_idx, config.clone(), false).and_then(|g| g.consensus())
-            {
-                candidates.push((c, AdaptiveAction::AlternateSeedRetry));
-            }
-        }
-    }
-
-    // Remedy 3: MajorityFrequency mode, same seed -- counts Delete
-    // traversals explicitly instead of relying on edge weights, which
-    // sometimes recovers length HeaviestPath loses to fragmentation (and
-    // sometimes does not; that is exactly why this is scored rather than
-    // assumed).
-    let mut cfg_mf = config.clone();
-    cfg_mf.consensus_mode = ConsensusMode::MajorityFrequency;
-    if let Ok(c) = build_graph(reads, seed_idx, cfg_mf, false).and_then(|g| g.consensus()) {
-        candidates.push((c, AdaptiveAction::MajorityFrequencyRetry));
-    }
-
-    // Score every candidate against the actual read population and keep the
-    // best (lowest) fit score. Ties keep the earliest candidate, i.e. prefer
-    // pass-1 over a rebuild, and prefer the pre-existing NoisyTighten remedy
-    // over the two new ones, when scores tie exactly.
-    let mut best = 0usize;
-    let mut best_score = f64::INFINITY;
-    for (i, (c, _)) in candidates.iter().enumerate() {
-        let score = crate::analysis::consensus_fit(&c.sequence, reads, config);
-        if score < best_score {
-            best_score = score;
-            best = i;
-        }
-    }
-    let (chosen, action) = candidates.into_iter().nth(best).expect("non-empty");
-    Ok(AdaptiveResult {
-        consensuses: vec![chosen],
-        action,
-    })
-}
-
-/// Standalone seed-sensitivity check-and-retry, without `consensus_adaptive`'s
-/// other passes (multi-allele bubble detection, truncation retry, semi-global
-/// fallback).
-///
-/// Builds a pass-1 consensus exactly like [`consensus`]; if
-/// `GraphStats::single_support_fraction` exceeds 0.3, additionally builds a
-/// small set of candidate remedies and returns whichever one an empirical fit
-/// score ([`analysis::consensus_fit`]) says the actual read population best
-/// supports (see `consensus_adaptive`'s "Seed-sensitivity retry" doc section
-/// for the full mechanism, rationale, and validated limitations). Otherwise
-/// returns the pass-1 result unchanged with `action: PassThrough`.
-///
-/// Exists as a separate entry point (rather than requiring callers to go
-/// through `consensus_adaptive`) for callers that want this specific retry
-/// without `consensus_adaptive`'s other behavior -- e.g. this crate's own CLI,
-/// which intentionally avoids `consensus_adaptive`'s multi-allele bubble
-/// detection firing unexpectedly on a het SNP in a caller that expects
-/// single-allele output.
-pub fn consensus_fit_scored(
-    reads: &[&[u8]],
-    seed_idx: usize,
-    config: &PoaConfig,
-) -> Result<AdaptiveResult, PoaError> {
-    validate(reads, seed_idx)?;
-    let graph = build_graph(reads, seed_idx, config.clone(), false)?;
-    let stats = graph.stats();
-    let c1 = graph.consensus()?;
-    if stats.single_support_fraction > 0.3 {
-        seed_sensitivity_retry(reads, seed_idx, config, &c1)
-    } else {
-        Ok(AdaptiveResult {
-            consensuses: vec![c1],
-            action: AdaptiveAction::PassThrough,
-        })
-    }
-}
 
 fn validate(reads: &[&[u8]], seed_idx: usize) -> Result<(), PoaError> {
     if reads.is_empty() {
@@ -631,7 +391,12 @@ pub fn consensus(
             g.add_read(r);
         }
     }
-    Ok(g.consensus_full())
+    // Best-fit consensus: pick heaviest-path vs majority-frequency by fit
+    // against the reads (the two win different cases; majority-frequency
+    // recovers homopolymer/length-variable repeats the heaviest path
+    // over-calls). Per-position output fields are made consistent with the
+    // chosen sequence inside `consensus_full_best_fit`.
+    Ok(g.consensus_full_best_fit(reads))
 }
 
 /// Build a multi-allele consensus from `reads`.
@@ -653,187 +418,6 @@ pub fn consensus_multi(
     // and single-allele safety at near-equal split sensitivity. (Same-length
     // substitution haplotypes are the one weaker case; tracked separately.)
     crate::poa2::hybrid_consensus_multi(reads, config)
-}
-
-/// Two-pass adaptive consensus.
-///
-/// **Pass 1** builds a graph with the supplied config and computes [`GraphStats`].
-/// **Pass 2** is selected by inspecting those stats:
-///
-/// | Condition | Pass-2 action |
-/// |---|---|
-/// | 1-3 bubbles, minority arm ≥ `min_allele_freq × n` | `consensus_multi` on pass-1 graph |
-/// | Consensus < 60% of median input read length (banded, median ≤ 5000 bp) | Retry with `band_width = 0` |
-/// | `single_support_fraction > 0.3` | Build several candidate remedies, keep whichever scores best against the actual reads (see below) |
-/// | Coverage CV > 1.5 and mode is `Global` | Switch to `SemiGlobal`, rebuild |
-/// | Otherwise | Return pass-1 single consensus; no rebuild |
-///
-/// Returns an [`AdaptiveResult`] containing `consensuses` (one element for
-/// single-allele outcomes, two for diploid) and `action` (which pass-2 branch
-/// fired, if any).  Inspect `action` to distinguish a clean pass-through from
-/// a corrected result without re-running [`diagnose`].
-///
-/// ## Seed-sensitivity retry (`single_support_fraction > 0.3`)
-///
-/// This trigger fires on most genuinely repetitive/homogeneous graphs
-/// (confirmed empirically to sit in the 0.3-0.45 range for the large
-/// majority of periodic-repeat test scenarios, whether or not anything is
-/// actually wrong), so it cannot be treated as "this specific consensus is
-/// wrong" on its own -- it only means "this locus looks noisy/ambiguous
-/// enough to be worth double-checking." Four candidates are built from the
-/// *same* reads -- the untouched pass-1 result, a coverage-floor-tightened
-/// rebuild (the sole pre-existing remedy), a rebuild re-seeded on a read
-/// near the population's median length, and a
-/// [`ConsensusMode::MajorityFrequency`] rebuild -- and scored against each
-/// other with [`analysis::consensus_fit`] (mean per-read Insert+Delete ops
-/// against each candidate). The lowest-scoring (best-fit) candidate is
-/// returned, and `action` records which one won.
-///
-/// This is not a complete fix for the underlying seed-length sensitivity:
-/// empirical validation across CAG/GAA repeats at several lengths, depths,
-/// and error models found it reliably avoids ever making an
-/// already-passing case *worse* (0 regressions across 21 tested passing
-/// scenarios), and outright corrects some -- but not all -- confirmed
-/// failure instances. On the residual failures, the chosen candidate is
-/// sometimes no better than pass-1, and in at least one confirmed case
-/// modestly *more* wrong than pass-1 by unit count (though that case was
-/// already substantially wrong before this retry existed, not a regression
-/// from a previously-correct result). No single absolute graph statistic
-/// tested during development reliably distinguished the fixable cases from
-/// the unfixable ones or from ordinary noise; see CHANGELOG for the full
-/// empirical account, including the negative results.
-///
-/// ## Truncation detection
-///
-/// When banded DP is used on highly repetitive sequence (e.g. the AAAAG 5-mer
-/// in RFC1), multiple DP diagonals score identically.  The band can lock onto a
-/// shorter diagonal without approaching the band edge, producing a truncated
-/// consensus with no error.  `consensus_adaptive` detects this by comparing the
-/// pass-1 consensus length to the median input read length.  If the ratio is
-/// below 0.60 and the median read length is at most 5000 bp, it retries with
-/// unbanded alignment (`band_width = 0`), which forces the traceback to reach
-/// the correct endpoint.  `band_width = 0` is genuinely O(read_len ×
-/// graph_len) DP (see `PoaConfig::band_width`), so the retry is capped to
-/// 5000 bp median read length -- the same cap the CLI's own truncation retry
-/// uses -- rather than unconditionally retrying on arbitrarily long reads.
-pub fn consensus_adaptive(
-    reads: &[&[u8]],
-    seed_idx: usize,
-    config: &PoaConfig,
-) -> Result<AdaptiveResult, PoaError> {
-    validate(reads, seed_idx)?;
-
-    // ── Pass 1 ───────────────────────────────────────────────────────────────
-    let graph = build_graph(reads, seed_idx, config.clone(), false)?;
-    let stats = graph.stats();
-
-    // ── Decision ─────────────────────────────────────────────────────────────
-    let n = reads.len();
-    let allele_threshold = (n as f64 * config.min_allele_freq).ceil() as usize;
-
-    // Multi-allele: few bubbles with a well-supported minority arm.
-    // Re-use the pass-1 graph; consensus_multi rebuilds per-allele sub-graphs.
-    if stats.bubble_count >= 1
-        && stats.bubble_count <= 3
-        && stats.max_bubble_depth >= allele_threshold
-    {
-        let mut consensuses = graph.consensus_multi()?;
-        remap_read_indices_to_input(&mut consensuses, seed_idx, n);
-        return Ok(AdaptiveResult {
-            consensuses,
-            action: AdaptiveAction::MultiAllele,
-        });
-    }
-
-    // Compute pass-1 consensus; used for truncation check and as the fallthrough
-    // return value if no second pass fires.
-    let c1 = graph.consensus()?;
-
-    // Truncation: consensus much shorter than median read length.
-    // Indicates banded DP converged to the wrong diagonal (bug #4 pattern:
-    // degenerate scoring landscape in highly repetitive sequence means the band
-    // can snap to an off-by-N×period diagonal without approaching the edge).
-    // Unbanded forces the traceback to terminate at the correct graph endpoint.
-    //
-    // band_width=0 (paired with adaptive_band=false below) is genuinely
-    // unbanded O(read_len * graph_len) DP, so the retry is gated on read length
-    // the same way the CLI gates its own truncation retry: above 5000 bp the
-    // memory/time cost is no longer a safe unconditional fallback, so this
-    // returns the (still truncated) pass-1 result rather than retrying.
-    let was_banded = config.band_width > 0 || config.adaptive_band;
-    if was_banded {
-        let median_len = c1.graph_stats.median_input_read_len;
-        if median_len > 0
-            && median_len <= 5_000
-            && (c1.sequence.len() as f64) < 0.6 * median_len as f64
-        {
-            let mut cfg2 = config.clone();
-            cfg2.band_width = 0;
-            cfg2.adaptive_band = false;
-            let c2 = build_graph(reads, seed_idx, cfg2, false)?.consensus()?;
-            let recovered = (c2.sequence.len() as f64) >= 0.6 * median_len as f64;
-            return Ok(AdaptiveResult {
-                consensuses: vec![c2],
-                action: AdaptiveAction::TruncationRetry { recovered },
-            });
-        }
-    }
-
-    // Noisy input: high fraction of singleton-supported nodes.
-    //
-    // Before this pass existed, the sole remedy was tightening the coverage
-    // floor and rebuilding on the *same* seed. That does not address a
-    // different, confirmed root cause behind this same trigger: an
-    // auto-selected seed that happens to be atypically short relative to the
-    // true read population can make heaviest_path/the interior filter
-    // systematically under-call a periodic/homogeneous repeat's length --
-    // the extra content most reads carry over the short seed has to be
-    // inserted somewhere, and in a homogeneous repeat any position is an
-    // equally valid place to insert it, so different reads scatter their
-    // inserts and no single insertion position accumulates enough coverage
-    // to survive on its own (confirmed via ground-truth read-length
-    // comparison on synthetic CAG/GAA repeats; reproduces identically fully
-    // unbanded, so it is not a band-width artifact). Tightening the coverage
-    // floor cannot fix this: it filters harder against evidence that is
-    // already fragmented, it does not un-fragment it.
-    //
-    // No single absolute, graph-level statistic reliably distinguished a
-    // genuinely-too-short consensus from ordinary sequencing-noise-heavy
-    // ones across scenario families in empirical testing (tried:
-    // `single_support_fraction`, `bubble_count`, `edge_weight_gini`,
-    // `mean_column_entropy`, seed length relative to the read population's
-    // median/longest read, and an aggregate "off-spine fork mass" measure --
-    // none separated cleanly; see CHANGELOG for the full account). What DID
-    // discriminate, empirically, is comparing candidate consensuses against
-    // each other using `consensus_fit` (mean per-read Insert+Delete ops
-    // against a candidate, normalised by length) -- i.e. scoring, not
-    // guessing, and always keeping whichever candidate (including the
-    // untouched pass-1 result) the actual read population best supports.
-    if stats.single_support_fraction > 0.3 {
-        return seed_sensitivity_retry(reads, seed_idx, config, &c1);
-    }
-
-    // Uneven boundary coverage (high CV) suggests partial reads in global mode.
-    // Switch to semi-global alignment and rebuild.
-    let cv = if stats.coverage_mean > 0.0 {
-        stats.coverage_variance.sqrt() / stats.coverage_mean
-    } else {
-        0.0
-    };
-    if cv > 1.5 && config.alignment_mode == AlignmentMode::Global {
-        let mut cfg2 = config.clone();
-        cfg2.alignment_mode = AlignmentMode::SemiGlobal;
-        return Ok(AdaptiveResult {
-            consensuses: vec![build_graph(reads, seed_idx, cfg2, false)?.consensus()?],
-            action: AdaptiveAction::SemiGlobalFallback,
-        });
-    }
-
-    // No second pass needed.
-    Ok(AdaptiveResult {
-        consensuses: vec![c1],
-        action: AdaptiveAction::PassThrough,
-    })
 }
 
 /// Build a consensus from two non-overlapping read groups with a gap of
@@ -872,8 +456,8 @@ pub fn bridged_consensus(
     validate(left_reads, left_seed_idx)?;
     validate(right_reads, right_seed_idx)?;
 
-    let left = build_graph(left_reads, left_seed_idx, config.clone(), false)?.consensus()?;
-    let right = build_graph(right_reads, right_seed_idx, config.clone(), false)?.consensus()?;
+    let left = consensus(left_reads, left_seed_idx, config)?;
+    let right = consensus(right_reads, right_seed_idx, config)?;
 
     let join = left.sequence.len();
 

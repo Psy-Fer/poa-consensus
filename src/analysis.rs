@@ -696,8 +696,7 @@ impl ConsensusWarnings {
                 format!(
                     "{label}: consensus ({} bp) is {:.0}% of median input read length \
                      ({} bp) — banded DP may have converged to the wrong diagonal on \
-                     highly repetitive sequence; retry with band_width=0 or \
-                     consensus_adaptive",
+                     highly repetitive sequence; retry with band_width=0",
                     t.consensus_len,
                     t.ratio * 100.0,
                     t.median_read_len,
@@ -747,28 +746,18 @@ pub fn consensus_fit(
     if reads.is_empty() || consensus_seq.is_empty() {
         return 0.0;
     }
-    let graph = match crate::graph::PoaGraph::new(consensus_seq, config.clone()) {
-        Ok(g) => g,
-        Err(_) => return 0.0,
-    };
-    let mut total = 0.0;
-    let mut n = 0usize;
-    for &read in reads {
-        if let Ok((ops, _, _)) = graph.align_read_ops(read) {
-            let n_insert = ops
-                .iter()
-                .filter(|o| matches!(o, crate::graph::AlignOp::Insert(_)))
-                .count();
-            let n_delete = ops
-                .iter()
-                .filter(|o| matches!(o, crate::graph::AlignOp::Delete(_)))
-                .count();
-            let denom = (read.len() + consensus_seq.len()) as f64 / 2.0;
-            total += (n_insert + n_delete) as f64 / denom.max(1.0);
-            n += 1;
-        }
+    // Delegate the per-read alignment to the poa2 engine; keep this function's
+    // own per-read length-normalised averaging (its established scale).
+    let counts = crate::poa2::align_indel_counts(consensus_seq, reads, config);
+    if counts.is_empty() {
+        return 0.0;
     }
-    if n == 0 { 0.0 } else { total / n as f64 }
+    let mut total = 0.0;
+    for (&read, &(n_insert, n_delete)) in reads.iter().zip(counts.iter()) {
+        let denom = (read.len() + consensus_seq.len()) as f64 / 2.0;
+        total += (n_insert + n_delete) as f64 / denom.max(1.0);
+    }
+    total / counts.len() as f64
 }
 
 /// Compute actionable diagnostic warnings for a [`Consensus`].
