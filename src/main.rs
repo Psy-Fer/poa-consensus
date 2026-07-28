@@ -99,14 +99,6 @@ struct Args {
     #[arg(long, value_name = "PENALTY", default_value_t = -1, help_heading = "Scoring")]
     gap_extend: i32,
 
-    /// Disable the abPOA-style read-support (path-score) bias.  On by default:
-    /// it biases alignment toward well-supported diagonals so homogeneous VNTRs
-    /// don't fabricate phantom bases at the repeat boundary.  Affects the legacy
-    /// multi-allele path (single-allele runs on the clean engine, which does not
-    /// use it).
-    #[arg(long, help_heading = "Scoring")]
-    no_path_score_bias: bool,
-
     // ── Coverage / consensus ──────────────────────────────────────────────────
     /// Minimum reads required to attempt consensus.
     #[arg(long, default_value_t = 3, help_heading = "Coverage / consensus")]
@@ -255,11 +247,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         consensus_mode: args.consensus_mode.into(),
         warn_on_long_unbanded: !args.no_long_unbanded_warning,
         phasing_bubble_min_span: args.phasing_bubble_min_span,
-        // Bias alignment toward well-supported diagonals so homogeneous VNTRs
-        // don't fabricate phantom bases at the repeat boundary (Known Bug #3).
-        // On by default; affects the legacy multi-allele path (single-allele
-        // runs on the clean poa2 engine, which does not read this flag).
-        path_score_bias: !args.no_path_score_bias,
         // multi_allele is managed by the library (consensus_multi sets it true);
         // the CLI's --multi selects the code path rather than setting this.
         ..PoaConfig::default()

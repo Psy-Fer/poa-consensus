@@ -177,43 +177,6 @@ fn edge_weight(nodes: &[Node], from: usize, to: usize) -> i32 {
         .unwrap_or(0)
 }
 
-/// abPOA-style log-odds path score for the edge `from -> to`, added into the
-/// alignment DP recurrence to break the scoring degeneracy in homogeneous
-/// repeats: matching a base to a phase-shifted repeat node scores identically
-/// (+match) to the correct node, so the aligner can fold a read onto the wrong
-/// unit. This adds `round(log(edge_weight / predecessor_total_out_weight))` --
-/// the log of the fraction of reads that took this exact edge -- to every
-/// transition across it. It is <= 0: the modal (fully-supported) edge gets ~0,
-/// a minority/phase-shifted edge gets a negative penalty (clamped at -20), so a
-/// read prefers the well-supported diagonal. Normalising by the predecessor's
-/// outflow (not raw weight) keeps the term from scaling with depth and swamping
-/// the +-1 substitution score. Mirrors abPOA `abpoa_get_incre_path_score`.
-///
-/// Scores on `matched` weight (real base support), not `total()`: delete
-/// traffic through a node is not evidence that a base belongs on this diagonal.
-#[inline]
-fn incre_path_score(nodes: &[Node], from: usize, to: usize) -> i32 {
-    let edge_w = nodes[from]
-        .out_edges
-        .iter()
-        .find(|&&(t, _)| t == to)
-        .map(|&(_, ew)| ew.matched)
-        .unwrap_or(0);
-    if edge_w <= 0 {
-        return 0;
-    }
-    let node_w: i32 = nodes[from]
-        .out_edges
-        .iter()
-        .map(|&(_, ew)| ew.matched)
-        .sum();
-    if node_w <= 0 {
-        return 0;
-    }
-    let s = (edge_w as f64 / node_w as f64).ln().round() as i32;
-    s.max(-20)
-}
-
 #[inline]
 fn safe_add(a: i32, b: i32) -> i32 {
     if a == UNSET {
@@ -243,14 +206,17 @@ fn safe_add(a: i32, b: i32) -> i32 {
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct EdgeWeight {
     /// Match traversals, plus the founding Insert that created the target node.
+    /// Under the pure-bypass Delete model there is no separate delete bucket:
+    /// a Delete records a bypass edge and never touches an ordinary out-edge.
     matched: i32,
-    /// Delete traversals (read skipped past the target node without consuming a base).
-    deleted: i32,
 }
 
 impl EdgeWeight {
+    /// Retained as an alias for `matched` so the many `.total()` call sites need
+    /// not change; the former `matched + deleted` sum collapsed to `matched`
+    /// when the always-zero delete bucket was removed.
     fn total(&self) -> i32 {
-        self.matched + self.deleted
+        self.matched
     }
 }
 
@@ -298,16 +264,6 @@ pub struct PoaGraph {
     /// target. Mirrors the `coverage`/`delete_count` idiom at the node level
     /// (see design/graph_data_model_rework.md Phase 2).
     edge_reads: HashMap<(usize, usize), Vec<u32>>,
-    /// **Vestigial under pure bypass (revised Phase 1 of
-    /// design/bypass_edge_delete_rework.md).** Formerly `(from, to)` → read
-    /// indices that Deleted through an edge; it was always write-only (no
-    /// production consumer ever read it -- confirmed by exhaustive grep). Under
-    /// pure bypass a deleting read touches the skipped node only via
-    /// `delete_count`, never via an edge, so this map is no longer populated at
-    /// all; it stays initialised-empty. Left in place rather than removed to
-    /// keep this phase's delta minimal; removable in a later cleanup.
-    #[allow(dead_code)]
-    edge_delete_reads: HashMap<(usize, usize), Vec<u32>>,
     /// Per-node bypass edges: from-node index → list of `(to_node, weight)`.
     /// A bypass edge records that a read skipped one or more nodes via a run
     /// of consecutive `Delete` ops and then reconnected -- by a clean Match --
@@ -499,58 +455,37 @@ fn set_new_node_own_fork(nodes: &mut [Node], p: usize, new_idx: usize) {
 }
 
 /// Adds a brand-new edge with weight 1, attributed as genuine confirmation
-/// (`matched: 1, deleted: 0`). Used only for the seed's initial linear chain,
-/// where the seed read's own bases are by definition confirmed. Calls
-/// `propagate_fork_if_new` directly (not deferred): the seed's entire chain
-/// is built in one uninterrupted pass with exactly one out-edge per node, so
-/// there is no "this read's own later ops" to race against -- the deferred-
-/// propagation subtlety only applies within a single `add_to_graph` call.
+/// (`matched: 1`). Used only for the seed's initial linear chain, where the seed
+/// read's own bases are by definition confirmed. Calls `propagate_fork_if_new`
+/// directly (not deferred): the seed's entire chain is built in one
+/// uninterrupted pass with exactly one out-edge per node, so there is no "this
+/// read's own later ops" to race against -- the deferred-propagation subtlety
+/// only applies within a single `add_to_graph` call.
 fn add_edge(nodes: &mut [Node], from: usize, to: usize) {
-    nodes[from].out_edges.push((
-        to,
-        EdgeWeight {
-            matched: 1,
-            deleted: 0,
-        },
-    ));
+    nodes[from].out_edges.push((to, EdgeWeight { matched: 1 }));
     nodes[to].in_edges.push(from);
     propagate_fork_if_new(nodes, from);
 }
 
-/// Increments an existing edge's weight, or creates it at weight 1, routing
-/// the `+1` to `.matched` or `.deleted` depending on how this read traversed
-/// it (`is_delete`). Returns `true` if a genuinely new edge was created (as
-/// opposed to an existing one being incremented) -- callers in `add_to_graph`
-/// use this to defer `propagate_fork_if_new(nodes, from)` until the current
-/// read's traceback has been fully processed, not run it immediately.
+/// Increments an existing edge's `matched` weight, or creates it at weight 1.
+/// Returns `true` if a genuinely new edge was created (as opposed to an existing
+/// one being incremented) -- callers in `add_to_graph` use this to defer
+/// `propagate_fork_if_new(nodes, from)` until the current read's traceback has
+/// been fully processed, not run it immediately. (Deletes are pure-bypass and
+/// never call this, so there is no delete-routing parameter.)
 #[must_use]
-fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize, is_delete: bool) -> bool {
+fn increment_or_add_edge(nodes: &mut [Node], from: usize, to: usize) -> bool {
     debug_assert_ne!(
         from, to,
         "increment_or_add_edge: refusing to create/increment a literal self-loop"
     );
     for (succ, ew) in nodes[from].out_edges.iter_mut() {
         if *succ == to {
-            if is_delete {
-                ew.deleted += 1;
-            } else {
-                ew.matched += 1;
-            }
+            ew.matched += 1;
             return false;
         }
     }
-    let ew = if is_delete {
-        EdgeWeight {
-            matched: 0,
-            deleted: 1,
-        }
-    } else {
-        EdgeWeight {
-            matched: 1,
-            deleted: 0,
-        }
-    };
-    nodes[from].out_edges.push((to, ew));
+    nodes[from].out_edges.push((to, EdgeWeight { matched: 1 }));
     nodes[to].in_edges.push(from);
     true
 }
@@ -1340,10 +1275,6 @@ fn align(
     // disabled for single-allele consensus (accuracy) and kept for multi-allele
     // (allele separation). See design/vntr_overcall_delete_edge_visibility.md.
     let diag_skip_disabled = !cfg.multi_allele;
-    // abPOA-style log-odds read-support term in the DP recurrence. Single-allele
-    // only: biasing toward the heaviest existing arm would corrupt multi-allele
-    // bubble phasing. See PoaConfig::path_score_bias.
-    let path_score_on = cfg.path_score_bias && !cfg.multi_allele;
 
     // j position of each bubble's entry node's predecessors — filled dynamically.
     let mut bubble_entry_j = vec![0usize; n];
@@ -1682,12 +1613,7 @@ fn align(
                 for &p in &nodes[node_idx].in_edges {
                     let pt = rank_of[p];
                     let ew = edge_weight(nodes, p, node_idx);
-                    let ps = if path_score_on {
-                        incre_path_score(nodes, p, node_idx)
-                    } else {
-                        0
-                    };
-                    let sc_ps = safe_add(sc, ps);
+                    let sc_ps = sc;
                     let vm = safe_add(
                         gs(&m, pt, j - 1, j_lo_arr[pt], j_hi_arr[pt], row_width),
                         sc_ps,
@@ -1777,14 +1703,9 @@ fn align(
                 for &p in &nodes[node_idx].in_edges {
                     let pt = rank_of[p];
                     let ew = edge_weight(nodes, p, node_idx);
-                    let ps = if path_score_on {
-                        incre_path_score(nodes, p, node_idx)
-                    } else {
-                        0
-                    };
                     let vm = safe_add(
                         gs(&m, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
-                        safe_add(go + ge, ps),
+                        go + ge,
                     );
                     if vm != UNSET && (vm > best || (vm == best && ew > best_edge_w)) {
                         best = vm;
@@ -1793,7 +1714,7 @@ fn align(
                     }
                     let vi = safe_add(
                         gs(&ins, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
-                        safe_add(go + ge, ps),
+                        go + ge,
                     );
                     if vi != UNSET && (vi > best || (vi == best && ew > best_edge_w)) {
                         best = vi;
@@ -1802,7 +1723,7 @@ fn align(
                     }
                     let vd = safe_add(
                         gsd(&del, &del0, pt, j, j_lo_arr[pt], j_hi_arr[pt], row_width),
-                        safe_add(ge, ps),
+                        ge,
                     );
                     if vd != UNSET && (vd > best || (vd == best && ew > best_edge_w)) {
                         best = vd;
@@ -2383,7 +2304,7 @@ fn commit_reuse_chain(
         // A brand-new edge appearing here would mean a reused arm's fork
         // propagation was never run when the arm was first built, which
         // would be a real bug elsewhere, not something to paper over here.
-        let created = increment_or_add_edge(nodes, prev_node, node, false);
+        let created = increment_or_add_edge(nodes, prev_node, node);
         debug_assert!(
             !created,
             "reuse chain traversed an edge that did not already exist"
@@ -2575,7 +2496,7 @@ fn add_to_graph(
                         // bypass edge recorded at the resolution block below.
                         resume_is_bypass = true;
                     } else if let Some(p) = prev {
-                        if increment_or_add_edge(nodes, p, node_idx, false) {
+                        if increment_or_add_edge(nodes, p, node_idx) {
                             newly_forked.push(p);
                         }
                         edge_reads.entry((p, node_idx)).or_default().push(read_idx);
@@ -2603,13 +2524,9 @@ fn add_to_graph(
                         let new_idx = push_node(nodes, q_base);
                         nodes[new_idx].coverage = 1;
                         if let Some(p) = prev {
-                            nodes[p].out_edges.push((
-                                new_idx,
-                                EdgeWeight {
-                                    matched: 1,
-                                    deleted: 0,
-                                },
-                            ));
+                            nodes[p]
+                                .out_edges
+                                .push((new_idx, EdgeWeight { matched: 1 }));
                             nodes[new_idx].in_edges.push(p);
                             edge_reads.entry((p, new_idx)).or_default().push(read_idx);
                             fork_arm_index
@@ -2675,13 +2592,9 @@ fn add_to_graph(
                         let new_idx = push_node(nodes, b);
                         nodes[new_idx].coverage = 1;
                         if let Some(p) = prev {
-                            nodes[p].out_edges.push((
-                                new_idx,
-                                EdgeWeight {
-                                    matched: 1,
-                                    deleted: 0,
-                                },
-                            ));
+                            nodes[p]
+                                .out_edges
+                                .push((new_idx, EdgeWeight { matched: 1 }));
                             nodes[new_idx].in_edges.push(p);
                             edge_reads.entry((p, new_idx)).or_default().push(read_idx);
                             set_new_node_own_fork(nodes, p, new_idx);
@@ -4084,7 +3997,6 @@ impl PoaGraph {
             n_reads: 1,
             reads: vec![seed.to_vec()],
             edge_reads,
-            edge_delete_reads: HashMap::new(),
             bypass_edges: HashMap::new(),
             warnings: 0,
             cached_spine: Vec::new(),
@@ -4624,31 +4536,6 @@ impl PoaGraph {
             edges,
             spine_ranks,
         }
-    }
-
-    /// For each node, return `(out_edges_count, max_out_edge_weight, min_out_edge_weight)`.
-    ///
-    /// Total (matched + deleted) weight, same reasoning as `edge_weights()`.
-    pub fn node_out_edge_info(&self) -> Vec<(usize, i32, i32)> {
-        self.nodes
-            .iter()
-            .map(|n| {
-                let count = n.out_edges.len();
-                let max_w = n
-                    .out_edges
-                    .iter()
-                    .map(|&(_, ew)| ew.total())
-                    .max()
-                    .unwrap_or(0);
-                let min_w = n
-                    .out_edges
-                    .iter()
-                    .map(|&(_, ew)| ew.total())
-                    .min()
-                    .unwrap_or(0);
-                (count, max_w, min_w)
-            })
-            .collect()
     }
 
     /// Return arm lengths for each bubble node with 2+ qualifying arms (weight >= threshold).
@@ -5194,27 +5081,6 @@ mod bypass_edge_tests {
             .map(|&(_, ew)| ew)
     }
 
-    /// Asserts the pure-bypass invariant across the whole graph: no `out_edge`
-    /// anywhere carries any `deleted`-bucket weight (under pure bypass a
-    /// deleting read never traverses an edge into a skipped node), and
-    /// `edge_delete_reads` was never populated.
-    fn assert_no_delete_bucket_or_delete_reads(g: &PoaGraph) {
-        for (idx, nd) in g.nodes.iter().enumerate() {
-            for &(to, ew) in &nd.out_edges {
-                assert_eq!(
-                    ew.deleted, 0,
-                    "pure bypass: out-edge {idx}->{to} must carry no deleted-bucket weight, \
-                     got {}",
-                    ew.deleted
-                );
-            }
-        }
-        assert!(
-            g.edge_delete_reads.is_empty(),
-            "pure bypass: edge_delete_reads must never be populated"
-        );
-    }
-
     #[test]
     fn single_base_deletion_records_one_bypass_edge() {
         // Delete seed position 6 ('A', between 'C'@5 and 'T'@7, both distinct
@@ -5249,7 +5115,6 @@ mod bypass_edge_tests {
             "edge 6->7 must NOT have gained matched weight from the deleting read \
              (that would be the laundering this rework removes)"
         );
-        assert_no_delete_bucket_or_delete_reads(&g);
     }
 
     #[test]
@@ -5271,7 +5136,6 @@ mod bypass_edge_tests {
         assert_eq!(g.nodes[7].delete_count, 1);
         // Pure-bypass: resume edge 7->8 not inflated by the deleting read.
         assert_eq!(out_edge(&g, 7, 8).map(|ew| ew.matched), Some(1));
-        assert_no_delete_bucket_or_delete_reads(&g);
     }
 
     #[test]
@@ -5325,7 +5189,6 @@ mod bypass_edge_tests {
         // the two DELETING reads did not launder their weight onto it. Under
         // the superseded dual-bookkeeping it would have been 4.
         assert_eq!(out_edge(&g, 8, 9).map(|ew| ew.matched), Some(2));
-        assert_no_delete_bucket_or_delete_reads(&g);
     }
 
     #[test]
@@ -5393,7 +5256,6 @@ mod bypass_edge_tests {
         assert_eq!(g.nodes[3].delete_count, 1);
         // Pure-bypass: the terminal Delete run created no edges into/out of the
         // skipped nodes.
-        assert_no_delete_bucket_or_delete_reads(&g);
     }
 
     #[test]
