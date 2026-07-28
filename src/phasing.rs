@@ -143,56 +143,58 @@ impl PhasingMatrix {
                 n_informative_sites: 0,
             };
         }
-        // Seed the split from the best-covered, most-balanced site.
+        // Seed from the best-covered, most-balanced site, then Lloyd-refine.
+        // (Multi-restart over several seeds was measured on the robustness matrix
+        // to give negligible count improvement and slightly worse single-allele
+        // safety — the clustering seed is not the bottleneck, the split
+        // confirmation is — so a single seed is kept for simplicity.)
         let seed_site = (0..ns)
             .max_by_key(|&s| {
                 let sup = &self.sites[s].branch_support;
                 let cov: u32 = sup.iter().sum();
                 let mx = *sup.iter().max().unwrap_or(&0);
-                // balance * coverage: prefer 2-branch, evenly-split, well-covered.
                 (cov.saturating_sub(mx)) * 1000 + cov
             })
             .unwrap();
-        // side 0 = branch 0 at the seed site, side 1 = any other branch.
+        self.score_partition(self.lloyd_from_seed(seed_site))
+    }
+
+    /// Lloyd-refine a bipartition seeded from `seed_site` (branch 0 → side 0,
+    /// any other branch → side 1; uncovered reads → side 0). Returns the
+    /// converged `side` assignment.
+    #[allow(clippy::needless_range_loop)] // loops cross-index `side` and `calls`
+    fn lloyd_from_seed(&self, seed_site: usize) -> Vec<i8> {
+        let ns = self.n_sites();
         let mut side: Vec<i8> = (0..self.n_reads)
             .map(|r| match self.calls[r][seed_site] {
-                MISSING => -1,
                 0 => 0,
+                MISSING => 0,
                 _ => 1,
             })
             .collect();
-        // Assign the still-unassigned reads to side 0 initially.
-        for s in side.iter_mut() {
-            if *s < 0 {
-                *s = 0;
-            }
-        }
-
-        for _ in 0..12 {
-            // Per-site, per-side majority branch.
-            let maj = |members: &[usize], s: usize| -> i16 {
-                let nb = self.sites[s].branches.len();
-                let mut c = vec![0u32; nb];
-                for &r in members {
+        let maj = |side: &[i8], want: i8, s: usize| -> i16 {
+            let nb = self.sites[s].branches.len();
+            let mut c = vec![0u32; nb];
+            for r in 0..self.n_reads {
+                if side[r] == want {
                     let v = self.calls[r][s];
                     if v != MISSING {
                         c[v as usize] += 1;
                     }
                 }
-                c.iter()
-                    .enumerate()
-                    .max_by_key(|&(_, &n)| n)
-                    .map(|(i, _)| i as i16)
-                    .unwrap_or(MISSING)
-            };
-            let m0: Vec<usize> = (0..self.n_reads).filter(|&r| side[r] == 0).collect();
-            let m1: Vec<usize> = (0..self.n_reads).filter(|&r| side[r] == 1).collect();
-            let maj0: Vec<i16> = (0..ns).map(|s| maj(&m0, s)).collect();
-            let maj1: Vec<i16> = (0..ns).map(|s| maj(&m1, s)).collect();
+            }
+            c.iter()
+                .enumerate()
+                .max_by_key(|&(_, &n)| n)
+                .map(|(i, _)| i as i16)
+                .unwrap_or(MISSING)
+        };
+        for _ in 0..12 {
+            let maj0: Vec<i16> = (0..ns).map(|s| maj(&side, 0, s)).collect();
+            let maj1: Vec<i16> = (0..ns).map(|s| maj(&side, 1, s)).collect();
             let mut changed = false;
-            for (r, sr) in side.iter_mut().enumerate() {
-                let mut a0 = 0i32;
-                let mut a1 = 0i32;
+            for r in 0..self.n_reads {
+                let (mut a0, mut a1) = (0i32, 0i32);
                 for s in 0..ns {
                     let v = self.calls[r][s];
                     if v == MISSING {
@@ -206,8 +208,8 @@ impl PhasingMatrix {
                     }
                 }
                 let new = if a1 > a0 { 1 } else { 0 };
-                if new != *sr {
-                    *sr = new;
+                if new != side[r] {
+                    side[r] = new;
                     changed = true;
                 }
             }
@@ -215,9 +217,17 @@ impl PhasingMatrix {
                 break;
             }
         }
+        side
+    }
 
-        // Consistency: fraction of covered calls matching their side's per-site
-        // majority. Informative sites: those where the two sides' majorities differ.
+    /// Score a GIVEN read bipartition (`side[r] ∈ {0, 1}`): its consistency
+    /// (fraction of covered calls matching their side's per-site majority),
+    /// minority fraction, and number of informative sites (where the two sides'
+    /// majorities differ). Used both by `dominant_bipartition` and to confirm a
+    /// split proposed by another engine (structural phasing) against the linkage
+    /// signal.
+    pub fn score_partition(&self, side: Vec<i8>) -> Bipartition {
+        let ns = self.n_sites();
         let members =
             |want: i8| -> Vec<usize> { (0..self.n_reads).filter(|&r| side[r] == want).collect() };
         let (m0, m1) = (members(0), members(1));

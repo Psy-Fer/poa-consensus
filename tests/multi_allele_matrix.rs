@@ -25,12 +25,14 @@ enum Engine {
     Legacy,
     Poa2,
     Linkage,
+    Hybrid,
 }
 
 fn engine() -> Engine {
     match std::env::var("BASELINE_ENGINE").as_deref() {
         Ok("poa2") => Engine::Poa2,
         Ok("linkage") => Engine::Linkage,
+        Ok("hybrid") => Engine::Hybrid,
         _ => Engine::Legacy,
     }
 }
@@ -40,6 +42,7 @@ fn engine_name() -> &'static str {
         Engine::Legacy => "legacy",
         Engine::Poa2 => "poa2",
         Engine::Linkage => "linkage",
+        Engine::Hybrid => "hybrid",
     }
 }
 
@@ -60,6 +63,7 @@ fn run_multi(reads: &[Read], config: &PoaConfig) -> (Vec<Vec<usize>>, Vec<usize>
         Engine::Legacy => poa_consensus::consensus_multi(&seqs, 0, config),
         Engine::Poa2 => poa_consensus::poa2::consensus_multi(&seqs, config),
         Engine::Linkage => poa_consensus::poa2::linkage_consensus_multi(&seqs, config),
+        Engine::Hybrid => poa_consensus::poa2::hybrid_consensus_multi(&seqs, config),
     };
     match result {
         Ok(alleles) => (

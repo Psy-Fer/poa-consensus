@@ -906,26 +906,26 @@ impl Poa {
     /// a fork (a node with ≥2 out-edges each clearing `floor` reads); node fusion
     /// makes substitutions forks too, so this uniformly captures SNP, indel, and
     /// length divergences. A read's call at a site is the branch (successor) its
-    /// matched path takes, or MISSING if it doesn't traverse an out-edge of the
-    /// fork or takes a below-floor minor branch. Uses `read_matched_edges`
-    /// (matched-only, excludes delete-bypass resume) so a length variant's short
-    /// allele registers as a genuine branch, consistent with the phasing signal.
+    /// path takes, or MISSING if it doesn't traverse an out-edge of the fork or
+    /// takes a below-floor minor branch.
+    ///
+    /// Uses `read_paths` (occupied-node adjacencies, INCLUDING delete-bypass
+    /// "resume" edges), NOT the matched-only edges: a length variant's shorter
+    /// allele diverges by *deleting* the tail and resuming — a bypass edge — so a
+    /// matched-only view shows no fork there and misses the length split entirely.
+    /// The bypass adjacency is exactly the shorter allele's arm.
     pub fn phasing_matrix(&self, floor: u32) -> crate::phasing::PhasingMatrix {
         use crate::phasing::{MISSING, PhasingMatrix, Site};
-        // Per-read matched adjacency map: node -> successor taken by this read.
+        // Per-read adjacency map (node -> successor) and edge weights, from the
+        // occupied-node paths (bypass-inclusive).
         let mut read_next: Vec<std::collections::HashMap<usize, usize>> =
             vec![std::collections::HashMap::new(); self.n_reads];
-        for (r, medges) in self.read_matched_edges.iter().enumerate() {
-            for &(a, b) in medges {
-                read_next[r].insert(a, b);
-            }
-        }
-        // Matched-only out-edge weights: (from,to) -> reads.
         let mut mw: std::collections::HashMap<(usize, usize), u32> =
             std::collections::HashMap::new();
-        for medges in &self.read_matched_edges {
-            for &e in medges {
-                *mw.entry(e).or_default() += 1;
+        for (r, path) in self.read_paths.iter().enumerate() {
+            for w in path.windows(2) {
+                read_next[r].insert(w[0], w[1]);
+                *mw.entry((w[0], w[1])).or_default() += 1;
             }
         }
         // Fork sites: nodes with ≥2 matched out-edges each ≥ floor.
@@ -1579,9 +1579,9 @@ pub fn linkage_consensus_multi(
         });
     }
     let all: Vec<usize> = (0..reads.len()).filter(|&i| !reads[i].is_empty()).collect();
-    let mut out = Vec::new();
-    linkage_split(reads, &all, config, 0, &mut out);
-    Ok(out)
+    let mut groups = Vec::new();
+    linkage_partition_into(reads, &all, config, 0, &mut groups);
+    groups_to_consensuses(reads, &groups, config)
 }
 
 /// Max recursion depth (allele count is bounded by 2^depth; 3 covers up to ~8).
@@ -1591,11 +1591,6 @@ const LINKAGE_MAX_DEPTH: usize = 3;
 /// sub-clusters of one allele split at lower consistency, so this gate stops the
 /// recursion from over-splitting a single allele at higher error rates.
 const LINKAGE_SPLIT_CONSISTENCY: f64 = 0.80;
-/// Minimum consensus-length gap (bp) between two sides for a *length*-variant
-/// split. Above per-read stutter (±1 repeat unit) for the common motifs, so an
-/// allele's own stutter sub-clusters don't get split, while a genuine
-/// repeat-count difference (many bp) does.
-const LINKAGE_LEN_GAP_BP: usize = 8;
 
 /// Build a consensus for `subset` of `reads`, tagged with the subset's external
 /// indices (sorted).
@@ -1615,16 +1610,20 @@ fn subset_consensus(
 
 /// Recursively split `subset` by the dominant linkage bipartition, keeping a
 /// split only when the two sides' consensuses genuinely differ.
-fn linkage_split(
+/// Recursively partition `subset` by the dominant linkage bipartition, keeping a
+/// split only when the two sides are genuinely distinct alleles (`groups_distinct`
+/// — length-bimodal, or a clean same-length substitution). Returns read-index
+/// groups (recurses for 3+ alleles). This is the linkage *discovery* primitive,
+/// used both standalone and to refine the hybrid's structural proposal.
+fn linkage_partition_into(
     reads: &[&[u8]],
     subset: &[usize],
     config: &PoaConfig,
     depth: usize,
-    out: &mut Vec<crate::types::Consensus>,
+    out: &mut Vec<Vec<usize>>,
 ) {
-    // Too shallow to split into two min_reads-sized alleles, or too deep.
     if subset.len() < 2 * config.min_reads || depth >= LINKAGE_MAX_DEPTH {
-        out.push(subset_consensus(reads, subset, config));
+        out.push(subset.to_vec());
         return;
     }
     let sub_reads: Vec<&[u8]> = subset.iter().map(|&i| reads[i]).collect();
@@ -1634,8 +1633,6 @@ fn linkage_split(
         .max(2);
     let bp = g.phasing_matrix(floor).dominant_bipartition();
 
-    // Cheap pre-filter: need a real candidate split (≥2 informative sites, both
-    // sides big enough). The consensus-difference test below is the real gate.
     let mut s0 = Vec::new();
     let mut s1 = Vec::new();
     for internal in 0..g.n_reads {
@@ -1646,48 +1643,19 @@ fn linkage_split(
             s1.push(orig);
         }
     }
-    let whole = |out: &mut Vec<crate::types::Consensus>| {
-        let mut c = g.consensus_full();
-        let mut idx = subset.to_vec();
-        idx.sort_unstable();
-        c.read_indices = idx;
-        out.push(c);
-    };
-    if bp.n_informative_sites < 2 || s0.len() < config.min_reads || s1.len() < config.min_reads {
-        whole(out);
+    // No `n_informative >= 2` pre-filter here: a clean LENGTH variant can diverge
+    // at a single fork, and `groups_distinct` confirms it by length-bimodality
+    // regardless of site count. The substitution branch of `groups_distinct` keeps
+    // its own `informative >= 2` requirement, so a noise split still can't pass.
+    if s0.len() < config.min_reads
+        || s1.len() < config.min_reads
+        || !groups_distinct(reads, &s0, &s1, config)
+    {
+        out.push(subset.to_vec());
         return;
     }
-
-    // Confirmation: do the two sides yield genuinely different sequences? A
-    // phase-shift-noise split yields the same consensus on both sides; a real
-    // allele split differs at the variant positions. Two regimes:
-    //  - a LARGE difference (length variant) is real regardless of how noisy the
-    //    per-read bipartition is (fixes under-splitting at high error), while
-    //  - a SMALL difference (a few substitutions) is only trusted when the
-    //    bipartition is clean (high consistency), so error noise between two
-    //    sub-clusters of ONE allele does not fabricate a split.
-    let c0 = subset_consensus(reads, &s0, config);
-    let c1 = subset_consensus(reads, &s1, config);
-    let diff = edit_distance(&c0.sequence, &c1.sequence);
-    // A split is a real allele boundary in one of two regimes:
-    //  - LENGTH variant: the two sides' consensus lengths differ by a real gap.
-    //    Consensus length is the modal allele length, so per-read stutter and
-    //    base errors (which don't shift the mode) leave this ~0 within one
-    //    allele — this is what stops the recursion splitting an allele into its
-    //    stutter sub-clusters at high error.
-    //  - SUBSTITUTION haplotype: same length, but a clean (high-consistency)
-    //    bipartition with base differences. Gated on consistency so error noise
-    //    between two sub-clusters of one allele can't fabricate a split.
-    let len_gap = c0.sequence.len().abs_diff(c1.sequence.len());
-    let real_split = len_gap >= LINKAGE_LEN_GAP_BP
-        || (bp.consistency >= LINKAGE_SPLIT_CONSISTENCY && len_gap <= 4 && diff >= 3);
-    if !real_split {
-        whole(out);
-        return;
-    }
-    // Real split — recurse each side (handles 3+ alleles).
-    linkage_split(reads, &s0, config, depth + 1, out);
-    linkage_split(reads, &s1, config, depth + 1, out);
+    linkage_partition_into(reads, &s0, config, depth + 1, out);
+    linkage_partition_into(reads, &s1, config, depth + 1, out);
 }
 
 /// Multi-allele consensus over `reads` (WORK IN PROGRESS — not the production
@@ -1728,17 +1696,26 @@ fn consensus_multi_impl(
     config: &PoaConfig,
     allow_unbanded_retry: bool,
 ) -> Result<Vec<crate::types::Consensus>, crate::error::PoaError> {
-    use crate::error::PoaError;
+    let groups = structural_read_groups(reads, config, allow_unbanded_retry);
+    groups_to_consensuses(reads, &groups, config)
+}
 
+/// Structural-phasing read partitions (external read indices): structural
+/// bubbles → cross-bubble clustering → validate/merge; an unbanded rebuild when
+/// no structural bubble is found on a banded graph; then a single-best
+/// SNP-bubble fallback. A single group (all reads) means "one allele". This is
+/// the split PROPOSAL the hybrid engine confirms with the linkage gate.
+fn structural_read_groups(
+    reads: &[&[u8]],
+    config: &PoaConfig,
+    allow_unbanded_retry: bool,
+) -> Vec<Vec<usize>> {
     let (g, ext) = build_median(reads, config);
     let lens: Vec<usize> = ext.iter().map(|&e| reads[e].len()).collect();
     let (topo, _) = g.topo_order();
     let (mout, min) = g.matched_view();
 
     let structural = find_structural_bubbles(&mout, &min, &topo, g.n_reads, config);
-
-    // No structural bubble on a banded graph: the band may have folded a real
-    // length variant onto the spine. Rebuild once fully unbanded and retry.
     if structural.is_empty()
         && allow_unbanded_retry
         && (config.band_width > 0 || config.adaptive_band)
@@ -1746,20 +1723,18 @@ fn consensus_multi_impl(
         let mut cfg2 = config.clone();
         cfg2.band_width = 0;
         cfg2.adaptive_band = false;
-        return consensus_multi_impl(reads, &cfg2, false);
+        return structural_read_groups(reads, &cfg2, false);
     }
 
     let edge_reads = g.edge_reads();
-
-    let groups: Vec<Vec<usize>> = if !structural.is_empty() {
+    let internal: Vec<Vec<usize>> = if !structural.is_empty() {
         let g0 = phasing_groups(&edge_reads, &structural, g.n_reads, config.min_reads, &lens);
         validate_and_merge_groups(g0, &lens, config.min_reads, &structural, &edge_reads)
     } else {
         let bubbles = find_bubbles(&mout, &topo, g.n_reads, config.min_allele_freq);
         if bubbles.is_empty() {
-            return Ok(vec![g.consensus_full()]);
+            return vec![ext.clone()];
         }
-        // Choose the bubble whose weakest arm has the most read support.
         let (entry, arms) = bubbles
             .iter()
             .max_by_key(|(entry, arms)| {
@@ -1771,11 +1746,28 @@ fn consensus_multi_impl(
             .unwrap();
         partition_reads_by_bubble(&edge_reads, *entry, arms, g.n_reads)
     };
+    // Map internal read indices back to external (input) indices.
+    internal
+        .into_iter()
+        .map(|grp| grp.into_iter().map(|i| ext[i]).collect())
+        .collect()
+}
 
+/// Build one consensus per read group (external indices), depth-guarded, with a
+/// single-allele shortcut when there is fewer than two groups.
+fn groups_to_consensuses(
+    reads: &[&[u8]],
+    groups: &[Vec<usize>],
+    config: &PoaConfig,
+) -> Result<Vec<crate::types::Consensus>, crate::error::PoaError> {
+    use crate::error::PoaError;
     if groups.len() < 2 {
-        return Ok(vec![g.consensus_full()]);
+        let all: Vec<usize> = match groups.first() {
+            Some(g) => g.clone(),
+            None => (0..reads.len()).filter(|&i| !reads[i].is_empty()).collect(),
+        };
+        return Ok(vec![subset_consensus(reads, &all, config)]);
     }
-
     let mut out = Vec::with_capacity(groups.len());
     for group in groups {
         if group.len() < config.min_reads {
@@ -1784,17 +1776,100 @@ fn consensus_multi_impl(
                 min: config.min_reads,
             });
         }
-        let mut ext_idx: Vec<usize> = group.iter().map(|&i| ext[i]).collect();
-        let sub_reads: Vec<&[u8]> = ext_idx.iter().map(|&e| reads[e]).collect();
-        let mut sub_cfg = config.clone();
-        sub_cfg.multi_allele = false;
-        let (sub, _) = build_median(&sub_reads, &sub_cfg);
-        let mut c = sub.consensus_full();
-        ext_idx.sort_unstable();
-        c.read_indices = ext_idx;
-        out.push(c);
+        out.push(subset_consensus(reads, group, config));
     }
     Ok(out)
+}
+
+/// Are two read groups genuinely distinct alleles (vs one allele a structural
+/// proposer over-split)? The linkage confirmation gate: a LENGTH variant is
+/// length-bimodal (median gap >= 3×MAD, robust to stutter); a SUBSTITUTION
+/// haplotype is same-length but the `gi`-vs-`gj` split is linkage-consistent
+/// (reads cleanly take sides at ≥2 het sites) with a real consensus difference.
+fn groups_distinct(reads: &[&[u8]], gi: &[usize], gj: &[usize], config: &PoaConfig) -> bool {
+    let lens_i: Vec<usize> = gi.iter().map(|&r| reads[r].len()).collect();
+    let lens_j: Vec<usize> = gj.iter().map(|&r| reads[r].len()).collect();
+    if length_separated(&lens_i, &lens_j) {
+        return true;
+    }
+    // Same length: confirm the split against the linkage signal on a pooled graph.
+    let pooled_reads: Vec<&[u8]> = gi.iter().chain(gj.iter()).map(|&r| reads[r]).collect();
+    let (g, ext) = build_median(&pooled_reads, config);
+    let floor = ((g.n_reads as f64 * config.min_allele_freq).ceil() as u32)
+        .max(config.min_reads as u32)
+        .max(2);
+    let m = g.phasing_matrix(floor);
+    // side per internal read: pooled input index < gi.len() ⟹ from gi (side 0).
+    let side: Vec<i8> = (0..g.n_reads)
+        .map(|internal| i8::from(ext[internal] >= gi.len()))
+        .collect();
+    let bp = m.score_partition(side);
+    let ci = subset_consensus(reads, gi, config);
+    let cj = subset_consensus(reads, gj, config);
+    bp.consistency >= LINKAGE_SPLIT_CONSISTENCY
+        && bp.n_informative_sites >= 2
+        && edit_distance(&ci.sequence, &cj.sequence) >= 3
+}
+
+/// Merge any pair of proposed groups that is NOT a genuinely distinct allele,
+/// to fixpoint. This is the hybrid's safety gate: it rejects the single-allele
+/// over-splits that structural phasing produces (two sub-clusters of one allele
+/// that are neither length-bimodal nor linkage-consistent).
+fn confirm_and_merge(
+    reads: &[&[u8]],
+    mut groups: Vec<Vec<usize>>,
+    config: &PoaConfig,
+) -> Vec<Vec<usize>> {
+    loop {
+        let mut merge: Option<(usize, usize)> = None;
+        'outer: for i in 0..groups.len() {
+            for j in (i + 1)..groups.len() {
+                if !groups_distinct(reads, &groups[i], &groups[j], config) {
+                    merge = Some((i, j));
+                    break 'outer;
+                }
+            }
+        }
+        match merge {
+            Some((i, j)) => {
+                let gj = groups.remove(j);
+                groups[i].extend(gj);
+            }
+            None => break,
+        }
+    }
+    groups
+}
+
+/// HYBRID multi-allele consensus: structural-bubble discovery *proposes* the
+/// split (good sensitivity on clean length variants), the linkage
+/// consensus-difference + bimodality gate *confirms* it (rejects the
+/// single-allele over-splits that structural phasing alone produces). Combines
+/// the split-sensitivity of `consensus_multi` with the safety of
+/// `linkage_consensus_multi`.
+pub fn hybrid_consensus_multi(
+    reads: &[&[u8]],
+    config: &PoaConfig,
+) -> Result<Vec<crate::types::Consensus>, crate::error::PoaError> {
+    use crate::error::PoaError;
+    if reads.len() < config.min_reads {
+        return Err(PoaError::InsufficientDepth {
+            got: reads.len(),
+            min: config.min_reads,
+        });
+    }
+    // Structural phasing PROPOSES the split (good sensitivity on clean length
+    // variants). Then refine each proposed group with linkage discovery — this
+    // finds splits structural phasing MISSES entirely (e.g. a folded periodic
+    // GAA diploid where no structural bubble surfaces, or a 3rd allele inside a
+    // structural group). Finally confirm_and_merge rejects any over-splits.
+    let proposed = structural_read_groups(reads, config, true);
+    let mut refined = Vec::new();
+    for group in &proposed {
+        linkage_partition_into(reads, group, config, 0, &mut refined);
+    }
+    let confirmed = confirm_and_merge(reads, refined, config);
+    groups_to_consensuses(reads, &confirmed, config)
 }
 
 #[cfg(test)]
