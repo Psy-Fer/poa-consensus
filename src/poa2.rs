@@ -1590,7 +1590,20 @@ const LINKAGE_MAX_DEPTH: usize = 3;
 /// clean (fraction of calls matching their side's per-site majority). Noise
 /// sub-clusters of one allele split at lower consistency, so this gate stops the
 /// recursion from over-splitting a single allele at higher error rates.
-const LINKAGE_SPLIT_CONSISTENCY: f64 = 0.80;
+/// Read-support floor for a het-site branch to count as significant: the
+/// `min_allele_freq` fraction of reads (min 2). Deliberately NOT maxed with
+/// `min_reads` — that is the consensus-*depth* floor (checked separately per
+/// group), and using it here would hide a legitimate minority arm below depth
+/// (e.g. a 3-read minor allele when min_reads=4), causing the split to be missed.
+fn phasing_floor(n_reads: usize, config: &PoaConfig) -> u32 {
+    ((n_reads as f64 * config.min_allele_freq).ceil() as u32).max(2)
+}
+
+/// Consistency bar for confirming a SAME-LENGTH (substitution) split,
+/// where length gives no signal: a clean haplotype split (even one SNP) is
+/// ~1.0 consistent, error sub-clusters of one allele ~0.7, so this admits the
+/// former and rejects the latter.
+const LINKAGE_SUBST_CONSISTENCY: f64 = 0.85;
 
 /// Build a consensus for `subset` of `reads`, tagged with the subset's external
 /// indices (sorted).
@@ -1628,10 +1641,9 @@ fn linkage_partition_into(
     }
     let sub_reads: Vec<&[u8]> = subset.iter().map(|&i| reads[i]).collect();
     let (g, ext) = build_median(&sub_reads, config);
-    let floor = ((g.n_reads as f64 * config.min_allele_freq).ceil() as u32)
-        .max(config.min_reads as u32)
-        .max(2);
-    let bp = g.phasing_matrix(floor).dominant_bipartition();
+    let bp = g
+        .phasing_matrix(phasing_floor(g.n_reads, config))
+        .dominant_bipartition();
 
     let mut s0 = Vec::new();
     let mut s1 = Vec::new();
@@ -1795,9 +1807,7 @@ fn groups_distinct(reads: &[&[u8]], gi: &[usize], gj: &[usize], config: &PoaConf
     // Same length: confirm the split against the linkage signal on a pooled graph.
     let pooled_reads: Vec<&[u8]> = gi.iter().chain(gj.iter()).map(|&r| reads[r]).collect();
     let (g, ext) = build_median(&pooled_reads, config);
-    let floor = ((g.n_reads as f64 * config.min_allele_freq).ceil() as u32)
-        .max(config.min_reads as u32)
-        .max(2);
+    let floor = phasing_floor(g.n_reads, config);
     let m = g.phasing_matrix(floor);
     // side per internal read: pooled input index < gi.len() ⟹ from gi (side 0).
     let side: Vec<i8> = (0..g.n_reads)
@@ -1806,9 +1816,22 @@ fn groups_distinct(reads: &[&[u8]], gi: &[usize], gj: &[usize], config: &PoaConf
     let bp = m.score_partition(side);
     let ci = subset_consensus(reads, gi, config);
     let cj = subset_consensus(reads, gj, config);
-    bp.consistency >= LINKAGE_SPLIT_CONSISTENCY
-        && bp.n_informative_sites >= 2
-        && edit_distance(&ci.sequence, &cj.sequence) >= 3
+    let same_length = ci.sequence.len().abs_diff(cj.sequence.len()) <= 2;
+    let edit = edit_distance(&ci.sequence, &cj.sequence);
+    // SUBSTITUTION split (same length; length gave no signal). The discriminator
+    // is CONSISTENCY: a real haplotype split — even a single clean SNP —
+    // separates reads cleanly across its het site(s) (consistency ~1.0), while
+    // two error/stutter sub-clusters of one allele do not (~0.7 at ONT error). A
+    // high consistency bar with ≥1 informative site and ≥1 consensus difference
+    // admits the clean single-SNP diploid while rejecting noise. The `same_length`
+    // gate is load-bearing: a length-jitter sub-split (which `length_separated`
+    // already rejected as sub-bimodal) must NOT leak in here as a "substitution".
+    // High-error substitution alleles (consistency dragged down by per-read error)
+    // are the acknowledged residual weak case.
+    same_length
+        && bp.consistency >= LINKAGE_SUBST_CONSISTENCY
+        && bp.n_informative_sites >= 1
+        && edit >= 1
 }
 
 /// Merge any pair of proposed groups that is NOT a genuinely distinct allele,

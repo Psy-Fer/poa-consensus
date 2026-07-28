@@ -644,19 +644,15 @@ pub fn consensus_multi(
     config: &PoaConfig,
 ) -> Result<Vec<Consensus>, PoaError> {
     validate(reads, seed_idx)?;
-    // Multi-allele runs on the LEGACY graph engine. A poa2-native multi-allele
-    // was attempted (see crate::poa2::consensus_multi, kept as WIP) but does not
-    // reach legacy's real-data parity: poa2's node-fusion folds periodic repeats
-    // so a shorter allele's length difference smears across many equal-length
-    // phase bubbles, and every phasing signal tried (structural-only,
-    // all-bubbles, length-refinement) regresses a different subset of the real
-    // HiFi multi scenarios (multi_gaa30_100 / multi_skew_cag20_40 /
-    // multi_cag20_50). Matching legacy — itself the product of two documented
-    // investigation rounds — needs flanking-anchor pre-processing, a separate
-    // effort. Single-allele is fully on poa2; multi stays on legacy until then.
-    let mut alleles = build_graph(reads, seed_idx, config.clone(), true)?.consensus_multi()?;
-    remap_read_indices_to_input(&mut alleles, seed_idx, reads.len());
-    Ok(alleles)
+    // Multi-allele runs on the clean poa2 HYBRID engine: structural-bubble
+    // discovery proposes splits, linkage discovery + consensus-difference /
+    // bimodality confirmation refines them and rejects false splits. It picks its
+    // own median-length seed and emits external read indices directly, so
+    // `seed_idx` is only used for input validation and no remap is needed. On the
+    // robustness matrix it beats the legacy engine on read-assignment cleanliness
+    // and single-allele safety at near-equal split sensitivity. (Same-length
+    // substitution haplotypes are the one weaker case; tracked separately.)
+    crate::poa2::hybrid_consensus_multi(reads, config)
 }
 
 /// Two-pass adaptive consensus.
