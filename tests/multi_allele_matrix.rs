@@ -24,11 +24,13 @@ use synth::{AlleleSpec, Outcome, Read, Spec};
 enum Engine {
     Legacy,
     Poa2,
+    Linkage,
 }
 
 fn engine() -> Engine {
     match std::env::var("BASELINE_ENGINE").as_deref() {
         Ok("poa2") => Engine::Poa2,
+        Ok("linkage") => Engine::Linkage,
         _ => Engine::Legacy,
     }
 }
@@ -37,6 +39,7 @@ fn engine_name() -> &'static str {
     match engine() {
         Engine::Legacy => "legacy",
         Engine::Poa2 => "poa2",
+        Engine::Linkage => "linkage",
     }
 }
 
@@ -56,6 +59,7 @@ fn run_multi(reads: &[Read], config: &PoaConfig) -> (Vec<Vec<usize>>, Vec<usize>
     let result = match engine() {
         Engine::Legacy => poa_consensus::consensus_multi(&seqs, 0, config),
         Engine::Poa2 => poa_consensus::poa2::consensus_multi(&seqs, config),
+        Engine::Linkage => poa_consensus::poa2::linkage_consensus_multi(&seqs, config),
     };
     match result {
         Ok(alleles) => (
@@ -117,11 +121,25 @@ fn base_spec(alleles: Vec<AlleleSpec>, err: f64, unit_len: usize, partial: f64, 
     }
 }
 
-fn diploid_length(motif: &[u8], ua: usize, ub: usize, depth: usize, err: f64, partial: f64, seed: u64) -> Spec {
+fn diploid_length(
+    motif: &[u8],
+    ua: usize,
+    ub: usize,
+    depth: usize,
+    err: f64,
+    partial: f64,
+    seed: u64,
+) -> Spec {
     base_spec(
         vec![
-            AlleleSpec { mid: synth::repeat(motif, ua), n_reads: depth },
-            AlleleSpec { mid: synth::repeat(motif, ub), n_reads: depth },
+            AlleleSpec {
+                mid: synth::repeat(motif, ua),
+                n_reads: depth,
+            },
+            AlleleSpec {
+                mid: synth::repeat(motif, ub),
+                n_reads: depth,
+            },
         ],
         err,
         motif.len(),
@@ -131,12 +149,28 @@ fn diploid_length(motif: &[u8], ua: usize, ub: usize, depth: usize, err: f64, pa
 }
 
 fn single(motif: &[u8], units: usize, depth: usize, err: f64, seed: u64) -> Spec {
-    base_spec(vec![AlleleSpec { mid: synth::repeat(motif, units), n_reads: depth }], err, motif.len(), 0.0, seed)
+    base_spec(
+        vec![AlleleSpec {
+            mid: synth::repeat(motif, units),
+            n_reads: depth,
+        }],
+        err,
+        motif.len(),
+        0.0,
+        seed,
+    )
 }
 
 /// Two SAME-length alleles differing only by substitutions (interruptions) at
 /// fixed positions — the substitution-haplotype case (no length signal at all).
-fn diploid_substitution(motif: &[u8], units: usize, n_subs: usize, depth: usize, err: f64, seed: u64) -> Spec {
+fn diploid_substitution(
+    motif: &[u8],
+    units: usize,
+    n_subs: usize,
+    depth: usize,
+    err: f64,
+    seed: u64,
+) -> Spec {
     let a = synth::repeat(motif, units);
     let mut b = a.clone();
     // Space the interruptions across the repeat; flip the base deterministically.
@@ -146,8 +180,14 @@ fn diploid_substitution(motif: &[u8], units: usize, n_subs: usize, depth: usize,
     }
     base_spec(
         vec![
-            AlleleSpec { mid: a, n_reads: depth },
-            AlleleSpec { mid: b, n_reads: depth },
+            AlleleSpec {
+                mid: a,
+                n_reads: depth,
+            },
+            AlleleSpec {
+                mid: b,
+                n_reads: depth,
+            },
         ],
         err,
         motif.len(),
@@ -157,13 +197,27 @@ fn diploid_substitution(motif: &[u8], units: usize, n_subs: usize, depth: usize,
 }
 
 /// Majority allele + a minority (mosaic/subclonal) allele at `minor_frac`.
-fn mosaic(motif: &[u8], ua: usize, ub: usize, total: usize, minor_frac: f64, err: f64, seed: u64) -> Spec {
+fn mosaic(
+    motif: &[u8],
+    ua: usize,
+    ub: usize,
+    total: usize,
+    minor_frac: f64,
+    err: f64,
+    seed: u64,
+) -> Spec {
     let minor = ((total as f64) * minor_frac).round() as usize;
     let major = total - minor;
     base_spec(
         vec![
-            AlleleSpec { mid: synth::repeat(motif, ua), n_reads: major },
-            AlleleSpec { mid: synth::repeat(motif, ub), n_reads: minor },
+            AlleleSpec {
+                mid: synth::repeat(motif, ua),
+                n_reads: major,
+            },
+            AlleleSpec {
+                mid: synth::repeat(motif, ub),
+                n_reads: minor,
+            },
         ],
         err,
         motif.len(),
@@ -175,9 +229,18 @@ fn mosaic(motif: &[u8], ua: usize, ub: usize, total: usize, minor_frac: f64, err
 fn triallelic(motif: &[u8], u: (usize, usize, usize), depth: usize, err: f64, seed: u64) -> Spec {
     base_spec(
         vec![
-            AlleleSpec { mid: synth::repeat(motif, u.0), n_reads: depth },
-            AlleleSpec { mid: synth::repeat(motif, u.1), n_reads: depth },
-            AlleleSpec { mid: synth::repeat(motif, u.2), n_reads: depth },
+            AlleleSpec {
+                mid: synth::repeat(motif, u.0),
+                n_reads: depth,
+            },
+            AlleleSpec {
+                mid: synth::repeat(motif, u.1),
+                n_reads: depth,
+            },
+            AlleleSpec {
+                mid: synth::repeat(motif, u.2),
+                n_reads: depth,
+            },
         ],
         err,
         motif.len(),
@@ -210,7 +273,11 @@ fn report(title: &str, rows: &[Row]) {
         let mark = if r.correct { "ok " } else { "XX " };
         println!(
             "  {mark} {:<34} got {}/{}  misassign {:>4.0}%  {}",
-            r.label, r.got, r.expected, r.misassign * 100.0, r.note
+            r.label,
+            r.got,
+            r.expected,
+            r.misassign * 100.0,
+            r.note
         );
     }
 }
@@ -225,7 +292,10 @@ fn case_single_allele_no_split() {
     for (mn, m) in MOTIFS {
         for &err in ERRS {
             for &d in &depths {
-                let gots: Vec<usize> = SEEDS.iter().map(|&s| eval(&single(m, 30, d, err, s)).got_alleles).collect();
+                let gots: Vec<usize> = SEEDS
+                    .iter()
+                    .map(|&s| eval(&single(m, 30, d, err, s)).got_alleles)
+                    .collect();
                 let splits = gots.iter().filter(|&&g| g > 1).count();
                 let errors = gots.iter().filter(|&&g| g == 0).count();
                 // Correct = exactly one allele on every seed (not split, not errored).
@@ -241,7 +311,10 @@ fn case_single_allele_no_split() {
             }
         }
     }
-    report("single allele — must be exactly 1 (never over-split)", &rows);
+    report(
+        "single allele — must be exactly 1 (never over-split)",
+        &rows,
+    );
 }
 
 #[test]
@@ -254,7 +327,8 @@ fn case_diploid_length() {
         for &(ua, ub) in gaps {
             for &err in ERRS {
                 for &d in &depths {
-                    let (ok, mis, got, _) = eval_seeds(|s| diploid_length(m, ua, ub, d, err, 0.0, s), SEEDS);
+                    let (ok, mis, got, _) =
+                        eval_seeds(|s| diploid_length(m, ua, ub, d, err, 0.0, s), SEEDS);
                     rows.push(Row {
                         label: format!("{mn} {ua}v{ub} d{d} e{:.0}%", err * 100.0),
                         got,
@@ -280,7 +354,8 @@ fn case_diploid_substitution() {
         for &ns in &subs {
             for &err in ERRS {
                 for &d in &depths {
-                    let (ok, mis, got, _) = eval_seeds(|s| diploid_substitution(m, 20, ns, d, err, s), SEEDS);
+                    let (ok, mis, got, _) =
+                        eval_seeds(|s| diploid_substitution(m, 20, ns, d, err, s), SEEDS);
                     rows.push(Row {
                         label: format!("{mn}x20 {ns}subs d{d} e{:.0}%", err * 100.0),
                         got,
@@ -350,9 +425,14 @@ fn case_partial_reads() {
     for (mn, m) in &MOTIFS[..3] {
         for &p in &partials {
             for &err in &[0.0f64, 0.03] {
-                let (ok, mis, got, _) = eval_seeds(|s| diploid_length(m, 20, 40, 20, err, p, s), SEEDS);
+                let (ok, mis, got, _) =
+                    eval_seeds(|s| diploid_length(m, 20, 40, 20, err, p, s), SEEDS);
                 rows.push(Row {
-                    label: format!("{mn} 20v40 d20 partial{:.0}% e{:.0}%", p * 100.0, err * 100.0),
+                    label: format!(
+                        "{mn} 20v40 d20 partial{:.0}% e{:.0}%",
+                        p * 100.0,
+                        err * 100.0
+                    ),
                     got,
                     expected: 2,
                     correct: ok,

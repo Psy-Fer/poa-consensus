@@ -902,6 +902,71 @@ impl Poa {
         m
     }
 
+    /// Build the read × het-site call matrix for linkage phasing. A het site is
+    /// a fork (a node with ≥2 out-edges each clearing `floor` reads); node fusion
+    /// makes substitutions forks too, so this uniformly captures SNP, indel, and
+    /// length divergences. A read's call at a site is the branch (successor) its
+    /// matched path takes, or MISSING if it doesn't traverse an out-edge of the
+    /// fork or takes a below-floor minor branch. Uses `read_matched_edges`
+    /// (matched-only, excludes delete-bypass resume) so a length variant's short
+    /// allele registers as a genuine branch, consistent with the phasing signal.
+    pub fn phasing_matrix(&self, floor: u32) -> crate::phasing::PhasingMatrix {
+        use crate::phasing::{MISSING, PhasingMatrix, Site};
+        // Per-read matched adjacency map: node -> successor taken by this read.
+        let mut read_next: Vec<std::collections::HashMap<usize, usize>> =
+            vec![std::collections::HashMap::new(); self.n_reads];
+        for (r, medges) in self.read_matched_edges.iter().enumerate() {
+            for &(a, b) in medges {
+                read_next[r].insert(a, b);
+            }
+        }
+        // Matched-only out-edge weights: (from,to) -> reads.
+        let mut mw: std::collections::HashMap<(usize, usize), u32> =
+            std::collections::HashMap::new();
+        for medges in &self.read_matched_edges {
+            for &e in medges {
+                *mw.entry(e).or_default() += 1;
+            }
+        }
+        // Fork sites: nodes with ≥2 matched out-edges each ≥ floor.
+        let mut sites: Vec<Site> = Vec::new();
+        for node in 0..self.nodes.len() {
+            let mut branches: Vec<(usize, u32)> = self.nodes[node]
+                .out
+                .iter()
+                .filter_map(|e| {
+                    let w = mw.get(&(node, e.to)).copied().unwrap_or(0);
+                    if w >= floor { Some((e.to, w)) } else { None }
+                })
+                .collect();
+            if branches.len() < 2 {
+                continue;
+            }
+            branches.sort_unstable_by_key(|&(to, _)| to); // deterministic
+            sites.push(Site {
+                node,
+                branches: branches.iter().map(|&(to, _)| to).collect(),
+                branch_support: branches.iter().map(|&(_, w)| w).collect(),
+            });
+        }
+        // Calls: for each read/site, which branch (successor) did it take.
+        let mut calls = vec![vec![MISSING; sites.len()]; self.n_reads];
+        for (s, site) in sites.iter().enumerate() {
+            for r in 0..self.n_reads {
+                if let Some(&nxt) = read_next[r].get(&site.node) {
+                    if let Some(bi) = site.branches.iter().position(|&b| b == nxt) {
+                        calls[r][s] = bi as i16;
+                    }
+                }
+            }
+        }
+        PhasingMatrix {
+            n_reads: self.n_reads,
+            sites,
+            calls,
+        }
+    }
+
     /// Matched-only adjacency view for bubble detection: `(out, inc)` where
     /// `out[a]` is `[(b, matched_weight)]` and `inc[b]` is `[a, …]`, both
     /// counting only matched adjacencies (delete-bypass excluded). This is the
@@ -1474,6 +1539,155 @@ fn build_median(reads: &[&[u8]], cfg: &PoaConfig) -> (Poa, Vec<usize>) {
         }
     }
     (g, ext)
+}
+
+/// Classic O(nm) edit distance (small consensus sequences, exact).
+fn edit_distance(a: &[u8], b: &[u8]) -> usize {
+    let (n, m) = (a.len(), b.len());
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
+}
+
+/// Linkage-based multi-allele consensus (design/multi_allele_phasing_design.md).
+///
+/// Phases reads by **linkage** — a genuine allele is a set of differences that
+/// co-occur on the same reads across many het sites — rather than by any single
+/// bubble's arm span (a folded-graph artifact). The dominant read bipartition is
+/// only *trusted* when its two sides yield genuinely different consensus
+/// sequences (the consensus-difference confirmation), so phase-shift noise in a
+/// homogeneous repeat — which splits reads but yields the SAME consensus on both
+/// sides — collapses back to one allele. Recurses for 3+ alleles. Each allele's
+/// `read_indices` are the external (input) read indices.
+pub fn linkage_consensus_multi(
+    reads: &[&[u8]],
+    config: &PoaConfig,
+) -> Result<Vec<crate::types::Consensus>, crate::error::PoaError> {
+    use crate::error::PoaError;
+    if reads.len() < config.min_reads {
+        return Err(PoaError::InsufficientDepth {
+            got: reads.len(),
+            min: config.min_reads,
+        });
+    }
+    let all: Vec<usize> = (0..reads.len()).filter(|&i| !reads[i].is_empty()).collect();
+    let mut out = Vec::new();
+    linkage_split(reads, &all, config, 0, &mut out);
+    Ok(out)
+}
+
+/// Max recursion depth (allele count is bounded by 2^depth; 3 covers up to ~8).
+const LINKAGE_MAX_DEPTH: usize = 3;
+/// A read bipartition is only trusted as a real allele split when it is this
+/// clean (fraction of calls matching their side's per-site majority). Noise
+/// sub-clusters of one allele split at lower consistency, so this gate stops the
+/// recursion from over-splitting a single allele at higher error rates.
+const LINKAGE_SPLIT_CONSISTENCY: f64 = 0.80;
+/// Minimum consensus-length gap (bp) between two sides for a *length*-variant
+/// split. Above per-read stutter (±1 repeat unit) for the common motifs, so an
+/// allele's own stutter sub-clusters don't get split, while a genuine
+/// repeat-count difference (many bp) does.
+const LINKAGE_LEN_GAP_BP: usize = 8;
+
+/// Build a consensus for `subset` of `reads`, tagged with the subset's external
+/// indices (sorted).
+fn subset_consensus(
+    reads: &[&[u8]],
+    subset: &[usize],
+    config: &PoaConfig,
+) -> crate::types::Consensus {
+    let sub_reads: Vec<&[u8]> = subset.iter().map(|&i| reads[i]).collect();
+    let (g, _) = build_median(&sub_reads, config);
+    let mut c = g.consensus_full();
+    let mut idx = subset.to_vec();
+    idx.sort_unstable();
+    c.read_indices = idx;
+    c
+}
+
+/// Recursively split `subset` by the dominant linkage bipartition, keeping a
+/// split only when the two sides' consensuses genuinely differ.
+fn linkage_split(
+    reads: &[&[u8]],
+    subset: &[usize],
+    config: &PoaConfig,
+    depth: usize,
+    out: &mut Vec<crate::types::Consensus>,
+) {
+    // Too shallow to split into two min_reads-sized alleles, or too deep.
+    if subset.len() < 2 * config.min_reads || depth >= LINKAGE_MAX_DEPTH {
+        out.push(subset_consensus(reads, subset, config));
+        return;
+    }
+    let sub_reads: Vec<&[u8]> = subset.iter().map(|&i| reads[i]).collect();
+    let (g, ext) = build_median(&sub_reads, config);
+    let floor = ((g.n_reads as f64 * config.min_allele_freq).ceil() as u32)
+        .max(config.min_reads as u32)
+        .max(2);
+    let bp = g.phasing_matrix(floor).dominant_bipartition();
+
+    // Cheap pre-filter: need a real candidate split (≥2 informative sites, both
+    // sides big enough). The consensus-difference test below is the real gate.
+    let mut s0 = Vec::new();
+    let mut s1 = Vec::new();
+    for internal in 0..g.n_reads {
+        let orig = subset[ext[internal]];
+        if bp.assign[internal] == 0 {
+            s0.push(orig);
+        } else {
+            s1.push(orig);
+        }
+    }
+    let whole = |out: &mut Vec<crate::types::Consensus>| {
+        let mut c = g.consensus_full();
+        let mut idx = subset.to_vec();
+        idx.sort_unstable();
+        c.read_indices = idx;
+        out.push(c);
+    };
+    if bp.n_informative_sites < 2 || s0.len() < config.min_reads || s1.len() < config.min_reads {
+        whole(out);
+        return;
+    }
+
+    // Confirmation: do the two sides yield genuinely different sequences? A
+    // phase-shift-noise split yields the same consensus on both sides; a real
+    // allele split differs at the variant positions. Two regimes:
+    //  - a LARGE difference (length variant) is real regardless of how noisy the
+    //    per-read bipartition is (fixes under-splitting at high error), while
+    //  - a SMALL difference (a few substitutions) is only trusted when the
+    //    bipartition is clean (high consistency), so error noise between two
+    //    sub-clusters of ONE allele does not fabricate a split.
+    let c0 = subset_consensus(reads, &s0, config);
+    let c1 = subset_consensus(reads, &s1, config);
+    let diff = edit_distance(&c0.sequence, &c1.sequence);
+    // A split is a real allele boundary in one of two regimes:
+    //  - LENGTH variant: the two sides' consensus lengths differ by a real gap.
+    //    Consensus length is the modal allele length, so per-read stutter and
+    //    base errors (which don't shift the mode) leave this ~0 within one
+    //    allele — this is what stops the recursion splitting an allele into its
+    //    stutter sub-clusters at high error.
+    //  - SUBSTITUTION haplotype: same length, but a clean (high-consistency)
+    //    bipartition with base differences. Gated on consistency so error noise
+    //    between two sub-clusters of one allele can't fabricate a split.
+    let len_gap = c0.sequence.len().abs_diff(c1.sequence.len());
+    let real_split = len_gap >= LINKAGE_LEN_GAP_BP
+        || (bp.consistency >= LINKAGE_SPLIT_CONSISTENCY && len_gap <= 4 && diff >= 3);
+    if !real_split {
+        whole(out);
+        return;
+    }
+    // Real split — recurse each side (handles 3+ alleles).
+    linkage_split(reads, &s0, config, depth + 1, out);
+    linkage_split(reads, &s1, config, depth + 1, out);
 }
 
 /// Multi-allele consensus over `reads` (WORK IN PROGRESS — not the production

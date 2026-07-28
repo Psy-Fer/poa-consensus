@@ -150,7 +150,12 @@ pub fn generate(spec: &Spec) -> Vec<Read> {
 
 /// Convenience: `motif` repeated `units` times.
 pub fn repeat(motif: &[u8], units: usize) -> Vec<u8> {
-    motif.iter().copied().cycle().take(motif.len() * units).collect()
+    motif
+        .iter()
+        .copied()
+        .cycle()
+        .take(motif.len() * units)
+        .collect()
 }
 
 /// A pseudo-random non-periodic sequence of length `len` (deterministic per seed).
@@ -244,7 +249,13 @@ pub fn score(reads: &[Read], spec: &Spec, group_read_indices: &[Vec<usize>]) -> 
         // Greedy: each group takes its majority label (labels may repeat).
         let assign: Vec<usize> = hist
             .iter()
-            .map(|h| h.iter().enumerate().max_by_key(|&(_, &c)| c).map(|(i, _)| i).unwrap_or(0))
+            .map(|h| {
+                h.iter()
+                    .enumerate()
+                    .max_by_key(|&(_, &c)| c)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            })
             .collect();
         let correct: usize = (0..g).map(|gi| hist[gi][assign[gi]]).sum();
         (correct, assign)
@@ -301,7 +312,13 @@ pub fn score_with_lens(
         best.1
     } else {
         hist.iter()
-            .map(|h| h.iter().enumerate().max_by_key(|&(_, &c)| c).map(|(i, _)| i).unwrap_or(0))
+            .map(|h| {
+                h.iter()
+                    .enumerate()
+                    .max_by_key(|&(_, &c)| c)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            })
             .collect()
     };
     let mut out = score(reads, spec, group_read_indices);

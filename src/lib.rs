@@ -342,6 +342,7 @@ pub mod error;
 pub mod flank;
 pub mod graph;
 pub mod orient;
+pub mod phasing;
 pub mod poa2;
 pub mod seed;
 pub mod types;
