@@ -884,7 +884,7 @@ impl Poa {
                 present[c] += 1;
             }
         }
-        let bases = [b'A', b'C', b'G', b'T'];
+        let bases = *b"ACGT";
         let mut out = Vec::with_capacity(ncol);
         let mut cov = Vec::with_capacity(ncol);
         // Column index already IS topological order (0..ncol).
