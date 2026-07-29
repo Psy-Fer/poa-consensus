@@ -4,9 +4,19 @@ pub enum AlignmentMode {
     SemiGlobal,
 }
 
+/// How the consensus sequence is extracted from the built graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusMode {
+    /// Default. "Best-fit": build both a heaviest-path and a majority-frequency
+    /// consensus and keep whichever the reads better support (lower mean
+    /// per-read insert+delete on realignment). The two win on different inputs
+    /// — heaviest on clean/short, majority on high-error length-variable repeats
+    /// — so picking per call gets the better of both. Never worse than plain
+    /// heaviest path.
     HeaviestPath,
+    /// Force the majority-frequency (MSA-column) consensus regardless of fit:
+    /// each column emits its plurality base, counting read deletions explicitly.
+    /// Best when column majority is trusted outright, e.g. high-depth amplicons.
     MajorityFrequency,
 }
 

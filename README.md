@@ -118,7 +118,7 @@ poa-consensus reads.fa --band-width 100 --adaptive-band-b 12 --adaptive-band-f 0
 
 # Coverage / consensus
 poa-consensus reads.fa --min-reads 5 --min-coverage-fraction 0.6
-poa-consensus reads.fa --consensus-mode majority        # heaviest (default) | majority
+poa-consensus reads.fa --consensus-mode majority        # default (best-fit) | force MSA-column majority
 
 # Multi-allele (raise min-allele-freq on noisy ONT data)
 poa-consensus reads.fa --multi --min-allele-freq 0.4 --phasing-bubble-min-span 8

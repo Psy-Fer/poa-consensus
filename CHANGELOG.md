@@ -50,6 +50,9 @@ Over-calls nothing, and every consensus is fully supported by a read pileup (0 f
   Heaviest-path and majority-frequency win on different inputs; picking per call
   gets the better of both without an oracle. Per-position output fields
   (coverage, path weights, gaps) are made consistent with the chosen sequence.
+  `ConsensusMode` now selects this: `HeaviestPath` (default) runs best-fit;
+  `MajorityFrequency` forces the MSA-column majority (previously `consensus_mode`
+  was accepted but ignored — the `--consensus-mode majority` CLI flag now works).
 - **`poa2::align_indel_counts`** — a small public helper that aligns reads to a
   candidate sequence and returns per-read (insert, delete) op counts. Backs
   `analysis::consensus_fit`, which no longer depends on any engine internals.

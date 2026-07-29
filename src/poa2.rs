@@ -691,7 +691,6 @@ impl Poa {
     /// output stays self-consistent; graph-structural fields (graph_stats,
     /// bubble_sites) are unchanged since they describe the graph, not the path.
     pub fn consensus_full_best_fit(&self, reads: &[&[u8]]) -> crate::types::Consensus {
-        use crate::types::{CoverageGap, GapKind};
         let base = self.consensus_full();
         let (mf_seq, mf_cov) = self.consensus_majority_cov();
         if base.sequence == mf_seq {
@@ -702,9 +701,37 @@ impl Poa {
         if fh <= fm {
             return base; // heaviest-path wins (ties keep the path-based output)
         }
-        // Majority-frequency wins: rebuild per-position fields from MF columns.
-        // path_weights proxy: the incoming support at each base = min of adjacent
-        // column coverages (there is no single node path for an MF consensus).
+        Self::mf_full(base, mf_seq, mf_cov)
+    }
+
+    /// Rich `Consensus` forced to the majority-frequency (MSA-column) sequence,
+    /// regardless of fit. This is what `ConsensusMode::MajorityFrequency`
+    /// selects — useful for high-depth amplicons where column majority is
+    /// trusted over the heaviest path. Per-position fields come from the MF
+    /// columns; graph-structural fields (graph_stats, bubble_sites) from the
+    /// underlying graph.
+    pub fn consensus_full_majority(&self) -> crate::types::Consensus {
+        let base = self.consensus_full();
+        let (mf_seq, mf_cov) = self.consensus_majority_cov();
+        if base.sequence == mf_seq {
+            return base;
+        }
+        Self::mf_full(base, mf_seq, mf_cov)
+    }
+
+    /// Rebuild a rich `Consensus` around a majority-frequency sequence `mf_seq`
+    /// with per-column coverage `mf_cov`, taking graph-structural fields from
+    /// `base` (the heaviest-path output over the same graph). Per-position
+    /// fields are recomputed so the output stays self-consistent with the MF
+    /// sequence: `path_weights` proxies incoming support as the min of adjacent
+    /// column coverages (an MF consensus has no single node path), and interior
+    /// coverage gaps are re-derived from `mf_cov`.
+    fn mf_full(
+        base: crate::types::Consensus,
+        mf_seq: Vec<u8>,
+        mf_cov: Vec<u32>,
+    ) -> crate::types::Consensus {
+        use crate::types::{CoverageGap, GapKind};
         let mut path_weights = Vec::with_capacity(mf_cov.len());
         for i in 0..mf_cov.len() {
             let w = if i == 0 {
@@ -2203,6 +2230,26 @@ mod tests {
             g.add_read(seed);
         }
         assert_eq!(g.consensus(), seed.to_vec());
+    }
+
+    #[test]
+    fn majority_mode_forces_msa_column_consensus() {
+        // ConsensusMode::MajorityFrequency (via `consensus_full_majority`) emits
+        // the MSA-column-majority sequence, not the best-fit/heaviest one. Even
+        // when heaviest and majority agree here, the forced-majority rich output
+        // must equal the raw column-majority sequence exactly (wiring guard for
+        // the CLI `--consensus-mode majority` flag / config.consensus_mode).
+        let seed = b"ACGTACGTACGTACGT";
+        let ins = b"ACGTACGTAACGTACGT"; // one extra A (minority insertion)
+        let mut g = Poa::new(seed, cfg());
+        for _ in 0..3 {
+            g.add_read(seed);
+        }
+        g.add_read(ins);
+        assert_eq!(g.consensus_full_majority().sequence, g.consensus_majority());
+        // The minority insertion is a gap-majority column, so it is dropped:
+        // majority consensus equals the clean backbone.
+        assert_eq!(g.consensus_majority(), seed.to_vec());
     }
 
     #[test]

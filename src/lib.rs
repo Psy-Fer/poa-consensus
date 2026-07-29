@@ -38,7 +38,8 @@
 //!     b"CATCATCAT",
 //! ];
 //!
-//! // Single-allele consensus; seed_idx=0 seeds the graph with reads[0].
+//! // Single-allele consensus. `seed_idx` is validated for bounds but the
+//! // engine self-seeds on the median-length read, so it is not load-bearing.
 //! let result = consensus(&reads, 0, &PoaConfig::default())?;
 //! println!("{}", String::from_utf8_lossy(&result.sequence));
 //!
@@ -66,28 +67,21 @@
 //!
 //! ## Seed selection
 //!
-//! The seed read initialises the graph as a linear chain of nodes.  All other
-//! reads are aligned into this initial structure, so a poor seed degrades
-//! alignment quality for every subsequent read.
+//! The seed read initialises the graph as a linear chain of nodes; all other
+//! reads are aligned into this initial structure.  A median-length seed is the
+//! best backbone (reads shorter than the seed produce terminal deletions,
+//! longer reads produce extensions; the median minimises both), so **the
+//! single-allele [`consensus`] entry point self-seeds on the median-length read
+//! internally** — `seed_idx` is validated for bounds but does not bias the
+//! result.  You do not need to pick a seed for the common case.
 //!
-//! **Choose a median-length read.**  The seed acts as the backbone; reads
-//! shorter than the seed produce terminal deletions and reads longer than the
-//! seed produce extensions.  A median-length seed minimises both.  In
-//! high-throughput use (many loci), `reads.iter().enumerate().min_by_key(|(_, r)| r.len().abs_diff(median_len))` is a one-liner.
+//! For lower-level or multi-allele use, the [`select_seed`] helper implements
+//! the same median/terminal-anchor heuristics if you want to choose explicitly.
 //!
-//! **Avoid outliers.**  The longest and shortest reads are the most likely to
-//! be error-prone or to span a different number of repeat units.  Using one as
-//! the seed skews the initial graph in a direction that the alignment of
-//! subsequent reads must then correct.
-//!
-//! **Orient reads before selecting the seed.**  Mixed-strand input produces a
-//! garbage graph silently.  Call [`auto_orient`] before POA construction; it
-//! uses k-mer matching (O(n) per read, no alignment) and returns borrowed
-//! slices for reads already on the correct strand.
-//!
-//! Seed selection is the caller's responsibility.  The API takes an explicit
-//! `seed_idx` so that the selection logic can live in the caller and be tuned
-//! per application.
+//! **Orient reads first, either way.**  Mixed-strand input produces a garbage
+//! graph silently.  Call [`auto_orient`] before POA construction; it uses k-mer
+//! matching (O(n) per read, no alignment) and returns borrowed slices for reads
+//! already on the correct strand.
 //!
 //! ## Band width and scale
 //!
@@ -191,22 +185,22 @@
 //!
 //! ### Example
 //!
-//! Using `gap_open = -2` and `gap_extend = -1`:
+//! Using this crate's defaults, `gap_open = -4` and `gap_extend = -3`:
 //!
 //! ```text
 //! One gap of length 4:
-//!     gap_open + 4 * gap_extend = -2 + (-4) = -6
+//!     gap_open + 4 * gap_extend = -4 + (-12) = -16
 //!
 //! Four gaps of length 1:
-//!     4 * (gap_open + 1 * gap_extend) = 4 * (-3) = -12
+//!     4 * (gap_open + 1 * gap_extend) = 4 * (-7) = -28
 //! ```
 //!
-//! The single 4-base deletion costs -6. Four separate 1-base deletions cost
-//! -12. The aligner now strongly prefers the single-event explanation, which
+//! The single 4-base deletion costs -16. Four separate 1-base deletions cost
+//! -28. The aligner strongly prefers the single-event explanation, which
 //! matches biological reality.
 //!
-//! With linear gaps (gap = -1) both scenarios cost -4 and the aligner cannot
-//! distinguish them at all.
+//! With linear gaps (a flat `-1` per base) both scenarios cost -4 and the
+//! aligner cannot distinguish them at all.
 //!
 //! ### Worked alignment example
 //!
@@ -217,12 +211,13 @@
 //! Read:      A C G T - - - - A C G T
 //! ```
 //!
-//! Scoring (match = +1, mismatch = -1, gap_open = -2, gap_extend = -1):
+//! Scoring with the defaults (match = +2, mismatch = -4, gap_open = -4,
+//! gap_extend = -3):
 //!
 //! ```text
-//! 8 matching bases:  8 * (+1)           =  +8
-//! 1 gap of length 4: -2 + 4 * (-1)     =  -6
-//! Total:                                =  +2
+//! 8 matching bases:  8 * (+2)           = +16
+//! 1 gap of length 4: -4 + 4 * (-3)     = -16
+//! Total:                                =   0
 //! ```
 //!
 //! Now consider a different alignment that avoids the gap by accepting 4
@@ -234,18 +229,19 @@
 //! ```
 //!
 //! ```text
-//! 8 matching bases:   8 * (+1)          =  +8
-//! 4 mismatches:       4 * (-1)          =  -4
-//! Total:                                =  +4
+//! 8 matching bases:   8 * (+2)          = +16
+//! 4 mismatches:       4 * (-4)          = -16
+//! Total:                                =   0
 //! ```
 //!
-//! Here the mismatched alignment scores higher (+4 vs +2), so the aligner
-//! would choose it. Whether that is the right call depends on the biology: if
-//! the read truly has a 4-base deletion, these parameters would produce the
-//! wrong alignment. Tuning `gap_open` and `gap_extend` controls this
-//! trade-off. A more negative `gap_open` makes the aligner more willing to
-//! open a gap rather than accept mismatches; a less negative `gap_extend`
-//! makes longer gaps cheaper relative to short ones.
+//! With these defaults the two alignments tie at this length: a 4-base gap and
+//! 4 mismatches score equally. That balance is deliberate — the gap penalties
+//! are harsh enough that the aligner does not open cheap spurious gaps in
+//! homopolymer or periodic runs (the failure mode that over-called repeat
+//! lengths under looser scoring), but not so harsh that a genuine deletion is
+//! always rejected in favour of mismatches. Shorter gaps tilt toward
+//! mismatches, longer gaps toward the single deletion event. Crucially, POA
+//! does not have to get this call right on any one read (next section).
 //!
 //! ### Why individual alignment ambiguity matters less in POA
 //!
@@ -264,8 +260,9 @@
 //! This means parameter choices affect alignment quality at the margins, but
 //! the coverage threshold and heaviest-path extraction together resolve most
 //! of the ambiguity that would be fatal to a single pairwise alignment. The
-//! defaults (`gap_open = -2`, `gap_extend = -1`) are calibrated for Oxford
-//! Nanopore and PacBio HiFi reads, where indels are the dominant error type.
+//! defaults (`match = +2`, `mismatch = -4`, `gap_open = -4`, `gap_extend = -3`)
+//! are calibrated for Oxford Nanopore and PacBio HiFi reads at tandem-repeat
+//! loci, where cheap gaps otherwise over-call repeat length.
 //!
 //! ### How affine scoring changes the dynamic programming
 //!
@@ -306,15 +303,14 @@
 //!
 //! ### Choosing parameter values
 //!
-//! The defaults used in this crate (`gap_open = -2`, `gap_extend = -1`) work
-//! well for Oxford Nanopore and PacBio HiFi reads at short tandem repeat loci.
-//! As a rule of thumb:
+//! The defaults used in this crate (`match = +2`, `mismatch = -4`,
+//! `gap_open = -4`, `gap_extend = -3`) work well for Oxford Nanopore and PacBio
+//! HiFi reads at short tandem repeat loci. As a rule of thumb:
 //!
-//! - Increase the magnitude of `gap_open` (e.g. `-4`) to make the aligner
+//! - Increase the magnitude of `gap_open`/`gap_extend` to make the aligner even
 //!   more reluctant to open gaps, preferring mismatches instead.
-//! - Decrease the magnitude of `gap_extend` (e.g. `-0.5`, or use integer
-//!   scaling) to make long gaps cheaper, useful when reads have systematic
-//!   length variation.
+//! - Decrease the magnitude of `gap_extend` to make long gaps cheaper per base,
+//!   useful when reads have systematic length variation.
 //! - Setting `gap_open = 0` recovers linear gap behaviour where only
 //!   `gap_extend` matters.
 
@@ -388,12 +384,18 @@ pub fn consensus(
             g.add_read(r);
         }
     }
-    // Best-fit consensus: pick heaviest-path vs majority-frequency by fit
-    // against the reads (the two win different cases; majority-frequency
-    // recovers homopolymer/length-variable repeats the heaviest path
-    // over-calls). Per-position output fields are made consistent with the
-    // chosen sequence inside `consensus_full_best_fit`.
-    Ok(g.consensus_full_best_fit(reads))
+    // Consensus extraction honours `consensus_mode`:
+    //  - HeaviestPath (default): best-fit — compute both a heaviest-path and a
+    //    majority-frequency consensus and keep whichever the reads better
+    //    support (majority-frequency recovers homopolymer/length-variable
+    //    repeats the heaviest path over-calls).
+    //  - MajorityFrequency: force the MSA-column majority consensus (useful for
+    //    high-depth amplicons where column majority is trusted outright).
+    // Per-position output fields are made consistent with the chosen sequence.
+    Ok(match config.consensus_mode {
+        crate::config::ConsensusMode::MajorityFrequency => g.consensus_full_majority(),
+        crate::config::ConsensusMode::HeaviestPath => g.consensus_full_best_fit(reads),
+    })
 }
 
 /// Build a multi-allele consensus from `reads`.
