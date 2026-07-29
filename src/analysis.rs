@@ -283,7 +283,7 @@ pub fn max_achievable_accuracy(n: usize, sigma_per_obs: f64) -> f64 {
 /// exists.
 ///
 /// A `Some` result is the primary signal to re-run with
-/// [`PoaGraph::consensus_multi`]: a meaningful fraction of reads support a
+/// [`consensus_multi`](crate::consensus_multi): a meaningful fraction of reads support a
 /// different sequence at this position.
 ///
 /// `min_freq` is applied against `n_reads`, consistent with how the graph's
@@ -334,7 +334,7 @@ pub fn has_competing_allele(consensus: &Consensus, min_freq: f64) -> Option<&Bub
 ///
 /// Thin wrapper over [`has_competing_allele`] for callers that only need the
 /// boolean signal.  When `true`, re-run with
-/// [`PoaGraph::consensus_multi`] to separate the alleles.
+/// [`consensus_multi`](crate::consensus_multi) to separate the alleles.
 ///
 /// # Examples
 /// ```
@@ -380,16 +380,16 @@ pub struct ConsensusConfidence {
     pub min_cov: u32,
     /// Mean per-position coverage across the consensus.
     pub mean_cov: f64,
-    /// Whether any coverage gap was detected (see [`CoverageGap`]).
+    /// Whether any coverage gap was detected (see [`CoverageGap`](crate::CoverageGap)).
     pub has_gaps: bool,
     /// Whether any bubble site has a minority arm above the `min_allele_freq`
-    /// threshold.  If `true`, re-run with [`PoaGraph::consensus_multi`].
+    /// threshold.  If `true`, re-run with [`consensus_multi`](crate::consensus_multi).
     pub competing_allele: bool,
     /// Fraction of consensus positions with coverage below half the read depth.
     /// Values above ~0.1 indicate widespread partial-read coverage.
     pub low_cov_fraction: f64,
     /// Fraction of graph nodes supported by exactly one read (from
-    /// [`GraphStats`]).  Values above ~0.15 suggest the graph is noisy.
+    /// [`GraphStats`](crate::GraphStats)).  Values above ~0.15 suggest the graph is noisy.
     pub single_support_fraction: f64,
 }
 
@@ -604,7 +604,7 @@ pub struct ConsensusWarnings {
     pub structural_competing: Option<StructuralCompetingSummary>,
     /// Suspected silent truncation: consensus is much shorter than the median
     /// input read, suggesting banded DP converged to the wrong diagonal.
-    /// Retry with `band_width = 0` or use `consensus_adaptive` to recover.
+    /// Retry with `band_width = 0` (unbanded) to recover.
     pub truncation_suspected: Option<TruncationWarning>,
 }
 
@@ -696,8 +696,7 @@ impl ConsensusWarnings {
                 format!(
                     "{label}: consensus ({} bp) is {:.0}% of median input read length \
                      ({} bp) — banded DP may have converged to the wrong diagonal on \
-                     highly repetitive sequence; retry with band_width=0 or \
-                     consensus_adaptive",
+                     highly repetitive sequence; retry with band_width=0",
                     t.consensus_len,
                     t.ratio * 100.0,
                     t.median_read_len,
@@ -721,10 +720,11 @@ impl ConsensusWarnings {
 /// exactly.**
 ///
 /// This is a *relative* scorer, meant to compare several candidate
-/// consensuses built from the same read population against each other (see
-/// [`consensus_adaptive`](crate::consensus_adaptive)'s seed-sensitivity
-/// retry) — not an absolute, scenario-independent "this consensus is wrong"
-/// threshold. Empirical investigation (see CHANGELOG) found no single
+/// consensuses built from the same read population against each other (the
+/// single-allele [`consensus`](crate::consensus) path uses it internally to
+/// pick between heaviest-path and majority-frequency) — not an absolute,
+/// scenario-independent "this consensus is wrong" threshold. Empirical
+/// investigation (see CHANGELOG) found no single
 /// graph-level statistic (`GraphStats::single_support_fraction`,
 /// `bubble_count`, `edge_weight_gini`, seed length relative to the read
 /// population, ...) reliably separated genuinely-too-short consensuses from
@@ -747,28 +747,18 @@ pub fn consensus_fit(
     if reads.is_empty() || consensus_seq.is_empty() {
         return 0.0;
     }
-    let graph = match crate::graph::PoaGraph::new(consensus_seq, config.clone()) {
-        Ok(g) => g,
-        Err(_) => return 0.0,
-    };
-    let mut total = 0.0;
-    let mut n = 0usize;
-    for &read in reads {
-        if let Ok((ops, _, _)) = graph.align_read_ops(read) {
-            let n_insert = ops
-                .iter()
-                .filter(|o| matches!(o, crate::graph::AlignOp::Insert(_)))
-                .count();
-            let n_delete = ops
-                .iter()
-                .filter(|o| matches!(o, crate::graph::AlignOp::Delete(_)))
-                .count();
-            let denom = (read.len() + consensus_seq.len()) as f64 / 2.0;
-            total += (n_insert + n_delete) as f64 / denom.max(1.0);
-            n += 1;
-        }
+    // Delegate the per-read alignment to the poa2 engine; keep this function's
+    // own per-read length-normalised averaging (its established scale).
+    let counts = crate::poa2::align_indel_counts(consensus_seq, reads, config);
+    if counts.is_empty() {
+        return 0.0;
     }
-    if n == 0 { 0.0 } else { total / n as f64 }
+    let mut total = 0.0;
+    for (&read, &(n_insert, n_delete)) in reads.iter().zip(counts.iter()) {
+        let denom = (read.len() + consensus_seq.len()) as f64 / 2.0;
+        total += (n_insert + n_delete) as f64 / denom.max(1.0);
+    }
+    total / counts.len() as f64
 }
 
 /// Compute actionable diagnostic warnings for a [`Consensus`].

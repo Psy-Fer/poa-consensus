@@ -37,7 +37,6 @@ Both crates are pure Rust with no C dependencies.
 |---|---|
 | *(none)* | Library only; zero external dependencies |
 | `cli` | Binary target; pulls in `clap` + `noodles` |
-| `plot` | SVG visualisation helpers via `kuva` |
 
 ## Quick example
 

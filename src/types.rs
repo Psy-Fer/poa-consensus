@@ -106,46 +106,6 @@ pub struct BubbleSite {
     pub is_structural: bool,
 }
 
-/// A single node in the POA graph, as returned by [`PoaGraph::graph_topology`].
-#[derive(Debug, Clone)]
-pub struct GraphNodeInfo {
-    /// Internal node index (not stable across calls to `add_read`).
-    pub node_idx: usize,
-    /// DNA base at this node (`b'A'`, `b'C'`, `b'G'`, or `b'T'`).
-    pub base: u8,
-    /// Number of reads with a Match op at this node.
-    pub coverage: u32,
-    /// Number of reads that passed through via Delete (traversed without consuming a base).
-    pub delete_count: u32,
-    /// Topological position of this node (0 = first node).
-    pub topo_rank: usize,
-}
-
-/// A directed edge in the POA graph, as returned by [`PoaGraph::graph_topology`].
-#[derive(Debug, Clone)]
-pub struct GraphEdgeInfo {
-    /// Topological rank of the source node.
-    pub from_rank: usize,
-    /// Topological rank of the target node.
-    pub to_rank: usize,
-    /// Number of reads that traversed this edge.
-    pub weight: i32,
-}
-
-/// A snapshot of the POA graph topology for visualization and inspection.
-///
-/// Returned by [`PoaGraph::graph_topology`].  Indices in `edges` refer to
-/// entries in `nodes` by `topo_rank`.
-#[derive(Debug, Clone)]
-pub struct GraphTopology {
-    /// Nodes in topological order.
-    pub nodes: Vec<GraphNodeInfo>,
-    /// All directed edges.
-    pub edges: Vec<GraphEdgeInfo>,
-    /// Topological ranks of nodes on the heaviest-path (consensus) spine.
-    pub spine_ranks: Vec<usize>,
-}
-
 /// Per-graph statistics computed in a single O(V+E) pass.
 #[derive(Debug, Clone, Default)]
 pub struct GraphStats {
@@ -169,7 +129,7 @@ pub struct GraphStats {
     /// Arms longer than 4096 nodes are capped at 4096.
     pub longest_bubble_span: usize,
     /// Median length (in bases) of all reads that built this graph, including
-    /// the seed.  0 when no reads have been added.  Used by [`diagnose`] to
+    /// the seed.  0 when no reads have been added.  Used by [`diagnose`](crate::diagnose) to
     /// detect consensus truncation: a consensus much shorter than the median
     /// input read is a signal that banded DP converged to the wrong diagonal.
     pub median_input_read_len: usize,
@@ -191,7 +151,7 @@ pub struct Consensus {
     /// Coverage gaps detected in this consensus.  Empty when reads overlap
     /// throughout.  Each gap is either `Spanning` (seed-only bases, minimum
     /// size known) or `Unknown` (no spanning read; size completely unknown,
-    /// as produced by [`bridged_consensus`]).
+    /// as produced by [`bridged_consensus`](crate::bridged_consensus)).
     pub gaps: Vec<CoverageGap>,
     /// Bubble sites on the consensus path where two or more arms each have
     /// read support above `min_allele_freq`.  Empty when all forks are
@@ -199,115 +159,18 @@ pub struct Consensus {
     ///
     /// Each site corresponds to one branching node on the heaviest-path
     /// consensus.  Inspect `arm_read_counts` and `arm_sequences` to decide
-    /// whether to re-run with [`PoaGraph::consensus_multi`].
+    /// whether to re-run with [`consensus_multi`](crate::consensus_multi).
     pub bubble_sites: Vec<BubbleSite>,
-    /// Indices of the reads that contributed to this consensus, in the caller's
-    /// own read ordering.  Populated by [`PoaGraph::consensus_multi`] and the
-    /// [`consensus_multi`] free function; **empty for single-allele outputs**
-    /// ([`PoaGraph::consensus`], [`consensus`]).
-    ///
-    /// The exact meaning of each index depends on how the graph was built:
-    ///
-    /// * **Free functions** ([`consensus_multi`], [`consensus_adaptive`]): indices
-    ///   into the input `reads` slice you passed, regardless of `seed_idx`.
-    /// * **Stateful API** ([`PoaGraph::consensus_multi`] on a graph you built with
-    ///   [`PoaGraph::new`] + [`PoaGraph::add_read`]): the order you supplied reads,
-    ///   with the [`PoaGraph::new`] seed at index 0 and each [`PoaGraph::add_read`]
-    ///   call following in order.
-    ///
-    /// (These coincide when `seed_idx == 0`.  For non-zero `seed_idx` the free
-    /// functions translate the internal seed-first ordering back to your input
-    /// slice so the indices are directly usable.)
+    /// Indices of the reads that contributed to this consensus, as indices into
+    /// the input `reads` slice you passed (regardless of `seed_idx`).  Populated
+    /// by the [`consensus_multi`](crate::consensus_multi) free function; **empty
+    /// for single-allele outputs** ([`consensus`](crate::consensus)).
     ///
     /// An empty `Vec` means "all reads contributed" — no phasing was performed.
     /// A non-empty `Vec` identifies exactly which reads belong to this allele,
     /// enabling the caller to assign per-read rows, pull reads for visualisation,
     /// or compute per-allele statistics without re-running alignment.
     pub read_indices: Vec<usize>,
-}
-
-/// The action taken by [`consensus_adaptive`] on its second pass.
-///
-/// Returned inside [`AdaptiveResult`] so callers can distinguish a clean
-/// pass-through from a corrected result without re-running [`diagnose`].
-///
-/// [`consensus_adaptive`]: crate::consensus_adaptive
-/// [`diagnose`]: crate::diagnose
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdaptiveAction {
-    /// Pass-1 result was returned unchanged. Either no second-pass trigger
-    /// fired at all, or the singleton-support trigger fired but the pass-1
-    /// consensus itself scored best among the candidate remedies compared
-    /// (see [`NoisyTighten`](AdaptiveAction::NoisyTighten)) -- i.e. the
-    /// pass-1 result was already trustworthy despite the trigger.
-    PassThrough,
-    /// Competing bubble(s) above `min_allele_freq` triggered multi-allele
-    /// partitioning.  The `consensuses` vec has one element per detected allele.
-    MultiAllele,
-    /// Pass-1 consensus was below the truncation-ratio threshold; alignment was
-    /// retried with unbanded DP (`band_width = 0`).
-    TruncationRetry {
-        /// `true` if the unbanded retry produced a consensus at or above the
-        /// truncation threshold.  `false` means the output is still short:
-        /// the sequence may be genuinely short or the locus may need manual
-        /// review.
-        recovered: bool,
-    },
-    /// High singleton-support fraction triggered a comparison of several
-    /// candidate remedies, scored empirically against the actual read
-    /// population (see [`consensus_fit`](crate::analysis::consensus_fit)),
-    /// and the pass-1 consensus rebuilt with `min_coverage_fraction` raised
-    /// to ≥ 0.6 scored best.
-    ///
-    /// Before the seed-sensitivity retry (below) was added, this variant
-    /// was returned unconditionally whenever the trigger fired; it is now
-    /// one of several scored candidates, so the trigger firing no longer
-    /// guarantees this specific action -- see
-    /// [`AlternateSeedRetry`](AdaptiveAction::AlternateSeedRetry) and
-    /// [`MajorityFrequencyRetry`](AdaptiveAction::MajorityFrequencyRetry)
-    /// for the other possible outcomes, and
-    /// [`PassThrough`](AdaptiveAction::PassThrough) for the case where the
-    /// pass-1 consensus itself was already the best-scoring candidate.
-    NoisyTighten,
-    /// High singleton-support fraction triggered the same empirical
-    /// candidate comparison as [`NoisyTighten`](AdaptiveAction::NoisyTighten),
-    /// and re-seeding on a different read (one near the read population's
-    /// median length, rather than the auto-selected seed) scored best.
-    ///
-    /// Confirmed root cause this targets: an auto-selected seed that is
-    /// atypically short relative to the true read population can cause
-    /// `heaviest_path`/the interior filter to systematically under-call a
-    /// periodic/homogeneous repeat's length, because the extra content the
-    /// majority of reads carry (relative to the short seed) gets inserted at
-    /// ambiguous, scattered positions and no single insertion accumulates
-    /// enough coverage to survive on its own. Re-seeding on a more
-    /// representative-length read avoids the problem outright rather than
-    /// trying to recover from it after the fact.
-    AlternateSeedRetry,
-    /// High singleton-support fraction triggered the same empirical
-    /// candidate comparison as [`NoisyTighten`](AdaptiveAction::NoisyTighten),
-    /// and rebuilding with [`ConsensusMode::MajorityFrequency`] (same seed)
-    /// scored best.
-    ///
-    /// [`ConsensusMode::MajorityFrequency`]: crate::ConsensusMode::MajorityFrequency
-    MajorityFrequencyRetry,
-    /// High coverage coefficient of variation in `Global` mode triggered a
-    /// rebuild with [`AlignmentMode::SemiGlobal`].
-    ///
-    /// [`AlignmentMode::SemiGlobal`]: crate::AlignmentMode
-    SemiGlobalFallback,
-}
-
-/// Return value of [`consensus_adaptive`].
-///
-/// [`consensus_adaptive`]: crate::consensus_adaptive
-#[derive(Debug, Clone)]
-pub struct AdaptiveResult {
-    /// Assembled consensus sequences.  One element for single-allele outcomes;
-    /// two or more for multi-allele.
-    pub consensuses: Vec<Consensus>,
-    /// Which second-pass action (if any) was taken.
-    pub action: AdaptiveAction,
 }
 
 impl Consensus {

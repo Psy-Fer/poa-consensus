@@ -4,9 +4,19 @@ pub enum AlignmentMode {
     SemiGlobal,
 }
 
+/// How the consensus sequence is extracted from the built graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusMode {
+    /// Default. "Best-fit": build both a heaviest-path and a majority-frequency
+    /// consensus and keep whichever the reads better support (lower mean
+    /// per-read insert+delete on realignment). The two win on different inputs
+    /// — heaviest on clean/short, majority on high-error length-variable repeats
+    /// — so picking per call gets the better of both. Never worse than plain
+    /// heaviest path.
     HeaviestPath,
+    /// Force the majority-frequency (MSA-column) consensus regardless of fit:
+    /// each column emits its plurality base, counting read deletions explicitly.
+    /// Best when column majority is trusted outright, e.g. high-depth amplicons.
     MajorityFrequency,
 }
 
@@ -52,14 +62,10 @@ pub struct PoaConfig {
     ///   multi-allele bubble-structure consistency).
     ///
     /// The functional wrappers set this automatically ([`consensus_multi`]
-    /// builds with it `true`; single-allele paths leave it `false`). Stateful
-    /// callers ([`PoaGraph::new`]) who intend to call
-    /// [`PoaGraph::consensus_multi`] should set it `true` so alignment is built
-    /// in multi-allele mode. Default: `false` (single-allele).
+    /// builds with it `true`; single-allele paths leave it `false`), so most
+    /// callers never touch it. Default: `false` (single-allele).
     ///
     /// [`consensus_multi`]: crate::consensus_multi
-    /// [`PoaGraph::new`]: crate::PoaGraph::new
-    /// [`PoaGraph::consensus_multi`]: crate::PoaGraph::consensus_multi
     pub multi_allele: bool,
 }
 
@@ -70,10 +76,17 @@ impl Default for PoaConfig {
             adaptive_band: true,
             adaptive_band_b: 10,
             adaptive_band_f: 0.01,
-            match_score: 1,
-            mismatch_score: -1,
-            gap_open: -2,
-            gap_extend: -1,
+            // abPOA-style scoring: gaps and mismatches are harsh relative to
+            // match (+2), so the aligner does not open cheap spurious gaps in
+            // homopolymer/periodic runs. The old +1/-1/-2/-1 made gaps too cheap
+            // (a gap-open cost only 2 matches), scattering homopolymer alignments
+            // at high error and over-calling repeats; abPOA-like scoring roughly
+            // halves that error with no regression on clean inputs (validated on
+            // the robustness matrix + 3-way comparison, 2026-07-28).
+            match_score: 2,
+            mismatch_score: -4,
+            gap_open: -4,
+            gap_extend: -3,
             min_coverage_fraction: 0.0,
             min_allele_freq: 0.2,
             min_reads: 1,

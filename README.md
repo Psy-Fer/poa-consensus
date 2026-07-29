@@ -18,13 +18,13 @@ POA aligns reads into a directed acyclic graph (DAG) using affine-gap dynamic pr
 
 ```toml
 [dependencies]
-poa-consensus = "0.4"
+poa-consensus = "0.5"
 ```
 
 ### Functional API
 
 ```rust
-use poa_consensus::{consensus, consensus_multi, consensus_adaptive, PoaConfig};
+use poa_consensus::{consensus, consensus_multi, PoaConfig};
 
 let reads: Vec<&[u8]> = vec![
     b"CATCATCAT",
@@ -33,37 +33,26 @@ let reads: Vec<&[u8]> = vec![
     b"CATCATCAT",
 ];
 
-// Single-allele consensus; seed_idx seeds the graph with reads[seed_idx].
+// Single-allele consensus. The engine internally seeds on the median-length
+// read and returns the better-fitting of a heaviest-path and a
+// majority-frequency (MSA-column) consensus, so `seed_idx` is validated for
+// bounds but does not bias the result on periodic repeats.
 let result = consensus(&reads, 0, &PoaConfig::default())?;
 println!("{}", String::from_utf8_lossy(&result.sequence));
 
+// The result carries per-position coverage, per-base path weights, detected
+// bubble sites, and interior coverage gaps for downstream analysis.
+let stats = &result.graph_stats;
+println!("bubbles: {}", stats.bubble_count);
+
 // Multi-allele: returns one Consensus per detected allele.
 let alleles = consensus_multi(&reads, 0, &PoaConfig::default())?;
-
-// Adaptive two-pass: inspects graph statistics after pass 1 and automatically
-// chooses multi-allele split, noise tightening, or semi-global switch for pass 2.
-// Returns AdaptiveResult { consensuses, action } — action records which branch fired.
-let result  = consensus_adaptive(&reads, 0, &PoaConfig::default())?;
-let alleles = result.consensuses;  // Vec<Consensus>; one or two elements
 ```
 
-### Stateful API
-
-```rust
-use poa_consensus::{PoaGraph, PoaConfig};
-
-let reads: &[&[u8]] = &[b"CATCATCAT", b"CATCATCAT", b"CATCGTCAT"];
-
-let mut graph = PoaGraph::new(reads[0], PoaConfig::default())?;
-for read in &reads[1..] {
-    graph.add_read(read)?;
-}
-let consensus = graph.consensus()?;
-let stats     = graph.stats();
-println!("bubbles: {}", stats.bubble_count);
-```
-
-The stateful API lets you inspect graph state between reads and reuse pre-allocated buffers across calls, which is important for high-throughput per-locus pipelines.
+The API is purely functional. (Earlier releases exposed a stateful `PoaGraph`
+builder and a two-pass `consensus_adaptive`; both were removed in 0.5.0 when the
+engine was rebuilt — see the CHANGELOG. `consensus` now covers the single-allele
+case directly, including the seed-robustness the adaptive path used to provide.)
 
 ### Seed selection
 
@@ -117,12 +106,34 @@ poa-consensus reads.fa --no-adaptive-band # disable adaptive band (on by default
 poa-consensus reads.fa --quiet            # suppress warnings; errors always printed
 ```
 
+The full `PoaConfig` surface and the diagnostic thresholds are exposed as
+flags, grouped in `--help` under **Band**, **Scoring**, **Coverage / consensus**,
+**Alignment**, **Multi-allele**, and **Diagnostics**. Defaults match the library
+defaults, so plain `poa-consensus reads.fa` is unchanged. Examples:
+
+```
+# Scoring and band tuning
+poa-consensus reads.fa --match 2 --mismatch -2 --gap-open -3 --gap-extend -1
+poa-consensus reads.fa --band-width 100 --adaptive-band-b 12 --adaptive-band-f 0.02
+
+# Coverage / consensus
+poa-consensus reads.fa --min-reads 5 --min-coverage-fraction 0.6
+poa-consensus reads.fa --consensus-mode majority        # default (best-fit) | force MSA-column majority
+
+# Multi-allele (raise min-allele-freq on noisy ONT data)
+poa-consensus reads.fa --multi --min-allele-freq 0.4 --phasing-bubble-min-span 8
+
+# Diagnostics thresholds
+poa-consensus reads.fa --depth-warn-threshold 15 --truncation-ratio-threshold 0.5
+
+poa-consensus --help                                     # full grouped list
+```
+
 ## Feature flags
 
 | Flag   | Adds                                       |
 |--------|--------------------------------------------|
 | `cli`  | Binary target; pulls in `clap` + `noodles` |
-| `plot` | SVG visualisation helpers via `kuva`       |
 
 Default build: library only, zero external dependencies.
 

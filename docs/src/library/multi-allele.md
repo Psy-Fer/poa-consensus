@@ -18,6 +18,11 @@ for (i, allele) in alleles.iter().enumerate() {
 `consensus_multi` returns one `Consensus` per detected allele. If no heterozygous bubble
 is found the result is a single-element `Vec` equivalent to `consensus`.
 
+Phasing enforces the `min_allele_freq` frequency floor: an allele group whose read
+support falls below `min_allele_freq` of the locus is not called as a separate allele.
+This rejects stutter and valley over-splits, where sequencing noise on a homogeneous
+repeat would otherwise fragment one true allele into several near-duplicates.
+
 ## Read indices
 
 Each returned `Consensus` carries `read_indices: Vec<usize>`, which holds the indices into
@@ -64,22 +69,6 @@ for allele in &alleles {
         println!("bubble at {}: arms = {:?}", site.consensus_pos, fracs);
     }
 }
-```
-
-## Stateful multi-allele
-
-```rust
-let mut graph = PoaGraph::new(reads[seed_idx], PoaConfig::default())?;
-for (i, read) in reads.iter().enumerate() {
-    if i == seed_idx { continue; }
-    graph.add_read(read)?;
-}
-
-// Inspect graph before splitting
-let stats = graph.stats();
-println!("structural bubbles: {}", stats.bubble_count);
-
-let alleles = graph.consensus_multi()?;
 ```
 
 ## When two alleles become one

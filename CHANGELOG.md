@@ -7,6 +7,87 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.5.0] - 2026-07-29
+
+Engine rebuild and accuracy pass. The accumulated legacy engine (`graph.rs`) is
+retired in favour of the clean `poa2` engine that has backed single-allele
+consensus since 0.4.x; scoring defaults are retuned and single-allele extraction
+now picks the better of two consensus methods per call. Validated on the MUC1
+flVNTR locus: poa-consensus matches abPOA and POASTA on every haplotype.
+Over-calls nothing, and every consensus is fully supported by a read pileup (0 fabricated / 0 missing bases). It is strictly more robust than SPOA, which over-calls two of the same haplotypes.
+
+### Breaking
+
+- **The stateful `PoaGraph` builder and `AlignOp` are removed.** The library API
+  is now purely functional (`consensus`, `consensus_multi`, `bridged_consensus`,
+  plus the `analysis`/`seed`/`orient`/`flank` helpers). Use `consensus` for the
+  single-allele case; it internally seeds on the median-length read and is
+  seed-robust, covering what the stateful builder was used for.
+- **`consensus_adaptive` and `consensus_fit_scored` are removed.** Their
+  seed-sensitivity retry is subsumed by the new best-fit extraction inside
+  `consensus` (below), so a separate two-pass entry point is no longer needed.
+- **The `plot` feature and its optional `kuva` dependency are removed**, along
+  with the SVG visualisation helpers. They depended on the deleted engine's
+  internal graph/alignment state.
+- **Default scoring changed** in `PoaConfig::default()`: `match_score` `1 → 2`,
+  `mismatch_score` `-1 → -4`, `gap_open` `-2 → -4`, `gap_extend` `-1 → -3`. The
+  old gaps were too cheap relative to a match, so the aligner opened spurious
+  gaps in homopolymer/periodic runs. Callers relying on the previous defaults
+  will get different alignments.
+- **Single-allele consensus output values change** (more accurate). Combined with
+  the best-fit extraction below, consensus sequences on high-error and
+  homopolymer/length-variable repeats differ from 0.4.x; a benchmark grid of
+  synthetic STR loci improved from total edit-to-truth 1017 → 877 (ahead of
+  abPOA on the same grid). Any caller pinned to exact 0.4.x output bytes will see
+  different (more correct) results.
+
+### Added
+
+- **Majority-frequency (MSA-column) consensus**, and automatic **best-fit
+  selection** in `consensus`: the engine computes both a heaviest-path and a
+  majority-frequency consensus and returns whichever the reads better support
+  (mean per-read insert+delete when the reads are realigned to the candidate).
+  Heaviest-path and majority-frequency win on different inputs; picking per call
+  gets the better of both without an oracle. Per-position output fields
+  (coverage, path weights, gaps) are made consistent with the chosen sequence.
+  `ConsensusMode` now selects this: `HeaviestPath` (default) runs best-fit;
+  `MajorityFrequency` forces the MSA-column majority (previously `consensus_mode`
+  was accepted but ignored — the `--consensus-mode majority` CLI flag now works).
+- **`poa2::align_indel_counts`** — a small public helper that aligns reads to a
+  candidate sequence and returns per-read (insert, delete) op counts. Backs
+  `analysis::consensus_fit`, which no longer depends on any engine internals.
+
+### Changed
+
+- **Multi-allele phasing enforces the `min_allele_freq` floor when confirming a
+  split.** A proposed allele group holding fewer reads than `min_allele_freq` of
+  the locus can no longer be called as a distinct allele. This rejects the
+  classic over-split where a small stutter / partial-read cluster lands at an
+  intermediate length in the *valley* between two real alleles (length-separated
+  from both) and was previously mistaken for a third allele. Real minority
+  alleles sit at or above `min_allele_freq` by definition; lower the threshold to
+  call true low-frequency mosaics. (validate.py `multi_skew_cag20_40` and a
+  periodic GAA diploid stress case are now correct; single-SNP diploids still
+  split.)
+- **`consensus_fit` (analysis) and `bridged_consensus` now run on the `poa2`
+  engine.** `bridged_consensus` builds each side via `consensus`; `consensus_fit`
+  scores candidates via `align_indel_counts`. Behaviour is equivalent.
+- The sole POA engine is now `poa2` (full partial-order affine DP + adaptive
+  static-diagonal-union band + heaviest bundling / best-fit extraction). The
+  legacy full-DP engine and its ~12k lines of code and tests are gone.
+
+### Removed
+
+- `src/graph.rs` (legacy engine), the `plot` module, the `network_plot` example,
+  and the `kuva` dependency.
+- The now-unreachable public types `AdaptiveResult` and `AdaptiveAction` (only
+  produced by the removed `consensus_adaptive`/`consensus_fit_scored`), and
+  `GraphTopology` / `GraphNodeInfo` / `GraphEdgeInfo` (only produced by the
+  removed `PoaGraph::graph_topology`). `GraphStats` is unchanged and still
+  available on every `Consensus`.
+
+---
+
 ## [0.4.0] - 2026-07-25
 
 Periodic-repeat consensus accuracy: fixes a length over-call on tandem-repeat /

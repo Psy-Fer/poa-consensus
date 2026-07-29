@@ -112,7 +112,7 @@ diagonals. The tracking band can converge to the wrong diagonal without approach
 band edge, producing a silently truncated consensus. The approaching-edge detector cannot
 catch this because the band never gets close to the edge.
 
-The workaround is the **truncation detector** in `diagnose()` and the automatic retry in
-`consensus_adaptive`: if the consensus is less than 60% of the median input read length and
-banded alignment was used, the alignment is retried unbanded. See
-[Adaptive Two-Pass Mode](adaptive.md).
+The signal is surfaced by the **truncation detector** in `diagnose()`: if the consensus is
+less than 60% of the median input read length and banded alignment was used, the truncation
+warning fires. The caller should rebuild unbanded (`band_width = 0`) and compare. See
+[Diagnostics and Warnings](../library/diagnostics.md).

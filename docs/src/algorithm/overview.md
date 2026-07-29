@@ -2,12 +2,15 @@
 
 The algorithm runs in three stages for each read set:
 
-1. **Seed initialisation**: the seed read becomes a linear chain of nodes. Every subsequent
-   read is aligned into this growing graph.
-2. **Iterative alignment**: for each read: (a) topological sort, (b) banded DP alignment
-   against the graph, (c) update the graph from the alignment traceback.
-3. **Consensus extraction**: follow the heaviest (most-supported) path through the final
-   graph, trim low-coverage boundaries, and return the sequence with coverage and statistics.
+1. **Seed initialisation**: a seed read becomes a linear chain of nodes. Every subsequent
+   read is aligned into this growing graph. `consensus()` self-seeds on the median-length
+   read internally, so the result does not depend on which index the caller passes.
+2. **Iterative alignment**: for each read: (a) topological sort, (b) full partial-order
+   affine DP alignment against the graph within an adaptive static-diagonal band, (c) update
+   the graph from the alignment traceback.
+3. **Consensus extraction**: compute both a heaviest-path consensus and a
+   majority-frequency (MSA-column) consensus, trim low-coverage boundaries, and return the
+   one the reads better support (best-fit) along with coverage and statistics.
 
 ## Example: linear consensus graph
 
@@ -39,21 +42,23 @@ Each node carries:
 Edge weight records how many reads traversed from this node to the target. Weights are
 updated on every alignment: a match or insert op increments the outgoing edge weight.
 
-### PoaGraph
+### Internal graph
 
 The graph owns all nodes in a flat `Vec<Node>`. Node indices are stable across the life of
-the graph; topological order is recomputed before each alignment. The graph also caches a
+the graph; topological order is recomputed before each alignment. The graph also tracks a
 **spine** (the current heaviest-path consensus), which is used by the banded aligner to
-centre the DP band.
+centre the DP band. This graph is an internal construction detail: the public API is purely
+functional (`consensus`, `consensus_multi`, `bridged_consensus`), so callers never handle
+the graph directly.
 
 ## Alignment scoring
 
 | Operation | Score |
 |---|---|
-| Match | +1 |
-| Mismatch | -1 |
-| Gap open | -2 |
-| Gap extend | -1 (per additional base) |
+| Match | +2 |
+| Mismatch | -4 |
+| Gap open | -4 |
+| Gap extend | -3 (per additional base) |
 
 Affine gap penalties are used from the start. The two-component recurrence (M/I/D matrices)
 handles gap-open separately from gap-extend, giving meaningfully better accuracy on

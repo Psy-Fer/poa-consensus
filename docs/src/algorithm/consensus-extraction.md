@@ -76,15 +76,20 @@ With a deletion read overlaid (orange), you can see which nodes the deleting rea
 
 ![Same graph with deletion read path highlighted in orange](../diagrams/poa_network_deletion_overlay.svg)
 
-## Majority-frequency mode
+## Best-fit vs majority-frequency
 
-As an alternative to heaviest path, `ConsensusMode::MajorityFrequency` converts the graph to
-a column-aligned MSA and takes the plurality base at each column. The denominator at each
-position is `coverage + delete_count` (reads on other bubble arms do not vote).
+`consensus()` does not blindly return the heaviest path. It computes both a heaviest-path
+consensus and a majority-frequency consensus and keeps whichever the reads better support:
+the **best-fit** result. This is the behaviour of the default `ConsensusMode::HeaviestPath`.
+
+`ConsensusMode::MajorityFrequency` forces the majority-frequency result instead of choosing
+by fit. It converts the graph to a column-aligned MSA and takes the plurality base at each
+column; the denominator at each position is `coverage + delete_count` (reads on other bubble
+arms do not vote).
 
 MF mode is more robust to the phase-shift boundary trim bug because it counts delete
-traversals explicitly rather than relying on edge weights. It is better suited to HiFi data
-where read lengths within an allele group are nearly identical.
+traversals explicitly rather than relying on edge weights. It is better suited to high-depth
+amplicons and HiFi data where read lengths within an allele group are nearly identical.
 
 ## Semi-global alignment and boundary trim
 
