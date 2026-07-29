@@ -52,14 +52,10 @@ pub struct PoaConfig {
     ///   multi-allele bubble-structure consistency).
     ///
     /// The functional wrappers set this automatically ([`consensus_multi`]
-    /// builds with it `true`; single-allele paths leave it `false`). Stateful
-    /// callers ([`PoaGraph::new`]) who intend to call
-    /// [`PoaGraph::consensus_multi`] should set it `true` so alignment is built
-    /// in multi-allele mode. Default: `false` (single-allele).
+    /// builds with it `true`; single-allele paths leave it `false`), so most
+    /// callers never touch it. Default: `false` (single-allele).
     ///
     /// [`consensus_multi`]: crate::consensus_multi
-    /// [`PoaGraph::new`]: crate::PoaGraph::new
-    /// [`PoaGraph::consensus_multi`]: crate::PoaGraph::consensus_multi
     pub multi_allele: bool,
 }
 

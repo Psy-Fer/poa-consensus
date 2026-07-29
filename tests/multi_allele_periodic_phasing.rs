@@ -226,11 +226,6 @@ fn structural_phasing_no_contamination_on_noisy_periodic_repeat() {
 /// separated in absolute terms), so this specifically stresses whether
 /// ambiguous-bubble-but-clear-length reads are routed correctly.
 #[test]
-#[ignore = "over-splits to 3 alleles under the 2026-07-28 scoring retune (2/-4/-4/-3): \
-            same multi-allele over-split class as validate.py's multi_skew_cag20_40, \
-            tracked in TODO task #18 (bimodality/dip test for stutter vs allele). The \
-            single-allele path is unaffected; re-enable once #18 re-tunes multi-allele \
-            phasing for the new scoring."]
 fn structural_phasing_small_gap_bridge_candidate_stress() {
     let left = b"ACGTACGTCGATCGATTAGCTAGCGCTAGCTA";
     let right = b"ATCGATCGCGATCGATTAGCTAGCTGCATGCA";

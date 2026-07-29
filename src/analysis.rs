@@ -283,7 +283,7 @@ pub fn max_achievable_accuracy(n: usize, sigma_per_obs: f64) -> f64 {
 /// exists.
 ///
 /// A `Some` result is the primary signal to re-run with
-/// [`PoaGraph::consensus_multi`]: a meaningful fraction of reads support a
+/// [`consensus_multi`](crate::consensus_multi): a meaningful fraction of reads support a
 /// different sequence at this position.
 ///
 /// `min_freq` is applied against `n_reads`, consistent with how the graph's
@@ -334,7 +334,7 @@ pub fn has_competing_allele(consensus: &Consensus, min_freq: f64) -> Option<&Bub
 ///
 /// Thin wrapper over [`has_competing_allele`] for callers that only need the
 /// boolean signal.  When `true`, re-run with
-/// [`PoaGraph::consensus_multi`] to separate the alleles.
+/// [`consensus_multi`](crate::consensus_multi) to separate the alleles.
 ///
 /// # Examples
 /// ```
@@ -380,16 +380,16 @@ pub struct ConsensusConfidence {
     pub min_cov: u32,
     /// Mean per-position coverage across the consensus.
     pub mean_cov: f64,
-    /// Whether any coverage gap was detected (see [`CoverageGap`]).
+    /// Whether any coverage gap was detected (see [`CoverageGap`](crate::CoverageGap)).
     pub has_gaps: bool,
     /// Whether any bubble site has a minority arm above the `min_allele_freq`
-    /// threshold.  If `true`, re-run with [`PoaGraph::consensus_multi`].
+    /// threshold.  If `true`, re-run with [`consensus_multi`](crate::consensus_multi).
     pub competing_allele: bool,
     /// Fraction of consensus positions with coverage below half the read depth.
     /// Values above ~0.1 indicate widespread partial-read coverage.
     pub low_cov_fraction: f64,
     /// Fraction of graph nodes supported by exactly one read (from
-    /// [`GraphStats`]).  Values above ~0.15 suggest the graph is noisy.
+    /// [`GraphStats`](crate::GraphStats)).  Values above ~0.15 suggest the graph is noisy.
     pub single_support_fraction: f64,
 }
 
@@ -604,7 +604,7 @@ pub struct ConsensusWarnings {
     pub structural_competing: Option<StructuralCompetingSummary>,
     /// Suspected silent truncation: consensus is much shorter than the median
     /// input read, suggesting banded DP converged to the wrong diagonal.
-    /// Retry with `band_width = 0` or use `consensus_adaptive` to recover.
+    /// Retry with `band_width = 0` (unbanded) to recover.
     pub truncation_suspected: Option<TruncationWarning>,
 }
 
@@ -720,10 +720,11 @@ impl ConsensusWarnings {
 /// exactly.**
 ///
 /// This is a *relative* scorer, meant to compare several candidate
-/// consensuses built from the same read population against each other (see
-/// [`consensus_adaptive`](crate::consensus_adaptive)'s seed-sensitivity
-/// retry) — not an absolute, scenario-independent "this consensus is wrong"
-/// threshold. Empirical investigation (see CHANGELOG) found no single
+/// consensuses built from the same read population against each other (the
+/// single-allele [`consensus`](crate::consensus) path uses it internally to
+/// pick between heaviest-path and majority-frequency) — not an absolute,
+/// scenario-independent "this consensus is wrong" threshold. Empirical
+/// investigation (see CHANGELOG) found no single
 /// graph-level statistic (`GraphStats::single_support_fraction`,
 /// `bubble_count`, `edge_weight_gini`, seed length relative to the read
 /// population, ...) reliably separated genuinely-too-short consensuses from

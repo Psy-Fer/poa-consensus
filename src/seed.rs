@@ -24,7 +24,7 @@ pub enum SeedSelection {
     /// Terminal k-mer frequency heuristic: find the shortest read that has
     /// common k-mers at *both* its left and right terminal regions.
     ///
-    /// The first and last [`TERM_LEN`] bases of every read are k-mer-sampled.
+    /// The first and last `TERM_LEN` bases of every read are k-mer-sampled.
     /// A k-mer is a valid anchor only if it is *end-specific*: common at one
     /// end (≥ `max(2, floor(n × 0.3))` reads) but rare at the other
     /// (`< threshold` reads).  K-mers frequent at both ends are interior
@@ -33,11 +33,11 @@ pub enum SeedSelection {
     /// **Fallback hierarchy:**
     /// 1. Spanning candidates found → shortest candidate.
     /// 2. Non-overlapping left-only and right-only groups, no bridge →
-    ///    `Err(PoaError::NoSpanningReads)` — use [`bridged_consensus`].
+    ///    `Err(PoaError::NoSpanningReads)` — use [`bridged_consensus`](crate::bridged_consensus).
     /// 3. No cluster structure (all reads too short or highly repetitive) →
     ///    longest read.
     ///
-    /// Complexity: O(n × [`TERM_LEN`]) — no alignment performed.
+    /// Complexity: O(n × `TERM_LEN`) — no alignment performed.
     ///
     /// [`bridged_consensus`]: crate::bridged_consensus
     Auto,
@@ -195,7 +195,7 @@ fn auto_select(reads: &[&[u8]]) -> Result<usize, PoaError> {
 
 /// Deduplicated set of k-mer hashes from the terminal region of `read`.
 ///
-/// `left = true` → first [`TERM_LEN`] bases; `left = false` → last [`TERM_LEN`] bases.
+/// `left = true` → first `TERM_LEN` bases; `left = false` → last `TERM_LEN` bases.
 /// Returns an empty set for reads shorter than [`TERM_K`].
 fn terminal_kmers(read: &[u8], left: bool) -> HashSet<u64> {
     if read.len() < TERM_K {

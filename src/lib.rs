@@ -337,10 +337,7 @@ pub use error::PoaError;
 pub use flank::extract_flanked_region;
 pub use orient::{auto_orient, orient_to_seed, reverse_complement};
 pub use seed::{SeedSelection, select_seed};
-pub use types::{
-    AdaptiveAction, AdaptiveResult, BubbleSite, Consensus, CoverageGap, GapKind, GraphEdgeInfo,
-    GraphNodeInfo, GraphStats, GraphTopology, Strand,
-};
+pub use types::{BubbleSite, Consensus, CoverageGap, GapKind, GraphStats, Strand};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 

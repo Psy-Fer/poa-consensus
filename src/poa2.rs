@@ -2068,6 +2068,19 @@ fn groups_to_consensuses(
 /// haplotype is same-length but the `gi`-vs-`gj` split is linkage-consistent
 /// (reads cleanly take sides at ≥2 het sites) with a real consensus difference.
 fn groups_distinct(reads: &[&[u8]], gi: &[usize], gj: &[usize], config: &PoaConfig) -> bool {
+    // Frequency floor: neither side can be a *called* allele if it holds fewer
+    // reads than `min_allele_freq` of the whole locus. This rejects the classic
+    // multi-allele over-split — a small stutter/partial cluster whose median
+    // length lands in the VALLEY between two real alleles (so it is length-
+    // separated from both) and would otherwise pass the length branch as a
+    // spurious third allele. `reads.len()` is the full locus read count (gi/gj
+    // index into it), so the floor is a genuine global allele frequency. A real
+    // minority allele sits at or above `min_allele_freq` by definition; a valley
+    // noise cluster does not. (Lower `min_allele_freq` to call true mosaics.)
+    let freq_floor = phasing_floor(reads.len(), config) as usize;
+    if gi.len().min(gj.len()) < freq_floor {
+        return false;
+    }
     let lens_i: Vec<usize> = gi.iter().map(|&r| reads[r].len()).collect();
     let lens_j: Vec<usize> = gj.iter().map(|&r| reads[r].len()).collect();
     // Length variant: separated (median gap vs MAD) AND the median gap clears an
@@ -2099,11 +2112,14 @@ fn groups_distinct(reads: &[&[u8]], gi: &[usize], gj: &[usize], config: &PoaConf
     // separates reads cleanly across its het site(s) (consistency ~1.0), while
     // two error/stutter sub-clusters of one allele do not (~0.7 at ONT error). A
     // high consistency bar with ≥1 informative site and ≥1 consensus difference
-    // admits the clean single-SNP diploid while rejecting noise. The `same_length`
-    // gate is load-bearing: a length-jitter sub-split (which `length_separated`
-    // already rejected as sub-bimodal) must NOT leak in here as a "substitution".
-    // High-error substitution alleles (consistency dragged down by per-read error)
-    // are the acknowledged residual weak case.
+    // admits the clean single-SNP diploid (`two_allele_snp_recovery`) while
+    // rejecting noise. Periodic-repeat phase noise — which can fake one spurious
+    // single-column fork with consistency ~1.0 — is handled *upstream* by the
+    // frequency floor at the top of this function (such a phantom sub-cluster is
+    // a small minority, below `min_allele_freq`), not by this branch. The
+    // `same_length` gate is load-bearing: a length-jitter sub-split (which
+    // `length_separated` already rejected as sub-bimodal) must NOT leak in here
+    // as a "substitution".
     same_length
         && bp.consistency >= LINKAGE_SUBST_CONSISTENCY
         && bp.n_informative_sites >= 1
