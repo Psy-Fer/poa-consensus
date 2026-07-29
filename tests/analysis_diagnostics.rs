@@ -103,9 +103,12 @@ fn graphstats_clean_unanimous_all_fields_pristine() {
         "one base per column → ~zero entropy; got {}",
         g.mean_column_entropy
     );
+    // Two-sided: a uniform graph must give Gini ~= 0 exactly, not merely "< 1e-9"
+    // (a one-sided bound passed vacuously on the old -2/n sign bug, which made
+    // this negative).
     assert!(
-        g.edge_weight_gini < 1e-9,
-        "uniform edge weights → gini ~0; got {}",
+        g.edge_weight_gini.abs() < 1e-9,
+        "uniform edge weights → gini ~0 (two-sided); got {}",
         g.edge_weight_gini
     );
     assert!(

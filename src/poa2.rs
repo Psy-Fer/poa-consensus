@@ -429,7 +429,14 @@ impl Poa {
                     } else {
                         let o = bget(&mflat, &off, &lo_, &hi_, r, j);
                         let e = bget(&iflat, &off, &lo_, &hi_, r, j);
-                        state = if o >= e { 0 } else { 1 };
+                        // The forward recurrence is I[j] = max(M[j-1]+go+ge,
+                        // I[j-1]+ge), so arriving from M pays the gap-open. The
+                        // predecessor is M only when M[j] + go >= I[j]; comparing
+                        // raw `o >= e` (go omitted) picks M too eagerly and cuts a
+                        // multi-base insert run one base short, mis-emitting an
+                        // inserted base as a Match. Guard the NEG_INF M cell so an
+                        // unreachable M can never win the comparison.
+                        state = if o != NEG_INF && o + go >= e { 0 } else { 1 };
                     }
                 }
                 _ => {
@@ -971,7 +978,12 @@ impl Poa {
                     area += cum;
                 }
                 let nlen = ws.len() as f64;
-                1.0 - (2.0 * area as f64) / (nlen * tot as f64) - 1.0 / nlen
+                // Gini from the sorted-ascending Lorenz curve:
+                //   G = (n+1)/n - 2*area/(n*T)  =  1 - 2*area/(n*T) + 1/n
+                // The `+ 1/n` term was previously `- 1/n`, which biased every
+                // graph by -2/n (a uniform graph scored -2/n instead of 0 and
+                // could report negative inequality).
+                1.0 - (2.0 * area as f64) / (nlen * tot as f64) + 1.0 / nlen
             }
         };
         // bubbles: fork nodes with 2+ out-edges each >= allele floor
@@ -1832,9 +1844,14 @@ pub fn linkage_consensus_multi(
     config: &PoaConfig,
 ) -> Result<Vec<crate::types::Consensus>, crate::error::PoaError> {
     use crate::error::PoaError;
-    if reads.len() < config.min_reads {
+    // Enforce the depth floor on the count of reads that carry sequence. Empty
+    // reads contribute nothing, and an all-empty input would otherwise panic the
+    // median-seed selection in `build_median` (empty `order`, out-of-bounds
+    // median index) rather than returning a clean error.
+    let nonempty = reads.iter().filter(|r| !r.is_empty()).count();
+    if nonempty < config.min_reads {
         return Err(PoaError::InsufficientDepth {
-            got: reads.len(),
+            got: nonempty,
             min: config.min_reads,
         });
     }
@@ -1990,9 +2007,14 @@ pub fn consensus_multi(
     config: &PoaConfig,
 ) -> Result<Vec<crate::types::Consensus>, crate::error::PoaError> {
     use crate::error::PoaError;
-    if reads.len() < config.min_reads {
+    // Enforce the depth floor on the count of reads that carry sequence. Empty
+    // reads contribute nothing, and an all-empty input would otherwise panic the
+    // median-seed selection in `build_median` (empty `order`, out-of-bounds
+    // median index) rather than returning a clean error.
+    let nonempty = reads.iter().filter(|r| !r.is_empty()).count();
+    if nonempty < config.min_reads {
         return Err(PoaError::InsufficientDepth {
-            got: reads.len(),
+            got: nonempty,
             min: config.min_reads,
         });
     }
@@ -2194,9 +2216,14 @@ pub fn hybrid_consensus_multi(
     config: &PoaConfig,
 ) -> Result<Vec<crate::types::Consensus>, crate::error::PoaError> {
     use crate::error::PoaError;
-    if reads.len() < config.min_reads {
+    // Enforce the depth floor on the count of reads that carry sequence. Empty
+    // reads contribute nothing, and an all-empty input would otherwise panic the
+    // median-seed selection in `build_median` (empty `order`, out-of-bounds
+    // median index) rather than returning a clean error.
+    let nonempty = reads.iter().filter(|r| !r.is_empty()).count();
+    if nonempty < config.min_reads {
         return Err(PoaError::InsufficientDepth {
-            got: reads.len(),
+            got: nonempty,
             min: config.min_reads,
         });
     }
@@ -2435,6 +2462,36 @@ mod tests {
         }
         eprintln!(
             "GRID SWEEP ({n} configs, full-Levenshtein vs truth):\n  heaviest={th}  majority={tm}  best_fit={tb}"
+        );
+    }
+
+    // Op counts (ins, match) for aligning `read` against a graph seeded on `seed`.
+    fn ins_match(seed: &[u8], read: &[u8]) -> (usize, usize) {
+        let g = Poa::new(seed, cfg());
+        let (topo, rank) = g.topo_order();
+        let ops = g.align(read, &topo, &rank);
+        let ins = ops.iter().filter(|o| matches!(o, Op::Ins(_))).count();
+        let mat = ops.iter().filter(|o| matches!(o, Op::Match(_))).count();
+        (ins, mat)
+    }
+
+    #[test]
+    fn affine_insert_run_traceback_does_not_mislabel_inserts_as_matches() {
+        // Regression for the affine insert-run traceback (forward recurrence pays
+        // gap_open from M into I, so the predecessor is M only when M+go >= I;
+        // the old `o >= e` test omitted go and picked M too eagerly, re-emitting
+        // an inserted base as a Match).
+        //
+        // seed = "AAC", read = "ACCC": the correct alignment matches 2 nodes and
+        // inserts 2 bases. The bug produced 3 matches / 1 insert — one inserted
+        // 'C' laundered into a Match op, inflating a node's coverage. Verified
+        // discriminating: this exact case flips (1,3)->(2,2) when the fix is
+        // toggled (brute-force grid over all len-3/4 seeds x reads, 2026-07-29).
+        let (ins, mat) = ins_match(b"AAC", b"ACCC");
+        assert_eq!(
+            (ins, mat),
+            (2, 2),
+            "inserted bases must stay Ins, not be laundered into Match ops"
         );
     }
 

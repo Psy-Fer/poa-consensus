@@ -111,10 +111,11 @@
 //!
 //! ## Coverage and depth
 //!
-//! **`min_reads`** (default: 1) is the minimum number of reads required to
+//! **`min_reads`** (default: 3) is the minimum number of reads required to
 //! attempt consensus.  `consensus()` returns `Err(InsufficientDepth)` below
-//! this threshold.  For reliable results, use at least 5 reads; 10+ is
-//! preferable for heterozygous sites.
+//! this threshold (the `(n/2 + 1).max(2)` coverage floor breaks down at depth
+//! 1-2, so a lower floor produces silently unreliable output).  For reliable
+//! results, use at least 5 reads; 10+ is preferable for heterozygous sites.
 //!
 //! **Boundary trim** removes leading and trailing nodes whose coverage falls
 //! below the majority threshold `(n/2 + 1).max(2)` (or

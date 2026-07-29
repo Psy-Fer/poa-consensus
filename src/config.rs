@@ -89,7 +89,7 @@ impl Default for PoaConfig {
             gap_extend: -3,
             min_coverage_fraction: 0.0,
             min_allele_freq: 0.2,
-            min_reads: 1,
+            min_reads: 3,
             alignment_mode: AlignmentMode::SemiGlobal,
             consensus_mode: ConsensusMode::HeaviestPath,
             warn_on_long_unbanded: true,
