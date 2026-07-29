@@ -78,8 +78,8 @@ Fires when `consensus_len / median_input_read_len < truncation_ratio_threshold` 
 that built it. The most common cause is banded DP converging to the wrong diagonal on a
 highly repetitive locus.
 
-When this fires in `consensus_adaptive`, an unbanded retry is attempted automatically. When
-it fires on a standalone `consensus` call, the caller should retry with `band_width = 0`.
+Diagnostics only report this signal; they do not retry. When it fires, the caller should
+rebuild with `band_width = 0` (unbanded) and compare.
 
 ## `DiagnoseConfig`
 

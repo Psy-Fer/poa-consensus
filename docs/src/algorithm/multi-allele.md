@@ -1,9 +1,9 @@
 # Multi-Allele Phasing
 
-A single `PoaGraph` built from reads covering two haplotypes contains both alleles
+A single graph built from reads covering two haplotypes contains both alleles
 simultaneously. The graph has **bubble** structures at every position where the haplotypes
 differ. Multi-allele extraction recovers per-allele consensuses by partitioning reads into
-haplotype groups before running the heaviest-path DP.
+haplotype groups before running per-group consensus extraction.
 
 ## Bubble detection
 
@@ -29,18 +29,29 @@ a 1-node arm that does not.
 The phasing strategy uses structural bubbles preferentially because they are far less likely
 to be noise. SNP bubble phasing is a fallback when no structural bubble is found.
 
-## Structural phasing (union-find)
+## Structural phasing (propose, then linkage-confirm)
 
-1. `find_structural_bubbles()` identifies all bubbles with at least one arm ≥
-   `phasing_bubble_min_span` bases.
-2. For each structural bubble, reads are labelled with which arm they traversed (0 or 1).
-3. Across all structural bubbles, reads that agree on arm choice at every shared bubble are
-   placed in the same haplotype group (union-find over pairwise compatibility).
-4. Groups below `min_reads` depth are merged into the largest group.
+Phasing is a **propose-then-confirm** pipeline, so a noisy bubble cannot on its own
+manufacture an allele:
 
-This correctly separates CAG-length variants from error-induced SNP bubbles: the error
-bubbles are single-node and below the structural span threshold, so they don't influence
-the phasing.
+1. **Propose.** Structural bubbles (those with at least one arm ≥ `phasing_bubble_min_span`
+   bases) split the reads into candidate groups by which arm each read traversed. Structural
+   bubbles are preferred because a length-changing variant is far less likely to be noise
+   than a single-column SNP bubble.
+2. **Confirm by linkage.** A candidate split is trusted only if the two groups are genuinely
+   distinct: either **length-separated** by a real gap (median length difference ≥ a
+   repeat-unit-scale floor, robust to stutter), or **linkage-consistent** — the reads take
+   consistent sides across the het site(s) and the two per-group consensuses actually differ.
+   A real allele is a set of differences that *co-occur on the same reads*; independent
+   sequencing error does not.
+3. **Frequency floor.** A candidate group holding fewer reads than `min_allele_freq` of the
+   whole locus is not called as a distinct allele. This rejects the classic over-split where
+   a small stutter or partial-read cluster lands at an intermediate length in the *valley*
+   between two real alleles. (Lower `min_allele_freq` to call true low-frequency mosaics.)
+
+This separates real CAG-length variants from error-induced SNP bubbles (the error bubbles are
+single-column and below the structural span threshold) and from stutter sub-clusters of a
+single allele (rejected by the frequency floor and the length/linkage confirmation).
 
 ## SNP fallback
 
@@ -62,7 +73,7 @@ the **per-group** read count, not the total. With 20 reads split 10/10, `min_cov
 on 10, not 20.
 
 `read_indices` in each returned `Consensus` records which original read indices contributed
-to that allele, allowing the caller to assign per-read metadata (TSV rows, brick-plot lanes,
+to that allele, allowing the caller to assign per-read metadata (TSV rows, per-read lanes,
 statistics) to the correct haplotype.
 
 ## Depth requirements

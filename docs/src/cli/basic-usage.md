@@ -26,6 +26,7 @@ band width used for the final read).
 | `--band-width N` | 50 | Minimum band width; 0 = unbanded |
 | `--no-adaptive-band` | off | Disable adaptive band (adaptive is on by default) |
 | `--global` | off | Use global alignment (semi-global is the default) |
+| `--consensus-mode MODE` | `heaviest` | `heaviest` (best-fit) or `majority` (force MSA-column majority) |
 | `--min-reads N` | 3 | Minimum reads required; error if below this |
 | `--seed N` | auto | Explicit seed index (0-based); overrides automatic selection |
 | `--quiet` | off | Suppress warnings and notes; errors always printed |

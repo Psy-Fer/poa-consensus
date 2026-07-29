@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [0.5.0] - Unreleased
+## [0.5.0] - 2026-07-29
 
 Engine rebuild and accuracy pass. The accumulated legacy engine (`graph.rs`) is
 retired in favour of the clean `poa2` engine that has backed single-allele

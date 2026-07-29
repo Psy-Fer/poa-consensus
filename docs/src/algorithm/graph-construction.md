@@ -2,17 +2,18 @@
 
 ## Seeding
 
-`PoaGraph::new(seed, config)` builds an initial linear chain: one node per base in the seed
-read, with each node connected to the next by an edge of weight 1 and coverage 1. This chain
-is the starting backbone; every subsequent read is aligned into it.
+The engine builds an initial linear chain from a seed read: one node per base, with each
+node connected to the next by an edge of weight 1 and coverage 1. This chain is the starting
+backbone; every subsequent read is aligned into it.
 
-The choice of seed matters. A seed that is much longer or shorter than the read set creates
-unnecessary early branches and inflates the band width the aligner needs to track them. A
-median-length spanning read is the right default (see [Seed Selection](../library/seed-selection.md)).
+The choice of seed matters, so `consensus()` self-seeds on the median-length read internally
+rather than trusting the caller's index. A seed that is much longer or shorter than the read
+set creates unnecessary early branches and inflates the band width the aligner needs to track
+them; a median-length spanning read avoids that (see [Seed Selection](../library/seed-selection.md)).
 
 ## Adding a read
 
-`PoaGraph::add_read(read)` runs three steps:
+Each subsequent read is folded into the graph in three steps:
 
 ### 1. Topological sort (Kahn's algorithm)
 
@@ -26,27 +27,29 @@ described in [Banded DP Alignment](banded-dp.md).
 ### 2. DP alignment
 
 The read is aligned against the sorted graph using banded affine-gap DP. The alignment
-returns an `AlignOp` sequence: `Match(node)`, `Insert(base)`, or `Delete(node)`.
+returns a sequence of operations: match (to a node), insert (a base), or delete (skip a node).
 
-### 3. Graph update (`add_to_graph`)
+### 3. Graph update
 
 The traceback is replayed to update the graph:
 
 | Op | Action |
 |---|---|
-| `Match(node)` | Increment `node.coverage` and the incoming edge weight |
-| `Insert(base)` | Create a new node; connect it to the previous and next nodes in the traceback |
-| `Delete(node)` | Traverse `node` without incrementing its coverage; increment only the traversal edge weight |
+| Match | Increment the node's `coverage` and the incoming edge weight |
+| Insert | Create a new node; connect it to the previous and next nodes in the traceback |
+| Delete | Increment the skipped node's `delete_count` only; record the reconnection as a bypass edge around the skipped run |
 
 **Insert nodes** are allocated with coverage 1 (the current read is the first to traverse
 them). Subsequent reads that match the same insert base will merge into the existing node
 rather than creating a new one, because the DP naturally finds the highest-scoring path and
-a match to an existing node scores +1 while a new insert scores 0 (open + extend penalty).
+a match to an existing node scores positively while opening a fresh insert pays the gap
+penalty.
 
-**Delete traversals** increment the outgoing edge weight at each skipped node, preserving
-the read count on the traversal path for the heaviest-path DP, but do not count as evidence
+**Deletes** touch the skipped node only through its `delete_count`; the read's path is
+reconnected by a separate bypass edge around the skipped run. A deleted node therefore gains
+no `coverage` and no incoming/outgoing match-edge weight, so it does not count as evidence
 that the node's base is correct. This is the key design choice that makes boundary trim work:
-nodes that are skipped by the majority of reads have low `coverage` even if many reads
+nodes that are skipped by the majority of reads have low `coverage` even though many reads
 traversed the graph position.
 
 ## Example: two-allele SNV graph

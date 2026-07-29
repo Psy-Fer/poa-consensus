@@ -4,14 +4,7 @@
 
 ```toml
 [dependencies]
-poa-consensus = "0.2"
-```
-
-For visualisation support:
-
-```toml
-[dependencies]
-poa-consensus = { version = "0.2", features = ["plot"] }
+poa-consensus = "0.5"
 ```
 
 ## Minimal example
@@ -36,53 +29,31 @@ fn main() -> Result<(), poa_consensus::PoaError> {
 }
 ```
 
-## Choosing an API
+## The functional API
 
-There are two API styles: **functional** (convenience wrappers) and **stateful** (direct
-graph access).
-
-### Functional
+The public API is purely functional: you pass a slice of reads and get back a
+`Consensus` (or several, for multi-allele loci). There is no graph object to
+manage.
 
 ```rust
-use poa_consensus::{consensus, consensus_multi, consensus_adaptive, PoaConfig};
+use poa_consensus::{consensus, consensus_multi, PoaConfig};
 
 // Single-allele
 let c = consensus(&reads, seed_idx, &config)?;
 
 // Multi-allele (returns one Consensus per detected allele)
 let alleles = consensus_multi(&reads, seed_idx, &config)?;
-
-// Adaptive: decide multi vs single based on graph statistics
-let result = consensus_adaptive(&reads, seed_idx, &config)?;
-let alleles = result.consensuses;
 ```
 
-### Stateful
+`consensus()` self-seeds on the median-length read internally, so the graph is
+built from a representative read regardless of which index you pass. The
+`seed_idx` argument is still validated for bounds (it must point at a real read),
+but it does not bias the result.
 
-```rust
-use poa_consensus::{PoaGraph, PoaConfig};
-
-let mut graph = PoaGraph::new(reads[seed_idx], PoaConfig::default())?;
-for (i, read) in reads.iter().enumerate() {
-    if i == seed_idx { continue; }
-    graph.add_read(read)?;
-}
-
-// Inspect state mid-build
-let stats = graph.stats();
-println!("bubble count after {} reads: {}", graph.n_reads(), stats.bubble_count);
-
-// Extract consensus
-let consensus = graph.consensus()?;
-
-// Or multi-allele
-let alleles = graph.consensus_multi()?;
-```
-
-The stateful API is preferable for high-throughput pipelines: the graph object pre-allocates
-internal buffers and reuses them across calls, avoiding repeated heap allocation. It also
-allows inspecting `GraphStats` mid-build to decide whether to continue adding reads or bail
-early.
+The returned consensus is a **best-fit** consensus: `consensus()` computes both a
+heaviest-path consensus and a majority-frequency (MSA-column) consensus and keeps
+whichever the reads better support. You can force the majority-frequency result
+with `ConsensusMode::MajorityFrequency` (see below).
 
 ## `PoaConfig` defaults
 
@@ -92,10 +63,10 @@ PoaConfig {
     adaptive_band: true,                    // abPOA formula: w = 10 + 0.01 * max(read_len, graph_nodes)
     adaptive_band_b: 10,
     adaptive_band_f: 0.01,
-    match_score: 1,
-    mismatch_score: -1,
-    gap_open: -2,
-    gap_extend: -1,
+    match_score: 2,
+    mismatch_score: -4,
+    gap_open: -4,
+    gap_extend: -3,
     min_coverage_fraction: 0.5,             // strict majority
     min_allele_freq: 0.25,
     min_reads: 3,
