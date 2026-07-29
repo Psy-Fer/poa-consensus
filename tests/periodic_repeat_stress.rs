@@ -94,6 +94,7 @@ const U3: &[u8] = b"CAG";
 #[test]
 fn periodic_single_allele_length_accurate() {
     // (unit, n_units, depth, err, seed, tolerance_bp)
+    #[allow(clippy::type_complexity)]
     let cases: &[(&[u8], usize, usize, f64, u64, usize)] = &[
         (U60, 20, 20, 0.05, 1, 60),
         (U60, 65, 30, 0.05, 2, 90),

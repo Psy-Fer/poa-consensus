@@ -123,6 +123,7 @@ fn count_units(seq: &[u8], unit: &[u8]) -> usize {
 ///
 /// Flanks are fixed per call (same reference sequence for all reads).  Error
 /// simulation is applied per-read with distinct seeds.
+#[allow(clippy::too_many_arguments)]
 fn make_reads(
     unit: &[u8],
     modal_count: usize,

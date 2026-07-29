@@ -23,7 +23,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --all-features -- -D warnings
+      # --all-targets lints tests/examples too (not just lib+bin), so a lint
+      # that only appears in test code is caught before release.
+      - run: cargo clippy --all-features --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -34,3 +36,23 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt -- --check
+
+  docs:
+    name: Doc links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Fail on broken intra-doc links so docs.rs never ships dangling refs.
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      # Library MSRV = the declared rust-version. Default features only: the
+      # optional `cli` feature pulls in `noodles`, which requires a newer
+      # rustc (1.88+) and is not part of the library's MSRV contract.
+      - run: cargo check

@@ -1192,8 +1192,10 @@ mod tests {
         n_reads: usize,
         median_read_len: usize,
     ) -> Consensus {
-        let mut gs = GraphStats::default();
-        gs.median_input_read_len = median_read_len;
+        let gs = GraphStats {
+            median_input_read_len: median_read_len,
+            ..Default::default()
+        };
         Consensus {
             sequence: vec![b'A'; seq_len],
             coverage: vec![n_reads as u32; seq_len],
