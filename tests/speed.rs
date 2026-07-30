@@ -526,7 +526,7 @@ fn row_consensus(label: &str, reads: &[Vec<u8>], cfg: &PoaConfig, reps: usize) {
 }
 
 /// Time a specific `ConsensusMode` on the same reads, to isolate the best-fit
-/// extraction overhead (HeaviestPath = best-fit builds BOTH candidates + fit-scores;
+/// extraction overhead (BestFit = best-fit builds BOTH candidates + fit-scores;
 /// MajorityFrequency builds only the MSA-column consensus).
 fn row_mode(label: &str, reads: &[Vec<u8>], mode: poa_consensus::ConsensusMode, reps: usize) {
     let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
@@ -593,7 +593,7 @@ fn perf_matrix() {
     row_consensus("unbanded (band_width=0)", &r2k, &cfg_unbanded(), 3);
 
     // ── Best-fit extraction overhead (F25) ────────────────────────────────────
-    // Default HeaviestPath is "best-fit": it builds a heaviest-path AND a
+    // Default BestFit is "best-fit": it builds a heaviest-path AND a
     // majority-frequency consensus and, when they differ, re-aligns every read
     // against each candidate (fit_score). MajorityFrequency builds only the MSA
     // consensus. The gap between the two rows is the best-fit overhead on a
@@ -607,9 +607,9 @@ fn perf_matrix() {
             .collect::<Vec<_>>()
     };
     row_mode(
-        "CAG×40 @5%: HeaviestPath(best-fit)",
+        "CAG×40 @5%: BestFit(best-fit)",
         &cag,
-        poa_consensus::ConsensusMode::HeaviestPath,
+        poa_consensus::ConsensusMode::BestFit,
         9,
     );
     row_mode(
@@ -628,9 +628,9 @@ fn perf_matrix() {
             .collect::<Vec<_>>()
     };
     row_mode(
-        "AAAAG×30 @10%: HeaviestPath(best-fit)",
+        "AAAAG×30 @10%: BestFit(best-fit)",
         &aaaag,
-        poa_consensus::ConsensusMode::HeaviestPath,
+        poa_consensus::ConsensusMode::BestFit,
         9,
     );
     row_mode(

@@ -426,7 +426,7 @@ pub fn consensus(
         }
     }
     // Consensus extraction honours `consensus_mode`:
-    //  - HeaviestPath (default): best-fit — compute both a heaviest-path and a
+    //  - BestFit (default): best-fit — compute both a heaviest-path and a
     //    majority-frequency consensus and keep whichever the reads better
     //    support (majority-frequency recovers homopolymer/length-variable
     //    repeats the heaviest path over-calls).
@@ -435,7 +435,7 @@ pub fn consensus(
     // Per-position output fields are made consistent with the chosen sequence.
     Ok(match config.consensus_mode {
         crate::config::ConsensusMode::MajorityFrequency => g.consensus_full_majority(),
-        crate::config::ConsensusMode::HeaviestPath => g.consensus_full_best_fit(reads),
+        crate::config::ConsensusMode::BestFit => g.consensus_full_best_fit(reads),
     })
 }
 

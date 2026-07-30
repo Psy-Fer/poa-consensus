@@ -11,8 +11,9 @@ use poa_consensus::{
 /// Consensus extraction mode, mirrored from [`ConsensusMode`] for the CLI.
 #[derive(Clone, Copy, ValueEnum)]
 enum ConsensusModeArg {
-    /// Heaviest-path (edge-weight) traversal. Best default for STR/VNTR data.
-    Heaviest,
+    /// Best-fit (default): builds both a heaviest-path and a majority-frequency
+    /// consensus and keeps whichever the reads better support. Best for STR/VNTR.
+    BestFit,
     /// Most-frequent-base per column (MSA majority). Better for near-equal-length
     /// HiFi read sets; counts Delete traversals explicitly.
     Majority,
@@ -21,7 +22,7 @@ enum ConsensusModeArg {
 impl From<ConsensusModeArg> for ConsensusMode {
     fn from(m: ConsensusModeArg) -> Self {
         match m {
-            ConsensusModeArg::Heaviest => ConsensusMode::HeaviestPath,
+            ConsensusModeArg::BestFit => ConsensusMode::BestFit,
             ConsensusModeArg::Majority => ConsensusMode::MajorityFrequency,
         }
     }
@@ -110,7 +111,7 @@ struct Args {
     min_coverage_fraction: f64,
 
     /// Consensus extraction mode.
-    #[arg(long, value_enum, default_value_t = ConsensusModeArg::Heaviest, help_heading = "Coverage / consensus")]
+    #[arg(long, value_enum, default_value_t = ConsensusModeArg::BestFit, help_heading = "Coverage / consensus")]
     consensus_mode: ConsensusModeArg,
 
     // ── Alignment ─────────────────────────────────────────────────────────────

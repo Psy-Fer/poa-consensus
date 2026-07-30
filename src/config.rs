@@ -13,7 +13,7 @@ pub enum ConsensusMode {
     /// — heaviest on clean/short, majority on high-error length-variable repeats
     /// — so picking per call gets the better of both. Never worse than plain
     /// heaviest path.
-    HeaviestPath,
+    BestFit,
     /// Force the majority-frequency (MSA-column) consensus regardless of fit:
     /// each column emits its plurality base, counting read deletions explicitly.
     /// Best when column majority is trusted outright, e.g. high-depth amplicons.
@@ -83,7 +83,7 @@ impl Default for PoaConfig {
             min_allele_freq: 0.2,
             min_reads: 3,
             alignment_mode: AlignmentMode::SemiGlobal,
-            consensus_mode: ConsensusMode::HeaviestPath,
+            consensus_mode: ConsensusMode::BestFit,
             warn_on_long_unbanded: true,
             phasing_bubble_min_span: 10,
         }

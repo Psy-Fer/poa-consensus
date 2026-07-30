@@ -80,7 +80,7 @@ With a deletion read overlaid (orange), you can see which nodes the deleting rea
 
 `consensus()` does not blindly return the heaviest path. It computes both a heaviest-path
 consensus and a majority-frequency consensus and keeps whichever the reads better support:
-the **best-fit** result. This is the behaviour of the default `ConsensusMode::HeaviestPath`.
+the **best-fit** result. This is the behaviour of the default `ConsensusMode::BestFit`.
 
 `ConsensusMode::MajorityFrequency` forces the majority-frequency result instead of choosing
 by fit. It converts the graph to a column-aligned MSA and takes the plurality base at each

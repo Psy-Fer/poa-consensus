@@ -71,7 +71,7 @@ PoaConfig {
     min_allele_freq: 0.2,                   // minimum arm frequency to call a second allele
     min_reads: 3,                           // Err(InsufficientDepth) below this
     alignment_mode: AlignmentMode::SemiGlobal,
-    consensus_mode: ConsensusMode::HeaviestPath,  // "best-fit" (see above)
+    consensus_mode: ConsensusMode::BestFit,  // "best-fit" (see above)
     warn_on_long_unbanded: true,            // warn on stderr for unbanded multi-kb reads
     phasing_bubble_min_span: 10,            // min arm span (bp) for a structural (length) bubble
 }

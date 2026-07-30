@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [0.6.0] - unreleased
+## [0.6.0] - 2026-07-30
 
 Correctness, safety-default, API, and documentation pass following a full deep-dive
 review. Fixes several silent correctness bugs in the default path, adds an opt-in
@@ -27,6 +27,11 @@ are unchanged (the default `consensus`/`consensus_multi` path is untouched by th
 - **`PoaError::BandTooNarrow` is removed.** The static-diagonal-union band never produces it
   (the endpoint is always in-band), so it was never constructed. Match arms on `PoaError`
   should drop the `BandTooNarrow` case.
+- **`ConsensusMode::HeaviestPath` is renamed to `ConsensusMode::BestFit`.** The variant never
+  forced a plain heaviest path: the default already builds both a heaviest-path and a
+  majority-frequency consensus and keeps whichever the reads better support, so the old name
+  was misleading. Behaviour is unchanged; rename any `ConsensusMode::HeaviestPath` use to
+  `BestFit`. CLI: `--consensus-mode heaviest` is now `--consensus-mode best-fit`.
 
 ### Added
 
@@ -44,6 +49,10 @@ are unchanged (the default `consensus`/`consensus_multi` path is untouched by th
 - **`warn_on_long_unbanded` is now honoured.** `consensus`/`consensus_multi` emit a one-line
   stderr warning when alignment is fully unbanded (`band_width = 0`, `adaptive_band = false`)
   on reads over ~1 kb. Previously the field was accepted but never read.
+- **Alignment DP reuses its per-row scratch buffers.** The banded DP allocated five `Vec`s
+  per graph node inside the topological loop; they are now hoisted and cleared/resized per
+  row, cutting allocations 7–16× and giving ~8% faster `add_read` on typical STR loci. Output
+  is byte-identical (`validate.py` 20/20, `compare_callers.py` 16/16 unchanged).
 
 ### Fixed
 
@@ -70,6 +79,18 @@ are unchanged (the default `consensus`/`consensus_multi` path is untouched by th
   variant's short-allele delete-bypass resume edge could register as a spurious competing arm
   in single-allele output. They now use the matched-edge view (`read_matched_edges`), matching
   the documented invariant.
+- **`analysis::has_competing_allele` used a raw fraction, inconsistent with phasing.** It
+  compared arm count against `n * min_allele_freq` directly, while the phasing pipeline uses
+  the `ceil(n * min_allele_freq).max(2)` floor. Low-depth loci could flag (or miss) a second
+  allele in the analysis helper that `consensus_multi` would not split. Both now share
+  `phasing_floor`.
+- **Non-ACGT / IUPAC bases were handled inconsistently.** `orient_to_seed` now applies the
+  full IUPAC complement (R/Y/K/M/B/V/D/H and self-complementary S/W/N) instead of only ACGT;
+  the MajorityFrequency column vote now buckets only ACGT while still counting an ambiguity
+  code toward column presence, so an ambiguous base no longer silently votes as an `A`.
+- **Float comparisons used `partial_cmp().unwrap()`.** Score/length sorts in consensus and
+  phasing now use `total_cmp`, so a NaN (e.g. from a degenerate fit score) can no longer panic
+  the sort.
 
 ### Documentation
 
@@ -77,6 +98,10 @@ are unchanged (the default `consensus`/`consensus_multi` path is untouched by th
   (rewritten for the static-diagonal-union anti-fold band), the `PoaConfig` defaults table,
   the `DiagnoseConfig` field list, the rustdoc `BandTooNarrow` "never silently wrong" claim,
   and the `delete_count` → `del` naming. Documented the flank-anchoring workflow.
+- Documented `min_allele_freq` as a hard mosaic-sensitivity boundary (a sub-threshold allele
+  is merged into the majority and never appears in output; lower it and re-run to probe for a
+  low-frequency / subclonal allele), and added a Student-t caveat to
+  `analysis::count_credible_interval`.
 
 ## [0.5.0] - 2026-07-29
 

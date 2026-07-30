@@ -144,7 +144,7 @@ fn structural_phasing_no_contamination_on_noisy_periodic_repeat() {
         adaptive_band: true,
         min_reads: 2,
         alignment_mode: AlignmentMode::SemiGlobal,
-        consensus_mode: ConsensusMode::HeaviestPath,
+        consensus_mode: ConsensusMode::BestFit,
         ..PoaConfig::default()
     };
 
@@ -265,7 +265,7 @@ fn structural_phasing_small_gap_bridge_candidate_stress() {
         adaptive_band: true,
         min_reads: 2,
         alignment_mode: AlignmentMode::SemiGlobal,
-        consensus_mode: ConsensusMode::HeaviestPath,
+        consensus_mode: ConsensusMode::BestFit,
         ..PoaConfig::default()
     };
 
@@ -392,7 +392,7 @@ fn structural_phasing_dense_noise_mixed_cluster_stress() {
         adaptive_band: true,
         min_reads: 2,
         alignment_mode: AlignmentMode::SemiGlobal,
-        consensus_mode: ConsensusMode::HeaviestPath,
+        consensus_mode: ConsensusMode::BestFit,
         ..PoaConfig::default()
     };
 
