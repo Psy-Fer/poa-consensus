@@ -340,6 +340,12 @@ pub mod poa2;
 #[doc(hidden)]
 pub mod phasing;
 
+/// Internal multi-allele consensus pipeline (structural-propose + linkage-confirm)
+/// on top of the [`poa2`] engine. **Not part of the public API** and exempt from
+/// semver; reached via the crate-root [`consensus_multi`].
+#[doc(hidden)]
+pub mod multi;
+
 pub use analysis::{
     ConsensusWarnings, DiagnoseConfig, InteriorSupportWarning, LowDepthWarning,
     StructuralCompetingSummary, TruncationWarning, diagnose,
@@ -456,7 +462,7 @@ pub fn consensus_multi(
     // robustness matrix it beats the legacy engine on read-assignment cleanliness
     // and single-allele safety at near-equal split sensitivity. (Same-length
     // substitution haplotypes are the one weaker case; tracked separately.)
-    crate::poa2::hybrid_consensus_multi(reads, config)
+    crate::multi::hybrid_consensus_multi(reads, config)
 }
 
 /// Fraction of reads that must fail to span both flanks before the flanked

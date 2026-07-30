@@ -61,9 +61,9 @@ fn run_multi(reads: &[Read], config: &PoaConfig) -> (Vec<Vec<usize>>, Vec<usize>
     let seqs = Read::seqs(reads);
     let result = match engine() {
         Engine::Legacy => poa_consensus::consensus_multi(&seqs, 0, config),
-        Engine::Poa2 => poa_consensus::poa2::consensus_multi(&seqs, config),
-        Engine::Linkage => poa_consensus::poa2::linkage_consensus_multi(&seqs, config),
-        Engine::Hybrid => poa_consensus::poa2::hybrid_consensus_multi(&seqs, config),
+        Engine::Poa2 => poa_consensus::multi::consensus_multi(&seqs, config),
+        Engine::Linkage => poa_consensus::multi::linkage_consensus_multi(&seqs, config),
+        Engine::Hybrid => poa_consensus::multi::hybrid_consensus_multi(&seqs, config),
     };
     match result {
         Ok(alleles) => (

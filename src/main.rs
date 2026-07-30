@@ -210,7 +210,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Single-record passthrough ─────────────────────────────────────────────
-    if reads.len() == 1 {
+    // Only when the depth floor permits it (`--min-reads <= 1`). Otherwise fall
+    // through so the normal path returns InsufficientDepth rather than silently
+    // emitting a one-read "consensus" that bypasses the floor.
+    if reads.len() == 1 && args.min_reads <= 1 {
         let stdout = io::stdout();
         let mut out = stdout.lock();
         writeln!(out, ">consensus reads=1 seed=0 band=unbanded")?;

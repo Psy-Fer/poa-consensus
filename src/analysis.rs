@@ -186,6 +186,13 @@ pub fn allele_fractions(site: &BubbleSite) -> Vec<f64> {
 ///
 /// `confidence` must be in (0, 1).  Typical values: 0.90, 0.95, 0.99.
 ///
+/// **Large-sample approximation:** this uses the normal quantile `z`, not the
+/// Student-t quantile, so with the sample standard deviation `s` it is
+/// *anticonservative* (interval slightly too narrow) at small `n` — noticeably so
+/// below ~15 observations, where `t` ≫ `z`. Treat the interval as approximate for
+/// the small read counts typical of STR loci; multiply the half-width by ~1.1–1.3
+/// at n ≈ 5–10 for a conservative bound.
+///
 /// Returns `(NaN, NaN)` for an empty slice and `(values[0], values[0])` for a
 /// single observation (interval undefined, point estimate returned).
 ///
@@ -325,7 +332,7 @@ pub fn has_competing_allele(consensus: &Consensus, min_freq: f64) -> Option<&Bub
     // (e.g. at low depth the old `c/n >= min_freq` fractional test flagged a
     // 1-read arm the `ceil(n·f).max(2)` splitter would decline). See
     // `poa2::phasing_floor`.
-    let floor = crate::poa2::phasing_floor(consensus.n_reads, min_freq);
+    let floor = crate::multi::phasing_floor(consensus.n_reads, min_freq);
     consensus.bubble_sites.iter().find(|site| {
         // Sort descending; the second entry is the strongest minority arm.
         let mut counts = site.arm_read_counts.clone();
@@ -754,7 +761,7 @@ pub fn consensus_fit(
     }
     // Delegate the per-read alignment to the poa2 engine; keep this function's
     // own per-read length-normalised averaging (its established scale).
-    let counts = crate::poa2::align_indel_counts(consensus_seq, reads, config);
+    let counts = crate::multi::align_indel_counts(consensus_seq, reads, config);
     if counts.is_empty() {
         return 0.0;
     }

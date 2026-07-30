@@ -105,6 +105,13 @@ fn find_flank_end(read: &[u8], flank: &[u8]) -> Option<usize> {
 /// Returns the position in `read` where the right flank begins (i.e. where the repeat
 /// segment should end).  Implemented by reversing both sequences and calling
 /// `find_flank_end`, then converting back to the original coordinate space.
+///
+/// Because `find_flank_end` takes the *first* max in the reversed read, this anchors
+/// to the *last* equally-scoring right-flank position in the original — the mirror of
+/// the left anchor's "earliest" choice. With a unique flank there is a single max, so
+/// the choice is unambiguous; only on a repeat-adjacent / degenerate right flank does
+/// this bias the extracted segment slightly longer (it may absorb a flank-like unit).
+/// Use ≥ ~20 bp of genuinely unique flanking sequence to avoid this.
 fn find_right_flank_start(read: &[u8], right_flank: &[u8]) -> Option<usize> {
     if right_flank.is_empty() {
         return Some(read.len());

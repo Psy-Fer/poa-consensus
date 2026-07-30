@@ -12,6 +12,19 @@ fn complement(b: u8) -> u8 {
         b'T' | b't' => b'A',
         b'C' | b'c' => b'G',
         b'G' | b'g' => b'C',
+        // IUPAC ambiguity codes: complement the pairs (R↔Y, K↔M, B↔V, D↔H);
+        // S, W, N are self-complementary. Returned uppercase, like the ACGT arms.
+        b'R' | b'r' => b'Y',
+        b'Y' | b'y' => b'R',
+        b'K' | b'k' => b'M',
+        b'M' | b'm' => b'K',
+        b'B' | b'b' => b'V',
+        b'V' | b'v' => b'B',
+        b'D' | b'd' => b'H',
+        b'H' | b'h' => b'D',
+        b'S' | b's' => b'S',
+        b'W' | b'w' => b'W',
+        b'N' | b'n' => b'N',
         other => other,
     }
 }
@@ -95,6 +108,8 @@ mod tests {
         assert_eq!(reverse_complement(b"AACG"), b"CGTT".to_vec());
         // N passes through; case is normalized to uppercase.
         assert_eq!(reverse_complement(b"acgtN"), b"NACGT".to_vec());
+        // IUPAC ambiguity codes complement (R↔Y, K↔M): rev("RYK")=KYR → complement → MRY.
+        assert_eq!(reverse_complement(b"RYK"), b"MRY".to_vec());
     }
 
     #[test]
