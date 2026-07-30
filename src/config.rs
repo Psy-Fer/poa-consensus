@@ -38,7 +38,16 @@ pub struct PoaConfig {
     pub gap_extend: i32,
     /// Fraction of reads that must cover a node for it to appear in consensus.
     pub min_coverage_fraction: f64,
-    /// Minimum fraction of reads supporting an allele for bubble detection.
+    /// Minimum fraction of reads supporting an allele for it to be called (the
+    /// minority-arm support floor is `ceil(n * min_allele_freq).max(2)`).
+    ///
+    /// This is a **hard mosaic-sensitivity boundary**, not just a noise filter: an
+    /// allele below this frequency is merged into the majority and does **not**
+    /// appear anywhere in the output (its bubble is emitted only at or above this
+    /// floor). A single run therefore cannot report a sub-threshold mosaic — to
+    /// detect a low-frequency / subclonal allele (e.g. a 10-15% mosaic), lower
+    /// `min_allele_freq` and re-run `consensus_multi`. On noisy ONT data raise it
+    /// (~0.40) instead, to avoid error-driven false second-allele calls.
     pub min_allele_freq: f64,
     /// Minimum number of reads required to build a consensus.
     pub min_reads: usize,

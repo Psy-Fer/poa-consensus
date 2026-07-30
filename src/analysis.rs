@@ -320,12 +320,17 @@ pub fn has_competing_allele(consensus: &Consensus, min_freq: f64) -> Option<&Bub
     if consensus.n_reads == 0 {
         return None;
     }
-    let n = consensus.n_reads as f64;
+    // Use the SAME minority-arm floor the multi-allele splitter uses, so this
+    // recommendation never fires at a looser threshold than the engine acts on
+    // (e.g. at low depth the old `c/n >= min_freq` fractional test flagged a
+    // 1-read arm the `ceil(n·f).max(2)` splitter would decline). See
+    // `poa2::phasing_floor`.
+    let floor = crate::poa2::phasing_floor(consensus.n_reads, min_freq);
     consensus.bubble_sites.iter().find(|site| {
         // Sort descending; the second entry is the strongest minority arm.
         let mut counts = site.arm_read_counts.clone();
         counts.sort_unstable_by(|a, b| b.cmp(a));
-        counts.get(1).is_some_and(|&c| c as f64 / n >= min_freq)
+        counts.get(1).is_some_and(|&c| c >= floor)
     })
 }
 

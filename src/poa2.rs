@@ -1440,7 +1440,7 @@ fn median_usize(vals: &[usize]) -> f64 {
         return 0.0;
     }
     let mut v: Vec<f64> = vals.iter().map(|&x| x as f64).collect();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(|a, b| a.total_cmp(b)); // total_cmp: NaN-safe, no unwrap panic path
     let n = v.len();
     if n % 2 == 1 {
         v[n / 2]
@@ -1695,8 +1695,7 @@ fn phasing_groups(
                 .min_by(|&a, &b| {
                     let da = (snapshot_lens[a] - len).abs();
                     let db = (snapshot_lens[b] - len).abs();
-                    da.partial_cmp(&db)
-                        .unwrap()
+                    da.total_cmp(&db)
                         .then_with(|| snapshot_sizes[b].cmp(&snapshot_sizes[a]))
                         .then_with(|| a.cmp(&b))
                 })
@@ -1852,7 +1851,7 @@ fn validate_and_merge_groups(
                     .min_by(|&a, &b| {
                         let da = (median_usize(&confirmed_lens[a]) - cand_med).abs();
                         let db = (median_usize(&confirmed_lens[b]) - cand_med).abs();
-                        da.partial_cmp(&db).unwrap()
+                        da.total_cmp(&db)
                     })
                     .expect("structurally_distinct false => at least one indistinguishable group");
                 confirmed_lens[target].extend(cand_lens);
@@ -1873,7 +1872,7 @@ fn validate_and_merge_groups(
                     .min_by(|&(_, &a), &(_, &b)| {
                         let da = (a - len).abs();
                         let db = (b - len).abs();
-                        da.partial_cmp(&db).unwrap()
+                        da.total_cmp(&db)
                     })
                     .map(|(i, _)| i)
                     .unwrap_or(0);
@@ -2048,8 +2047,13 @@ const LINKAGE_MAX_DEPTH: usize = 3;
 /// `min_reads` — that is the consensus-*depth* floor (checked separately per
 /// group), and using it here would hide a legitimate minority arm below depth
 /// (e.g. a 3-read minor allele when min_reads=4), causing the split to be missed.
-fn phasing_floor(n_reads: usize, config: &PoaConfig) -> u32 {
-    ((n_reads as f64 * config.min_allele_freq).ceil() as u32).max(2)
+/// Shared minority-arm support floor: the minimum read count for an arm to be a
+/// callable allele at frequency `min_allele_freq`. Used BOTH by the multi-allele
+/// splitter (so the split threshold) AND by the analysis layer's competing-allele
+/// recommendation (`analysis::has_competing_allele`), so "re-run with --multi" can
+/// never fire at a looser threshold than the engine will actually act on.
+pub(crate) fn phasing_floor(n_reads: usize, min_allele_freq: f64) -> u32 {
+    ((n_reads as f64 * min_allele_freq).ceil() as u32).max(2)
 }
 
 /// Minimum median read-length gap (bp) between two groups to accept a LENGTH
@@ -2101,7 +2105,7 @@ fn linkage_partition_into(
     let sub_reads: Vec<&[u8]> = subset.iter().map(|&i| reads[i]).collect();
     let (g, ext) = build_median(&sub_reads, config);
     let bp = g
-        .phasing_matrix(phasing_floor(g.n_reads, config))
+        .phasing_matrix(phasing_floor(g.n_reads, config.min_allele_freq))
         .dominant_bipartition();
 
     let mut s0 = Vec::new();
@@ -2272,7 +2276,7 @@ fn groups_distinct(reads: &[&[u8]], gi: &[usize], gj: &[usize], config: &PoaConf
     // index into it), so the floor is a genuine global allele frequency. A real
     // minority allele sits at or above `min_allele_freq` by definition; a valley
     // noise cluster does not. (Lower `min_allele_freq` to call true mosaics.)
-    let freq_floor = phasing_floor(reads.len(), config) as usize;
+    let freq_floor = phasing_floor(reads.len(), config.min_allele_freq) as usize;
     if gi.len().min(gj.len()) < freq_floor {
         return false;
     }
@@ -2291,7 +2295,7 @@ fn groups_distinct(reads: &[&[u8]], gi: &[usize], gj: &[usize], config: &PoaConf
     // Same length: confirm the split against the linkage signal on a pooled graph.
     let pooled_reads: Vec<&[u8]> = gi.iter().chain(gj.iter()).map(|&r| reads[r]).collect();
     let (g, ext) = build_median(&pooled_reads, config);
-    let floor = phasing_floor(g.n_reads, config);
+    let floor = phasing_floor(g.n_reads, config.min_allele_freq);
     let m = g.phasing_matrix(floor);
     // side per internal read: pooled input index < gi.len() ⟹ from gi (side 0).
     let side: Vec<i8> = (0..g.n_reads)

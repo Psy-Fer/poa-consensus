@@ -437,6 +437,10 @@ pub fn consensus(
 ///
 /// Returns one [`Consensus`] per detected allele.  If no heterozygous bubble is
 /// found the result is a single-element `Vec` equivalent to calling [`consensus`].
+///
+/// An allele below [`PoaConfig::min_allele_freq`] is merged into the majority and
+/// does not appear in the output; to detect a low-frequency / mosaic allele, lower
+/// `min_allele_freq` and re-run (see that field's docs).
 pub fn consensus_multi(
     reads: &[&[u8]],
     seed_idx: usize,
