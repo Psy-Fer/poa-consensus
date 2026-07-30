@@ -24,6 +24,9 @@ required-features = ["cli"]
 
 [features]
 cli = ["dep:clap", "dep:noodles"]
+# Internal profiling: enables zero-overhead-when-off phase timers in the engine
+# (topo / align / integrate), read by the speed harness. Not part of the public API.
+profile = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }

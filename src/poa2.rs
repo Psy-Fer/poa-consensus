@@ -26,6 +26,82 @@
 use crate::config::{AlignmentMode, PoaConfig};
 use std::collections::HashMap;
 
+/// Internal per-phase profiling (topo / align / integrate), gated behind the
+/// `profile` feature so it is entirely absent — zero overhead — in normal builds.
+/// The `profile`-on version accumulates elapsed nanoseconds per phase into atomics
+/// the speed harness reads; the `profile`-off version is a no-op ZST guard.
+/// Not part of the public API.
+#[cfg(feature = "profile")]
+#[doc(hidden)]
+pub mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub static TOPO_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ALIGN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static INTEGRATE_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy)]
+    pub enum Phase {
+        Topo,
+        Align,
+        Integrate,
+    }
+
+    pub struct Timer {
+        start: Instant,
+        phase: Phase,
+    }
+    pub fn guard(phase: Phase) -> Timer {
+        Timer {
+            start: Instant::now(),
+            phase,
+        }
+    }
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            let ns = self.start.elapsed().as_nanos() as u64;
+            let slot = match self.phase {
+                Phase::Topo => &TOPO_NS,
+                Phase::Align => &ALIGN_NS,
+                Phase::Integrate => &INTEGRATE_NS,
+            };
+            slot.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Reset all phase accumulators to zero.
+    pub fn reset() {
+        TOPO_NS.store(0, Ordering::SeqCst);
+        ALIGN_NS.store(0, Ordering::SeqCst);
+        INTEGRATE_NS.store(0, Ordering::SeqCst);
+    }
+    /// (topo_ns, align_ns, integrate_ns) accumulated since the last `reset`.
+    pub fn take() -> (u64, u64, u64) {
+        (
+            TOPO_NS.load(Ordering::SeqCst),
+            ALIGN_NS.load(Ordering::SeqCst),
+            INTEGRATE_NS.load(Ordering::SeqCst),
+        )
+    }
+}
+
+#[cfg(not(feature = "profile"))]
+mod profile {
+    #[derive(Clone, Copy)]
+    pub enum Phase {
+        Topo,
+        Align,
+        Integrate,
+    }
+    /// No-op guard (ZST, no Drop) — compiles away entirely.
+    pub struct NoOp;
+    #[inline(always)]
+    pub fn guard(_phase: Phase) -> NoOp {
+        NoOp
+    }
+}
+
 const NEG_INF: i32 = i32::MIN / 4; // /4 so additions can't overflow
 
 /// Consensus coverage floor (mirrors the crate's `coverage_threshold`): a
@@ -246,6 +322,16 @@ impl Poa {
         let mut d0bk = vec![(0u8, VSTART); n];
         let mut best_j = vec![1usize; n]; // per-rank winning column (adaptive center)
 
+        // Per-row DP scratch, reused across nodes (cleared + resized to each row's
+        // `width` below). Hoisted out of the loop so the hot path does not allocate
+        // 5 Vecs per node — the dominant allocation churn (see the `profile` phase
+        // attribution: `align` is ~96% of build time).
+        let mut mrow: Vec<i32> = Vec::new();
+        let mut irow: Vec<i32> = Vec::new();
+        let mut drow: Vec<i32> = Vec::new();
+        let mut mbrow: Vec<(u8, u32)> = Vec::new();
+        let mut dbrow: Vec<(u8, u32)> = Vec::new();
+
         for &t in topo.iter() {
             let r = rank_of[t];
             let base = self.nodes[t].base;
@@ -298,11 +384,16 @@ impl Poa {
                 d0bk[r] = bk;
             }
 
-            let mut mrow = vec![NEG_INF; width];
-            let mut irow = vec![NEG_INF; width];
-            let mut drow = vec![NEG_INF; width];
-            let mut mbrow = vec![(0u8, VSTART); width];
-            let mut dbrow = vec![(0u8, VSTART); width];
+            mrow.clear();
+            mrow.resize(width, NEG_INF);
+            irow.clear();
+            irow.resize(width, NEG_INF);
+            drow.clear();
+            drow.resize(width, NEG_INF);
+            mbrow.clear();
+            mbrow.resize(width, (0u8, VSTART));
+            dbrow.clear();
+            dbrow.resize(width, (0u8, VSTART));
             let mut row_best = NEG_INF;
             let mut row_best_j = best_j[r];
 
@@ -575,9 +666,18 @@ impl Poa {
         if read.is_empty() {
             return;
         }
-        let (topo, rank_of) = self.topo_order();
-        let ops = self.align(read, &topo, &rank_of);
-        let (path, medges) = self.integrate(read, &ops);
+        let (topo, rank_of) = {
+            let _g = profile::guard(profile::Phase::Topo);
+            self.topo_order()
+        };
+        let ops = {
+            let _g = profile::guard(profile::Phase::Align);
+            self.align(read, &topo, &rank_of)
+        };
+        let (path, medges) = {
+            let _g = profile::guard(profile::Phase::Integrate);
+            self.integrate(read, &ops)
+        };
         self.read_paths.push(path);
         self.read_matched_edges.push(medges);
         self.read_lens.push(read.len());

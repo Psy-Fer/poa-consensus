@@ -421,6 +421,56 @@ fn case_triallelic() {
     report("triallelic (short/medium/long)", &rows);
 }
 
+// ── Must-hold CI guards (NOT ignored) ─────────────────────────────────────────
+// A small, robust subset of the sweeps above, asserted as hard bounds so the
+// headline multi-allele API (`consensus_multi` → hybrid) is actually exercised in
+// CI. The full sweeps stay `#[ignore]`d reports; these are the regression floor.
+// Run under the default engine (production hybrid via `poa_consensus::consensus_multi`).
+
+#[test]
+fn must_single_allele_never_oversplits() {
+    // A single true allele must return exactly one consensus — never a spurious
+    // second allele — across motifs, seeds, and clean/moderate error. This guards
+    // the single-allele safety the whole phasing pipeline is gated on.
+    for (mn, m) in MOTIFS {
+        for &err in &[0.0f64, 0.03] {
+            for &s in SEEDS {
+                let o = eval(&single(m, 30, 20, err, s));
+                assert_eq!(
+                    o.got_alleles, 1,
+                    "{mn}×30 single allele over-split at err={err} seed={s}: got {} alleles",
+                    o.got_alleles
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn must_clean_diploid_length_splits_cleanly() {
+    // A clean, well-separated, well-covered length diploid (20 vs 40 units, 0%
+    // error, depth 20) must split into exactly two alleles with no read
+    // misassignment. This guards the core diploid-length calling path.
+    for (mn, m) in MOTIFS {
+        for &s in SEEDS {
+            let o = eval(&diploid_length(m, 20, 40, 20, 0.0, 0.0, s));
+            // Count is the headline must-hold; a few % read misassignment under
+            // the per-read ±1-unit jitter is tolerable, so the misassign bound is
+            // a gross-failure guard, not an exact-0.
+            assert_eq!(
+                o.got_alleles, 2,
+                "{mn} 20v40 clean diploid should split into 2 (seed={s}): got {}",
+                o.got_alleles
+            );
+            assert!(
+                o.misassign_rate < 0.15,
+                "{mn} 20v40 clean diploid grossly misphased: misassign {:.3} (seed={s})",
+                o.misassign_rate
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "baseline report; run with --ignored --nocapture"]
 fn case_partial_reads() {
