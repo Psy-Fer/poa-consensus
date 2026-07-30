@@ -623,7 +623,13 @@ impl Poa {
         }
         let mut path = Vec::new();
         let mut cur = start;
-        while cur != usize::MAX {
+        // `visited` is cycle-safety insurance: the graph is a DAG by construction
+        // (topo_order debug-asserts it), so `nxt` cannot cycle — but node fusion has
+        // no explicit back-edge guard, so if a cycle ever slipped through in a
+        // release build this bounds the walk instead of looping.
+        let mut visited = vec![false; n];
+        while cur != usize::MAX && !visited[cur] {
+            visited[cur] = true;
             path.push(cur);
             cur = nxt[cur];
         }
@@ -878,11 +884,21 @@ impl Poa {
             b'G' => 2,
             _ => 3,
         };
+        // `covering[c]` = reads whose occupied column *range* brackets column `c`
+        // (via a difference array over each read's [min,max] column). A read that
+        // simply doesn't reach `c` (a partial / non-spanning read) is NOT counted,
+        // so under SemiGlobal it can't masquerade as a deletion and truncate the
+        // consensus near the flanks. Only reads that span `c` but don't occupy it
+        // are genuine deletions (`covering - present`).
+        let mut cover_delta = vec![0i32; ncol + 1];
         for path in &self.read_paths {
             // A read occupies each column at most once; guard duplicates.
             let mut last_col = usize::MAX;
+            let (mut lo, mut hi) = (usize::MAX, 0usize);
             for &nd in path {
                 let c = node_col[nd];
+                lo = lo.min(c);
+                hi = hi.max(c);
                 if c == last_col {
                     continue;
                 }
@@ -890,19 +906,36 @@ impl Poa {
                 tally[c][code(self.nodes[nd].base)] += 1;
                 present[c] += 1;
             }
+            if lo != usize::MAX {
+                cover_delta[lo] += 1;
+                cover_delta[hi + 1] -= 1;
+            }
+        }
+        let mut covering = vec![0u32; ncol];
+        let mut acc = 0i32;
+        for c in 0..ncol {
+            acc += cover_delta[c];
+            covering[c] = acc.max(0) as u32;
         }
         let bases = *b"ACGT";
         let mut out = Vec::with_capacity(ncol);
         let mut cov = Vec::with_capacity(ncol);
-        // Column index already IS topological order (0..ncol).
+        // A column is emitted only if a majority of the whole read set REACHES it
+        // (`covering >= floor`) AND its plurality base beats genuine deletions
+        // among the reads that span it (`bc > gap`). The `covering` floor keeps
+        // the majority-*length* semantics (a minority of longer reads can't emit
+        // their private tail), while measuring `gap` against `covering` rather than
+        // `n_reads` stops reads that simply END elsewhere from voting as deletions
+        // and truncating a well-covered column.
+        let floor = coverage_threshold(self.n_reads, self.cfg.min_coverage_fraction);
         for c in 0..ncol {
-            let gap = self.n_reads as u32 - present[c].min(self.n_reads as u32);
+            let gap = covering[c] - present[c].min(covering[c]);
             let (bi, &bc) = tally[c]
                 .iter()
                 .enumerate()
                 .max_by_key(|&(_, &v)| v)
                 .unwrap();
-            if bc > gap {
+            if bc > gap && covering[c] >= floor {
                 out.push(bases[bi]);
                 cov.push(bc); // reads supporting the emitted base at this column
             }
@@ -937,7 +970,7 @@ impl Poa {
     }
 
     /// GraphStats over the whole graph (O(V+E)).
-    fn compute_stats(&self) -> crate::types::GraphStats {
+    fn compute_stats(&self, er: &HashMap<(usize, usize), Vec<u32>>) -> crate::types::GraphStats {
         use crate::types::GraphStats;
         let n = self.nodes.len();
         let edge_count: usize = self.nodes.iter().map(|nd| nd.out.len()).sum();
@@ -986,17 +1019,21 @@ impl Poa {
                 1.0 - (2.0 * area as f64) / (nlen * tot as f64) + 1.0 / nlen
             }
         };
-        // bubbles: fork nodes with 2+ out-edges each >= allele floor
+        // bubbles: fork nodes with 2+ out-edges each >= allele floor. Uses the
+        // MATCHED edge view (`er`), not `Edge.weight`, so a length variant's
+        // delete-bypass resume edge does not inflate bubble_count/max_bubble_depth
+        // (see the matched-edge invariant and the bubble scan in `consensus_full`).
         let floor = ((self.n_reads as f64) * self.cfg.min_allele_freq).floor() as i32;
         let floor = floor.max(1);
         let mut bubble_count = 0usize;
         let mut max_bubble_depth = 0usize;
         let mut longest_span = 0usize;
-        for nd in &self.nodes {
+        for (ni, nd) in self.nodes.iter().enumerate() {
+            let mw = |to: usize| er.get(&(ni, to)).map_or(0, |v| v.len()) as i32;
             let sig: Vec<i32> = nd
                 .out
                 .iter()
-                .map(|e| e.weight)
+                .map(|e| mw(e.to))
                 .filter(|&w| w >= floor)
                 .collect();
             if sig.len() >= 2 {
@@ -1005,7 +1042,7 @@ impl Poa {
                 s.sort_unstable_by(|a, b| b.cmp(a));
                 max_bubble_depth = max_bubble_depth.max(s[1] as usize); // minority arm
                 for e in &nd.out {
-                    if e.weight >= floor {
+                    if mw(e.to) >= floor {
                         let (_, cnt) = self.materialize_arm(e.to, 4096);
                         longest_span = longest_span.max(cnt);
                     }
@@ -1113,21 +1150,30 @@ impl Poa {
                 i += 1;
             }
         }
-        // bubble sites on the consensus path
+        // bubble sites on the consensus path. Arm significance/counts use the
+        // MATCHED edge view (`read_matched_edges` via `edge_reads`), NOT
+        // `Edge.weight`: a length variant's short-allele delete-bypass resume edge
+        // carries `Edge.weight` but no matched reads, so counting `Edge.weight`
+        // here would register it as a spurious competing arm. Single-allele
+        // reporting; multi-allele phasing handles length variants via the
+        // bypass-inclusive `read_paths` separately. See the `read_matched_edges`
+        // invariant.
+        let er = self.edge_reads();
         let floor = (((self.n_reads as f64) * self.cfg.min_allele_freq).floor() as i32).max(1);
         let mut bubble_sites = Vec::new();
         for (pos, &nd) in path.iter().enumerate() {
+            let mw = |to: usize| er.get(&(nd, to)).map_or(0, |v| v.len()) as i32;
             let sig: Vec<&Edge> = self.nodes[nd]
                 .out
                 .iter()
-                .filter(|e| e.weight >= floor)
+                .filter(|e| mw(e.to) >= floor)
                 .collect();
             if sig.len() >= 2 {
                 let mut arm_read_counts = Vec::new();
                 let mut arm_sequences = Vec::new();
                 let mut is_structural = false;
                 for e in &sig {
-                    arm_read_counts.push(e.weight as u32);
+                    arm_read_counts.push(mw(e.to) as u32);
                     let (seq, cnt) = self.materialize_arm(e.to, 256);
                     if cnt >= self.cfg.phasing_bubble_min_span {
                         is_structural = true;
@@ -1147,7 +1193,7 @@ impl Poa {
             coverage,
             path_weights,
             n_reads: self.n_reads,
-            graph_stats: self.compute_stats(),
+            graph_stats: self.compute_stats(&er),
             gaps,
             bubble_sites,
             read_indices: vec![],

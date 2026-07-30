@@ -392,16 +392,6 @@ fn explain_error(e: &PoaError, n_reads: usize) {
                 );
             }
         }
-        PoaError::BandTooNarrow {
-            configured,
-            required,
-        } => {
-            eprintln!(
-                "poa-consensus: error: band width {configured} is too narrow \
-                 (need ≥ {required} for this read set)"
-            );
-            eprintln!("  hint: try --adaptive-band, or --band-width {required}");
-        }
         PoaError::NoSpanningReads {
             left_depth,
             right_depth,

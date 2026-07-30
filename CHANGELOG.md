@@ -24,6 +24,9 @@ are unchanged (the default `consensus`/`consensus_multi` path is untouched by th
 - **`PoaConfig::multi_allele` is removed.** It was dead (never read) and its doc described
   deleted-engine machinery. Callers using `..PoaConfig::default()` are unaffected; remove
   any explicit `multi_allele:` field initialiser.
+- **`PoaError::BandTooNarrow` is removed.** The static-diagonal-union band never produces it
+  (the endpoint is always in-band), so it was never constructed. Match arms on `PoaError`
+  should drop the `BandTooNarrow` case.
 
 ### Added
 
@@ -57,6 +60,16 @@ are unchanged (the default `consensus`/`consensus_multi` path is untouched by th
 - **`consensus_multi` could panic on all-empty input.** The multi-allele entry points now
   validate the non-empty read count and return `Err(InsufficientDepth)` instead of panicking
   in median-seed selection.
+- **MajorityFrequency consensus truncated on partial reads.** `consensus_majority_cov` counted
+  every read not occupying a column as a deletion vote, so reads that simply do not *reach* a
+  column (partial / non-spanning) suppressed well-covered columns. It now measures deletions
+  only among reads that span the column, while still requiring a majority of reads to reach a
+  column before it is emitted (preserving majority-length trimming).
+- **Bubble statistics counted delete-bypass traffic.** `bubble_sites`, `bubble_count`,
+  `max_bubble_depth`, and `arm_read_counts` used the unified `Edge.weight`, so a length
+  variant's short-allele delete-bypass resume edge could register as a spurious competing arm
+  in single-allele output. They now use the matched-edge view (`read_matched_edges`), matching
+  the documented invariant.
 
 ### Documentation
 

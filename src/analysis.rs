@@ -545,9 +545,9 @@ pub struct InteriorSupportWarning {
 /// Fired when `consensus_len / median_input_read_len` is below the configured
 /// threshold (default 0.60).  The most common cause is highly repetitive sequence
 /// (e.g. AAAAG 5-mer) where multiple DP diagonals score identically; the band
-/// locks onto the wrong one without approaching the band edge, so no
-/// `BandTooNarrow` error is raised.  The remedy is to retry with `band_width = 0`
-/// (unbanded), which forces the traceback to reach the correct endpoint.
+/// locks onto the wrong one silently (the static-diagonal-union band keeps the
+/// endpoint reachable, so no error is raised).  The remedy is to retry with
+/// `band_width = 0` (unbanded), which forces the traceback to the correct endpoint.
 #[derive(Debug, Clone)]
 pub struct TruncationWarning {
     /// Length of the consensus sequence produced.
