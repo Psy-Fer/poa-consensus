@@ -9,24 +9,38 @@ aligner. This creates spurious branches and unreliable consensus.
 
 The root cause is that nothing pins the read to a common anchor point before alignment.
 
-## The fix: extract the repeat segment
+## The fix: anchor to the flanks
+
+The simplest path is `consensus_flanked` (and `consensus_multi_flanked`), which take the
+flank sequences directly and return the consensus of the repeat region **between** them:
 
 ```rust
-use poa_consensus::{consensus, extract_flanked_region, PoaConfig};
+use poa_consensus::{consensus_flanked, PoaConfig};
 
 let left_flank  = b"TTTCTTTCTTTC";   // unique sequence left of the repeat
 let right_flank = b"GAAGAAGAAGAA";   // unique sequence right of the repeat
 
-// Extract only the repeat segment from each read. `extract_flanked_region`
-// returns a zero-copy `&[u8]` slice into the original read; reads where either
-// flank is not found are skipped (naturally excluding non-spanning reads).
+// Consensus of the repeat segment only (flanks excluded from the output).
+let result = consensus_flanked(&reads, left_flank, right_flank, &PoaConfig::default())?;
+```
+
+These wrappers **auto-detect partial reads**: when a meaningful fraction of reads fail to
+span both flanks, the consensus is built only from the reads that do span (trimmed to the
+repeat), which is where anchoring wins — a raw consensus is distorted by partial reads. When
+the reads already span, it builds from all of them and slices the result, so anchoring is
+never worse than the plain call. It falls back to the raw all-reads consensus when too few
+reads span to anchor safely. Use flanks of at least ~20 bp of unique sequence.
+
+If you need the extracted segments themselves (e.g. to feed a different pipeline), the
+lower-level `extract_flanked_region` returns the zero-copy `&[u8]` slice between the flanks:
+
+```rust
+use poa_consensus::{consensus, extract_flanked_region, PoaConfig};
+
 let segments: Vec<&[u8]> = reads
     .iter()
     .filter_map(|read| extract_flanked_region(read, left_flank, right_flank))
     .collect();
-
-// Build the consensus from the anchored segments (see Seed Selection for
-// choosing `seed_idx`; the engine self-seeds on the median-length read).
 let result = consensus(&segments, 0, &PoaConfig::default())?;
 ```
 

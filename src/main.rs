@@ -133,6 +133,18 @@ struct Args {
     #[arg(long, default_value_t = 10, help_heading = "Multi-allele")]
     phasing_bubble_min_span: usize,
 
+    // ── Flanking ────────────────────────────────────────────────────────────────
+    /// Left flank sequence anchoring the repeat region (use with --right-flank).
+    /// When both are set, the consensus is restricted to the segment BETWEEN the
+    /// flanks and non-spanning (partial) reads are auto-excluded when they are a
+    /// meaningful fraction of the pool. Use ≥ ~20 bp of unique flank.
+    #[arg(long, value_name = "SEQ", help_heading = "Flanking")]
+    left_flank: Option<String>,
+
+    /// Right flank sequence (see --left-flank). Both flanks must be given together.
+    #[arg(long, value_name = "SEQ", help_heading = "Flanking")]
+    right_flank: Option<String>,
+
     // ── Diagnostics ───────────────────────────────────────────────────────────
     /// Suppress the long-read unbanded warning (reads > ~1 kb with band 0).
     #[arg(long, help_heading = "Diagnostics")]
@@ -297,9 +309,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = stdout.lock();
     let n = reads.len();
 
+    // Flanking-anchor mode: both flanks together restrict the output to the repeat
+    // segment and auto-exclude partial reads (see `consensus_flanked`).
+    let flanks: Option<(Vec<u8>, Vec<u8>)> = match (&args.left_flank, &args.right_flank) {
+        (Some(l), Some(r)) => Some((l.as_bytes().to_vec(), r.as_bytes().to_vec())),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--left-flank and --right-flank must be provided together".into());
+        }
+        (None, None) => None,
+    };
+
     if args.multi {
-        let alleles = poa_consensus::consensus_multi(&slices, seed_idx, &config)
-            .inspect_err(|e| explain_error(e, n))?;
+        let alleles = match &flanks {
+            Some((l, r)) => poa_consensus::consensus_multi_flanked(&slices, l, r, &config),
+            None => poa_consensus::consensus_multi(&slices, seed_idx, &config),
+        }
+        .inspect_err(|e| explain_error(e, n))?;
         let total = alleles.len();
         let allele_cfg = DiagnoseConfig {
             is_allele_partition: true,
@@ -332,8 +357,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // carry -- the seed-sensitivity retry (`consensus_fit_scored`), the
         // banded-truncation unbanded-rebuild retry, and the interior filter --
         // none of which the clean engine needs.
-        let result = poa_consensus::consensus(&slices, seed_idx, &config)
-            .inspect_err(|e| explain_error(e, n))?;
+        let result = match &flanks {
+            Some((l, r)) => poa_consensus::consensus_flanked(&slices, l, r, &config),
+            None => poa_consensus::consensus(&slices, seed_idx, &config),
+        }
+        .inspect_err(|e| explain_error(e, n))?;
         // `consensus()` picks the median-length read as seed internally; recompute
         // it here purely for the informational FASTA header.
         let mut order: Vec<usize> = (0..slices.len()).collect();

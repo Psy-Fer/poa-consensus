@@ -7,6 +7,64 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.6.0] - unreleased
+
+Correctness, safety-default, API, and documentation pass following a full deep-dive
+review. Fixes several silent correctness bugs in the default path, adds an opt-in
+flank-anchoring workflow that wins on partial-read loci, and reconciles the docs with the
+shipped engine. `validate.py` 20/20 and `compare_callers.py` 16/16 (vs abPOA/SPOA/POASTA)
+are unchanged (the default `consensus`/`consensus_multi` path is untouched by the new work).
+
+### Breaking
+
+- **`min_reads` now defaults to `3` (was `1`).** The `(n/2 + 1).max(2)` coverage floor is
+  unreliable at depth 1–2, so the old default could produce silently unreliable output.
+  `consensus`/`consensus_multi` now return `Err(InsufficientDepth)` below 3 reads by
+  default; set `min_reads: 1` explicitly to restore the previous behaviour.
+- **`PoaConfig::multi_allele` is removed.** It was dead (never read) and its doc described
+  deleted-engine machinery. Callers using `..PoaConfig::default()` are unaffected; remove
+  any explicit `multi_allele:` field initialiser.
+
+### Added
+
+- **Flank-anchoring consensus: `consensus_flanked` and `consensus_multi_flanked`.** Given
+  left/right flank sequences, they return the consensus of the repeat region *between* the
+  flanks. They **auto-detect partial reads**: when a meaningful fraction of reads fail to
+  span both flanks, the consensus is built only from the reads that span (kept whole so the
+  flanks still anchor the alignment) and the result is sliced to the repeat; otherwise all
+  reads are used. A raw fallback covers the case where too few reads span. On partial-read
+  loci this is a large accuracy win (single-allele and multi-allele length) and is neutral
+  on fully-spanning read sets. CLI: `--left-flank` / `--right-flank`.
+
+### Changed
+
+- **`warn_on_long_unbanded` is now honoured.** `consensus`/`consensus_multi` emit a one-line
+  stderr warning when alignment is fully unbanded (`band_width = 0`, `adaptive_band = false`)
+  on reads over ~1 kb. Previously the field was accepted but never read.
+
+### Fixed
+
+- **Affine insert-run traceback mislabelled inserted bases as matches.** The insert-run
+  traceback compared `M >= I` instead of `M + gap_open >= I`, so a multi-base insertion run
+  (homopolymer / repeat inserts) could be cut one base short, with an inserted base emitted
+  as a Match and inflating a node's coverage. Alignments on affected inputs change (more
+  correct).
+- **Lowercase / soft-masked reads were spuriously reverse-complemented.** `orient_to_seed`
+  matched k-mers case-sensitively while `reverse_complement` uppercases, so a lowercase
+  forward read scored zero forward hits and was flipped. Orientation is now case-insensitive.
+- **`GraphStats::edge_weight_gini` had a sign error** that biased every graph by `-2/n`
+  (a uniform graph scored `-2/n` instead of `0` and could report negative inequality).
+- **`consensus_multi` could panic on all-empty input.** The multi-allele entry points now
+  validate the non-empty read count and return `Err(InsufficientDepth)` instead of panicking
+  in median-seed selection.
+
+### Documentation
+
+- Corrected user-facing docs that described the deleted engine: the banded-DP page
+  (rewritten for the static-diagonal-union anti-fold band), the `PoaConfig` defaults table,
+  the `DiagnoseConfig` field list, the rustdoc `BandTooNarrow` "never silently wrong" claim,
+  and the `delete_count` → `del` naming. Documented the flank-anchoring workflow.
+
 ## [0.5.0] - 2026-07-29
 
 Engine rebuild and accuracy pass. The accumulated legacy engine (`graph.rs`) is

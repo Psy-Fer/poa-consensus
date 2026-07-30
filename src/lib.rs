@@ -455,6 +455,150 @@ pub fn consensus_multi(
     crate::poa2::hybrid_consensus_multi(reads, config)
 }
 
+/// Fraction of reads that must fail to span both flanks before the flanked
+/// entry points switch to anchored mode (restrict to spanning reads).
+const FLANK_ANCHOR_TRIGGER: f64 = 0.1;
+
+/// Indices of the reads that span BOTH flanks (i.e. are not partial). We anchor
+/// by restricting to these reads but keep them WHOLE — the flanks provide unique
+/// anchoring context the aligner and (especially) the multi-allele length-phasing
+/// need; trimming to the bare repeat first makes periodic segments align
+/// ambiguously and collapses length alleles together (measured 2026-07-30:
+/// keeping reads whole calls 182/216 length-diploids correct vs 103 when trimmed).
+/// The output is sliced back to the repeat region afterwards for a consistent
+/// flanks-excluded result.
+fn spanning_indices(reads: &[&[u8]], left: &[u8], right: &[u8]) -> Vec<usize> {
+    (0..reads.len())
+        .filter(|&i| crate::flank::flank_span(reads[i], left, right).is_some())
+        .collect()
+}
+
+/// Anchor only when a meaningful fraction of reads fail to span (so partials are
+/// distorting the raw consensus) AND enough reads still span to build from (so we
+/// don't trade a partials problem for a depth problem — the raw fallback covers
+/// the rest).
+fn should_anchor(total: usize, spanning: usize, config: &PoaConfig) -> bool {
+    if total == 0 {
+        return false;
+    }
+    let partial_frac = 1.0 - (spanning as f64 / total as f64);
+    partial_frac >= FLANK_ANCHOR_TRIGGER && spanning >= config.min_reads
+}
+
+/// Slice a whole-region `Consensus` down to the repeat segment between `left` and
+/// `right` (located in the consensus's own low-error sequence), so a flanked
+/// result always describes the sequence BETWEEN the flanks. Returns the consensus
+/// unchanged if the flanks cannot be located in it (rare; the consensus is clean).
+fn slice_to_repeat(c: Consensus, left: &[u8], right: &[u8]) -> Consensus {
+    let Some((s, e)) = crate::flank::flank_span(&c.sequence, left, right) else {
+        return c;
+    };
+    if e > c.sequence.len() || s >= e {
+        return c;
+    }
+    Consensus {
+        sequence: c.sequence[s..e].to_vec(),
+        coverage: c
+            .coverage
+            .get(s..e)
+            .map(<[u32]>::to_vec)
+            .unwrap_or_default(),
+        path_weights: c
+            .path_weights
+            .get(s..e)
+            .map(<[i32]>::to_vec)
+            .unwrap_or_default(),
+        n_reads: c.n_reads,
+        graph_stats: c.graph_stats,
+        gaps: c
+            .gaps
+            .into_iter()
+            .filter(|g| g.start >= s && g.end <= e)
+            .map(|g| CoverageGap {
+                start: g.start - s,
+                end: g.end - s,
+                kind: g.kind,
+            })
+            .collect(),
+        bubble_sites: c
+            .bubble_sites
+            .into_iter()
+            .filter(|b| b.consensus_pos >= s && b.consensus_pos < e)
+            .map(|mut b| {
+                b.consensus_pos -= s;
+                b
+            })
+            .collect(),
+        read_indices: c.read_indices,
+    }
+}
+
+/// Single-allele consensus of the repeat region between `left_flank` and
+/// `right_flank`, auto-anchoring when the read set is partial-heavy.
+///
+/// Reads that do not span both flanks (partial / non-spanning reads) distort a
+/// raw consensus. When a meaningful fraction of reads fail to span, this builds
+/// only from the reads that DO span (kept whole, so the flanks still anchor the
+/// alignment); otherwise it builds from all reads. Either way the result is sliced
+/// so the returned [`Consensus`] describes the sequence **between** the flanks
+/// (flanks excluded). Falls back to the raw all-reads consensus when too few reads
+/// span to anchor safely. Flanks of at least ~20 bp of unique sequence are
+/// recommended.
+pub fn consensus_flanked(
+    reads: &[&[u8]],
+    left_flank: &[u8],
+    right_flank: &[u8],
+    config: &PoaConfig,
+) -> Result<Consensus, PoaError> {
+    validate(reads, 0)?;
+    let span = spanning_indices(reads, left_flank, right_flank);
+    let full = if should_anchor(reads.len(), span.len(), config) {
+        // Partial-heavy: build only from the spanning reads (kept whole).
+        let refs: Vec<&[u8]> = span.iter().map(|&i| reads[i]).collect();
+        consensus(&refs, 0, config)
+    } else {
+        // Spanning-heavy or too few spanned to anchor safely: all reads.
+        consensus(reads, 0, config)
+    }?;
+    Ok(slice_to_repeat(full, left_flank, right_flank))
+}
+
+/// Multi-allele version of [`consensus_flanked`]: returns one [`Consensus`] per
+/// detected allele, each describing the repeat region between the flanks. Uses
+/// the same partial-heavy auto-anchoring; `read_indices` are always reported as
+/// indices into the input `reads` slice (remapped from the anchored subset).
+pub fn consensus_multi_flanked(
+    reads: &[&[u8]],
+    left_flank: &[u8],
+    right_flank: &[u8],
+    config: &PoaConfig,
+) -> Result<Vec<Consensus>, PoaError> {
+    validate(reads, 0)?;
+    let span = spanning_indices(reads, left_flank, right_flank);
+    if should_anchor(reads.len(), span.len(), config) {
+        // Partial-heavy: phase only the spanning reads (kept whole so the flanks
+        // still anchor the length-bubble detection), then slice each allele to the
+        // repeat and remap read indices from the spanning subset back to originals.
+        let refs: Vec<&[u8]> = span.iter().map(|&i| reads[i]).collect();
+        if let Ok(mut alleles) = consensus_multi(&refs, 0, config) {
+            for a in &mut alleles {
+                for idx in &mut a.read_indices {
+                    *idx = span[*idx];
+                }
+            }
+            return Ok(alleles
+                .into_iter()
+                .map(|c| slice_to_repeat(c, left_flank, right_flank))
+                .collect());
+        }
+    }
+    let full = consensus_multi(reads, 0, config)?;
+    Ok(full
+        .into_iter()
+        .map(|c| slice_to_repeat(c, left_flank, right_flank))
+        .collect())
+}
+
 /// Build a consensus from two non-overlapping read groups with a gap of
 /// unknown length between them.
 ///
