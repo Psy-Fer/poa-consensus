@@ -14,7 +14,9 @@ retired in favour of the clean `poa2` engine that has backed single-allele
 consensus since 0.4.x; scoring defaults are retuned and single-allele extraction
 now picks the better of two consensus methods per call. Validated on the MUC1
 flVNTR locus: poa-consensus matches abPOA and POASTA on every haplotype.
-Over-calls nothing, and every consensus is fully supported by a read pileup (0 fabricated / 0 missing bases). It is strictly more robust than SPOA, which over-calls two of the same haplotypes.
+Over-calls nothing, and every consensus is fully supported by a read pileup 
+(0 fabricated / 0 missing bases). It is strictly more robust than SPOA, 
+which over-calls two of the same haplotypes.
 
 ### Breaking
 

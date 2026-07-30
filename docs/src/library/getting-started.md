@@ -4,7 +4,7 @@
 
 ```toml
 [dependencies]
-poa-consensus = "0.5"
+poa-consensus = "0.6"
 ```
 
 ## Minimal example
@@ -67,12 +67,13 @@ PoaConfig {
     mismatch_score: -4,
     gap_open: -4,
     gap_extend: -3,
-    min_coverage_fraction: 0.5,             // strict majority
-    min_allele_freq: 0.25,
-    min_reads: 3,
+    min_coverage_fraction: 0.0,             // 0.0 = use the (n/2 + 1).max(2) majority floor
+    min_allele_freq: 0.2,                   // minimum arm frequency to call a second allele
+    min_reads: 3,                           // Err(InsufficientDepth) below this
     alignment_mode: AlignmentMode::SemiGlobal,
-    consensus_mode: ConsensusMode::HeaviestPath,
-    warn_on_long_unbanded: true,
+    consensus_mode: ConsensusMode::HeaviestPath,  // "best-fit" (see above)
+    warn_on_long_unbanded: true,            // warn on stderr for unbanded multi-kb reads
+    phasing_bubble_min_span: 10,            // min arm span (bp) for a structural (length) bubble
 }
 ```
 

@@ -12,19 +12,22 @@ The root cause is that nothing pins the read to a common anchor point before ali
 ## The fix: extract the repeat segment
 
 ```rust
-use poa_consensus::extract_flanked_region;
+use poa_consensus::{consensus, extract_flanked_region, PoaConfig};
 
 let left_flank  = b"TTTCTTTCTTTC";   // unique sequence left of the repeat
 let right_flank = b"GAAGAAGAAGAA";   // unique sequence right of the repeat
 
-for read in &reads {
-    if let Some(segment) = extract_flanked_region(read, left_flank, right_flank) {
-        // segment is a &[u8] slice into the original read;
-        // no allocation, zero-copy
-        graph.add_read(segment)?;
-    }
-    // reads where neither flank is found are silently skipped
-}
+// Extract only the repeat segment from each read. `extract_flanked_region`
+// returns a zero-copy `&[u8]` slice into the original read; reads where either
+// flank is not found are skipped (naturally excluding non-spanning reads).
+let segments: Vec<&[u8]> = reads
+    .iter()
+    .filter_map(|read| extract_flanked_region(read, left_flank, right_flank))
+    .collect();
+
+// Build the consensus from the anchored segments (see Seed Selection for
+// choosing `seed_idx`; the engine self-seeds on the median-length read).
+let result = consensus(&segments, 0, &PoaConfig::default())?;
 ```
 
 `extract_flanked_region` aligns the left and right flanks to the read using approximate
@@ -79,6 +82,6 @@ let warnings = diagnose(&result, &DiagnoseConfig::default());
 
 If you do not have reliable flanking sequences (e.g. the flanks are themselves repetitive,
 or you are processing reads without a reference), the core POA still works without this
-step. The rotational phase bugs (CLAUDE.md bugs #1 and #2) will be present in edge cases,
-but for most clean read sets the aligner resolves phase by the third or fourth read and the
+step. Rotational phase ambiguity on periodic repeats can degrade multi-allele phasing and
+close-repeat-count resolution in edge cases, but for most clean single-allele read sets the
 consensus is correct.

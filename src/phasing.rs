@@ -7,7 +7,7 @@
 //! representation artifact that collapses on folded periodic repeats — we build
 //! a read × het-site matrix and measure cross-site linkage.
 //!
-//! This module is the *interpretation* layer: it operates on a [`PhasingMatrix`]
+//! This module is the *interpretation* layer: it operates on a `PhasingMatrix`
 //! (extracted from a built graph by the engine) and scores linkage, so it is
 //! independent of the graph representation. Clustering (MEC / correlation) and
 //! the single-mode het/mosaic/error classifier build on top of these scores.

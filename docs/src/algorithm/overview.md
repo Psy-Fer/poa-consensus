@@ -45,11 +45,11 @@ updated on every alignment: a match or insert op increments the outgoing edge we
 ### Internal graph
 
 The graph owns all nodes in a flat `Vec<Node>`. Node indices are stable across the life of
-the graph; topological order is recomputed before each alignment. The graph also tracks a
-**spine** (the current heaviest-path consensus), which is used by the banded aligner to
-centre the DP band. This graph is an internal construction detail: the public API is purely
-functional (`consensus`, `consensus_multi`, `bridged_consensus`), so callers never handle
-the graph directly.
+the graph; topological order is recomputed before each alignment. The banded aligner centres
+its DP band using a static-diagonal-union corridor derived from graph geometry (see
+[Banded DP Alignment](banded-dp.md)), not a cached spine. This graph is an internal
+construction detail: the public API is purely functional (`consensus`, `consensus_multi`,
+`bridged_consensus`), so callers never handle the graph directly.
 
 ## Alignment scoring
 

@@ -18,7 +18,7 @@ POA aligns reads into a directed acyclic graph (DAG) using affine-gap dynamic pr
 
 ```toml
 [dependencies]
-poa-consensus = "0.5"
+poa-consensus = "0.6"
 ```
 
 ### Functional API

@@ -105,9 +105,13 @@
 //! - Reads > 20 kb: adaptive banding is required; consider `poasta` for graphs
 //!   that approach bacterial-gene size.
 //!
-//! A band that is too narrow returns `Err(PoaError::BandTooNarrow)` when the
-//! terminal column is unreachable.  The library never silently produces a wrong
-//! alignment — it errors instead.
+//! The banded DP uses a static-diagonal-union corridor (abPOA-style anti-fold):
+//! the graph-geometry diagonal is always kept in-band, so the terminal column is
+//! always reachable and a too-narrow band can never collapse the consensus to an
+//! empty/all-gap alignment — at worst it yields a *suboptimal* alignment. On
+//! pure-repetitive sequence several diagonals score equally and the DP may pick
+//! one that differs by a repeat unit; `diagnose()` surfaces gross truncation so
+//! the caller can rebuild unbanded and compare.
 //!
 //! ## Coverage and depth
 //!
@@ -320,10 +324,21 @@ pub mod config;
 pub mod error;
 pub mod flank;
 pub mod orient;
-pub mod phasing;
-pub mod poa2;
 pub mod seed;
 pub mod types;
+
+/// Internal POA engine. **Not part of the public API** and exempt from semver:
+/// its types and functions may change or be removed in any release. Use the
+/// crate-root functions ([`consensus`], [`consensus_multi`], [`bridged_consensus`])
+/// instead. Exposed only so the crate's own benchmark/robustness test harness can
+/// switch between engine variants.
+#[doc(hidden)]
+pub mod poa2;
+
+/// Internal linkage-phasing primitives behind [`consensus_multi`]. **Not part of
+/// the public API** and exempt from semver. See [`poa2`].
+#[doc(hidden)]
+pub mod phasing;
 
 pub use analysis::{
     ConsensusWarnings, DiagnoseConfig, InteriorSupportWarning, LowDepthWarning,
@@ -351,6 +366,24 @@ fn validate(reads: &[&[u8]], seed_idx: usize) -> Result<(), PoaError> {
     Ok(())
 }
 
+/// Emit a one-line stderr warning when the caller has forced fully unbanded
+/// alignment (`band_width == 0` and `adaptive_band == false`) on long reads,
+/// where the DP allocates O(nodes × read_len) memory. Gated by
+/// [`PoaConfig::warn_on_long_unbanded`] (set it `false` to silence).
+fn warn_long_unbanded(reads: &[&[u8]], config: &PoaConfig) {
+    const LONG_READ_BP: usize = 1000;
+    if config.warn_on_long_unbanded && config.band_width == 0 && !config.adaptive_band {
+        let max_len = reads.iter().map(|r| r.len()).max().unwrap_or(0);
+        if max_len > LONG_READ_BP {
+            eprintln!(
+                "poa-consensus: warning: unbanded alignment (band_width = 0) on reads up \
+                 to {max_len} bp uses O(nodes × read_len) memory; set band_width or enable \
+                 adaptive_band for long reads (silence with warn_on_long_unbanded = false)"
+            );
+        }
+    }
+}
+
 // ── Public convenience wrappers ───────────────────────────────────────────────
 
 /// Build a single-allele consensus from `reads`.
@@ -369,6 +402,7 @@ pub fn consensus(
             min: config.min_reads,
         });
     }
+    warn_long_unbanded(reads, config);
     // Cutover Step 2: single-allele consensus now runs on the clean engine
     // (poa2). The clean engine is seed-robust, so it picks its own backbone --
     // the MEDIAN-length read -- rather than trusting the caller's `seed_idx`
@@ -409,6 +443,7 @@ pub fn consensus_multi(
     config: &PoaConfig,
 ) -> Result<Vec<Consensus>, PoaError> {
     validate(reads, seed_idx)?;
+    warn_long_unbanded(reads, config);
     // Multi-allele runs on the clean poa2 HYBRID engine: structural-bubble
     // discovery proposes splits, linkage discovery + consensus-difference /
     // bimodality confirmation refines them and rejects false splits. It picks its

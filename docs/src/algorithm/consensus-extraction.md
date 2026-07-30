@@ -84,8 +84,8 @@ the **best-fit** result. This is the behaviour of the default `ConsensusMode::He
 
 `ConsensusMode::MajorityFrequency` forces the majority-frequency result instead of choosing
 by fit. It converts the graph to a column-aligned MSA and takes the plurality base at each
-column; the denominator at each position is `coverage + delete_count` (reads on other bubble
-arms do not vote).
+column; the denominator at each position is `cov + del` (matched coverage plus delete
+traversals; reads on other bubble arms do not vote).
 
 MF mode is more robust to the phase-shift boundary trim bug because it counts delete
 traversals explicitly rather than relying on edge weights. It is better suited to high-depth

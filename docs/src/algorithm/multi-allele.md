@@ -14,7 +14,7 @@ weight satisfies:
 edge_weight >= ceil(n_reads * min_allele_freq)
 ```
 
-`min_allele_freq` defaults to 0.25. With 20 reads, an arm must have at least 5 reads to
+`min_allele_freq` defaults to 0.2. With 20 reads, an arm must have at least 4 reads to
 qualify. Arms below the threshold are treated as noise.
 
 ## Structural vs SNP bubbles

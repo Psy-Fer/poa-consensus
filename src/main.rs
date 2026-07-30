@@ -270,9 +270,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         consensus_mode: args.consensus_mode.into(),
         warn_on_long_unbanded: !args.no_long_unbanded_warning,
         phasing_bubble_min_span: args.phasing_bubble_min_span,
-        // multi_allele is managed by the library (consensus_multi sets it true);
-        // the CLI's --multi selects the code path rather than setting this.
-        ..PoaConfig::default()
     };
 
     // Diagnostic thresholds shared by both the single- and multi-allele paths.

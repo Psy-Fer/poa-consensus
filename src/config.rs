@@ -50,23 +50,6 @@ pub struct PoaConfig {
     /// for cross-bubble phasing. Bubbles below this threshold (SNPs, short indels)
     /// use the existing single-bubble partitioning. Default 10.
     pub phasing_bubble_min_span: usize,
-    /// Whether this graph is being built for **multi-allele** consensus.
-    ///
-    /// Controls two mode-dependent behaviours whose correct setting differs
-    /// between single- and multi-allele consensus:
-    /// - the O(1) diagonal-skip fast path in alignment (kept in multi-allele
-    ///   mode to lock reads onto their own length-allele track; disabled in
-    ///   single-allele mode where its greedy forward-match over-calls periodic
-    ///   repeats by matching reads through phantom units), and
-    /// - the whole-graph unbanded rebuild on band-retry (needed only for
-    ///   multi-allele bubble-structure consistency).
-    ///
-    /// The functional wrappers set this automatically ([`consensus_multi`]
-    /// builds with it `true`; single-allele paths leave it `false`), so most
-    /// callers never touch it. Default: `false` (single-allele).
-    ///
-    /// [`consensus_multi`]: crate::consensus_multi
-    pub multi_allele: bool,
 }
 
 impl Default for PoaConfig {
@@ -94,7 +77,6 @@ impl Default for PoaConfig {
             consensus_mode: ConsensusMode::HeaviestPath,
             warn_on_long_unbanded: true,
             phasing_bubble_min_span: 10,
-            multi_allele: false,
         }
     }
 }
