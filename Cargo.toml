@@ -12,6 +12,14 @@ readme = "README.md"
 authors = ["James Ferguson <j.ferguson@garvan.org.au>"]
 keywords = ["bioinformatics", "consensus", "alignment", "genomics", "nanopore"]
 categories = ["science", "algorithms"]
+# Keep the published tarball lean: large real-data test fixtures and the
+# benchmark harness are not needed to build or use the library.
+exclude = [
+    "tests/fixtures/hg002_muc1_hap1.fa",
+    "tests/fixtures/hg002_muc1_hap2.fa",
+    "tests/hg002_muc1_real_data.rs",
+    "bench/",
+]
 
 [lib]
 name = "poa_consensus"
