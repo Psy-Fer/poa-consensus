@@ -7,6 +7,102 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.6.0] - 2026-07-31
+
+Correctness, safety-default, API, and documentation pass following a full deep-dive
+review. Fixes several silent correctness bugs in the default path, adds an opt-in
+flank-anchoring workflow that wins on partial-read loci, and reconciles the docs with the
+shipped engine. `validate.py` 20/20 and `compare_callers.py` 16/16 (vs abPOA/SPOA/POASTA)
+are unchanged (the default `consensus`/`consensus_multi` path is untouched by the new work).
+
+### Breaking
+
+- **`min_reads` now defaults to `3` (was `1`).** The `(n/2 + 1).max(2)` coverage floor is
+  unreliable at depth 1–2, so the old default could produce silently unreliable output.
+  `consensus`/`consensus_multi` now return `Err(InsufficientDepth)` below 3 reads by
+  default; set `min_reads: 1` explicitly to restore the previous behaviour.
+- **`PoaConfig::multi_allele` is removed.** It was dead (never read) and its doc described
+  deleted-engine machinery. Callers using `..PoaConfig::default()` are unaffected; remove
+  any explicit `multi_allele:` field initialiser.
+- **`PoaError::BandTooNarrow` is removed.** The static-diagonal-union band never produces it
+  (the endpoint is always in-band), so it was never constructed. Match arms on `PoaError`
+  should drop the `BandTooNarrow` case.
+- **`ConsensusMode::HeaviestPath` is renamed to `ConsensusMode::BestFit`.** The variant never
+  forced a plain heaviest path: the default already builds both a heaviest-path and a
+  majority-frequency consensus and keeps whichever the reads better support, so the old name
+  was misleading. Behaviour is unchanged; rename any `ConsensusMode::HeaviestPath` use to
+  `BestFit`. CLI: `--consensus-mode heaviest` is now `--consensus-mode best-fit`.
+
+### Added
+
+- **Flank-anchoring consensus: `consensus_flanked` and `consensus_multi_flanked`.** Given
+  left/right flank sequences, they return the consensus of the repeat region *between* the
+  flanks. They **auto-detect partial reads**: when a meaningful fraction of reads fail to
+  span both flanks, the consensus is built only from the reads that span (kept whole so the
+  flanks still anchor the alignment) and the result is sliced to the repeat; otherwise all
+  reads are used. A raw fallback covers the case where too few reads span. On partial-read
+  loci this is a large accuracy win (single-allele and multi-allele length) and is neutral
+  on fully-spanning read sets. CLI: `--left-flank` / `--right-flank`.
+
+### Changed
+
+- **`warn_on_long_unbanded` is now honoured.** `consensus`/`consensus_multi` emit a one-line
+  stderr warning when alignment is fully unbanded (`band_width = 0`, `adaptive_band = false`)
+  on reads over ~1 kb. Previously the field was accepted but never read.
+- **Alignment DP reuses its per-row scratch buffers.** The banded DP allocated five `Vec`s
+  per graph node inside the topological loop; they are now hoisted and cleared/resized per
+  row, cutting allocations 7–16× and giving ~8% faster `add_read` on typical STR loci. Output
+  is byte-identical (`validate.py` 20/20, `compare_callers.py` 16/16 unchanged).
+
+### Fixed
+
+- **Affine insert-run traceback mislabelled inserted bases as matches.** The insert-run
+  traceback compared `M >= I` instead of `M + gap_open >= I`, so a multi-base insertion run
+  (homopolymer / repeat inserts) could be cut one base short, with an inserted base emitted
+  as a Match and inflating a node's coverage. Alignments on affected inputs change (more
+  correct).
+- **Lowercase / soft-masked reads were spuriously reverse-complemented.** `orient_to_seed`
+  matched k-mers case-sensitively while `reverse_complement` uppercases, so a lowercase
+  forward read scored zero forward hits and was flipped. Orientation is now case-insensitive.
+- **`GraphStats::edge_weight_gini` had a sign error** that biased every graph by `-2/n`
+  (a uniform graph scored `-2/n` instead of `0` and could report negative inequality).
+- **`consensus_multi` could panic on all-empty input.** The multi-allele entry points now
+  validate the non-empty read count and return `Err(InsufficientDepth)` instead of panicking
+  in median-seed selection.
+- **MajorityFrequency consensus truncated on partial reads.** `consensus_majority_cov` counted
+  every read not occupying a column as a deletion vote, so reads that simply do not *reach* a
+  column (partial / non-spanning) suppressed well-covered columns. It now measures deletions
+  only among reads that span the column, while still requiring a majority of reads to reach a
+  column before it is emitted (preserving majority-length trimming).
+- **Bubble statistics counted delete-bypass traffic.** `bubble_sites`, `bubble_count`,
+  `max_bubble_depth`, and `arm_read_counts` used the unified `Edge.weight`, so a length
+  variant's short-allele delete-bypass resume edge could register as a spurious competing arm
+  in single-allele output. They now use the matched-edge view (`read_matched_edges`), matching
+  the documented invariant.
+- **`analysis::has_competing_allele` used a raw fraction, inconsistent with phasing.** It
+  compared arm count against `n * min_allele_freq` directly, while the phasing pipeline uses
+  the `ceil(n * min_allele_freq).max(2)` floor. Low-depth loci could flag (or miss) a second
+  allele in the analysis helper that `consensus_multi` would not split. Both now share
+  `phasing_floor`.
+- **Non-ACGT / IUPAC bases were handled inconsistently.** `orient_to_seed` now applies the
+  full IUPAC complement (R/Y/K/M/B/V/D/H and self-complementary S/W/N) instead of only ACGT;
+  the MajorityFrequency column vote now buckets only ACGT while still counting an ambiguity
+  code toward column presence, so an ambiguous base no longer silently votes as an `A`.
+- **Float comparisons used `partial_cmp().unwrap()`.** Score/length sorts in consensus and
+  phasing now use `total_cmp`, so a NaN (e.g. from a degenerate fit score) can no longer panic
+  the sort.
+
+### Documentation
+
+- Corrected user-facing docs that described the deleted engine: the banded-DP page
+  (rewritten for the static-diagonal-union anti-fold band), the `PoaConfig` defaults table,
+  the `DiagnoseConfig` field list, the rustdoc `BandTooNarrow` "never silently wrong" claim,
+  and the `delete_count` → `del` naming. Documented the flank-anchoring workflow.
+- Documented `min_allele_freq` as a hard mosaic-sensitivity boundary (a sub-threshold allele
+  is merged into the majority and never appears in output; lower it and re-run to probe for a
+  low-frequency / subclonal allele), and added a Student-t caveat to
+  `analysis::count_credible_interval`.
+
 ## [0.5.0] - 2026-07-29
 
 Engine rebuild and accuracy pass. The accumulated legacy engine (`graph.rs`) is
@@ -14,7 +110,9 @@ retired in favour of the clean `poa2` engine that has backed single-allele
 consensus since 0.4.x; scoring defaults are retuned and single-allele extraction
 now picks the better of two consensus methods per call. Validated on the MUC1
 flVNTR locus: poa-consensus matches abPOA and POASTA on every haplotype.
-Over-calls nothing, and every consensus is fully supported by a read pileup (0 fabricated / 0 missing bases). It is strictly more robust than SPOA, which over-calls two of the same haplotypes.
+Over-calls nothing, and every consensus is fully supported by a read pileup 
+(0 fabricated / 0 missing bases). It is strictly more robust than SPOA, 
+which over-calls two of the same haplotypes.
 
 ### Breaking
 

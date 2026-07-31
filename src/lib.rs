@@ -105,16 +105,21 @@
 //! - Reads > 20 kb: adaptive banding is required; consider `poasta` for graphs
 //!   that approach bacterial-gene size.
 //!
-//! A band that is too narrow returns `Err(PoaError::BandTooNarrow)` when the
-//! terminal column is unreachable.  The library never silently produces a wrong
-//! alignment — it errors instead.
+//! The banded DP uses a static-diagonal-union corridor (abPOA-style anti-fold):
+//! the graph-geometry diagonal is always kept in-band, so the terminal column is
+//! always reachable and a too-narrow band can never collapse the consensus to an
+//! empty/all-gap alignment — at worst it yields a *suboptimal* alignment. On
+//! pure-repetitive sequence several diagonals score equally and the DP may pick
+//! one that differs by a repeat unit; `diagnose()` surfaces gross truncation so
+//! the caller can rebuild unbanded and compare.
 //!
 //! ## Coverage and depth
 //!
-//! **`min_reads`** (default: 1) is the minimum number of reads required to
+//! **`min_reads`** (default: 3) is the minimum number of reads required to
 //! attempt consensus.  `consensus()` returns `Err(InsufficientDepth)` below
-//! this threshold.  For reliable results, use at least 5 reads; 10+ is
-//! preferable for heterozygous sites.
+//! this threshold (the `(n/2 + 1).max(2)` coverage floor breaks down at depth
+//! 1-2, so a lower floor produces silently unreliable output).  For reliable
+//! results, use at least 5 reads; 10+ is preferable for heterozygous sites.
 //!
 //! **Boundary trim** removes leading and trailing nodes whose coverage falls
 //! below the majority threshold `(n/2 + 1).max(2)` (or
@@ -319,10 +324,27 @@ pub mod config;
 pub mod error;
 pub mod flank;
 pub mod orient;
-pub mod phasing;
-pub mod poa2;
 pub mod seed;
 pub mod types;
+
+/// Internal POA engine. **Not part of the public API** and exempt from semver:
+/// its types and functions may change or be removed in any release. Use the
+/// crate-root functions ([`consensus`], [`consensus_multi`], [`bridged_consensus`])
+/// instead. Exposed only so the crate's own benchmark/robustness test harness can
+/// switch between engine variants.
+#[doc(hidden)]
+pub mod poa2;
+
+/// Internal linkage-phasing primitives behind [`consensus_multi`]. **Not part of
+/// the public API** and exempt from semver. See [`poa2`].
+#[doc(hidden)]
+pub mod phasing;
+
+/// Internal multi-allele consensus pipeline (structural-propose + linkage-confirm)
+/// on top of the [`poa2`] engine. **Not part of the public API** and exempt from
+/// semver; reached via the crate-root [`consensus_multi`].
+#[doc(hidden)]
+pub mod multi;
 
 pub use analysis::{
     ConsensusWarnings, DiagnoseConfig, InteriorSupportWarning, LowDepthWarning,
@@ -350,6 +372,24 @@ fn validate(reads: &[&[u8]], seed_idx: usize) -> Result<(), PoaError> {
     Ok(())
 }
 
+/// Emit a one-line stderr warning when the caller has forced fully unbanded
+/// alignment (`band_width == 0` and `adaptive_band == false`) on long reads,
+/// where the DP allocates O(nodes × read_len) memory. Gated by
+/// [`PoaConfig::warn_on_long_unbanded`] (set it `false` to silence).
+fn warn_long_unbanded(reads: &[&[u8]], config: &PoaConfig) {
+    const LONG_READ_BP: usize = 1000;
+    if config.warn_on_long_unbanded && config.band_width == 0 && !config.adaptive_band {
+        let max_len = reads.iter().map(|r| r.len()).max().unwrap_or(0);
+        if max_len > LONG_READ_BP {
+            eprintln!(
+                "poa-consensus: warning: unbanded alignment (band_width = 0) on reads up \
+                 to {max_len} bp uses O(nodes × read_len) memory; set band_width or enable \
+                 adaptive_band for long reads (silence with warn_on_long_unbanded = false)"
+            );
+        }
+    }
+}
+
 // ── Public convenience wrappers ───────────────────────────────────────────────
 
 /// Build a single-allele consensus from `reads`.
@@ -368,6 +408,7 @@ pub fn consensus(
             min: config.min_reads,
         });
     }
+    warn_long_unbanded(reads, config);
     // Cutover Step 2: single-allele consensus now runs on the clean engine
     // (poa2). The clean engine is seed-robust, so it picks its own backbone --
     // the MEDIAN-length read -- rather than trusting the caller's `seed_idx`
@@ -385,7 +426,7 @@ pub fn consensus(
         }
     }
     // Consensus extraction honours `consensus_mode`:
-    //  - HeaviestPath (default): best-fit — compute both a heaviest-path and a
+    //  - BestFit (default): best-fit — compute both a heaviest-path and a
     //    majority-frequency consensus and keep whichever the reads better
     //    support (majority-frequency recovers homopolymer/length-variable
     //    repeats the heaviest path over-calls).
@@ -394,7 +435,7 @@ pub fn consensus(
     // Per-position output fields are made consistent with the chosen sequence.
     Ok(match config.consensus_mode {
         crate::config::ConsensusMode::MajorityFrequency => g.consensus_full_majority(),
-        crate::config::ConsensusMode::HeaviestPath => g.consensus_full_best_fit(reads),
+        crate::config::ConsensusMode::BestFit => g.consensus_full_best_fit(reads),
     })
 }
 
@@ -402,12 +443,17 @@ pub fn consensus(
 ///
 /// Returns one [`Consensus`] per detected allele.  If no heterozygous bubble is
 /// found the result is a single-element `Vec` equivalent to calling [`consensus`].
+///
+/// An allele below [`PoaConfig::min_allele_freq`] is merged into the majority and
+/// does not appear in the output; to detect a low-frequency / mosaic allele, lower
+/// `min_allele_freq` and re-run (see that field's docs).
 pub fn consensus_multi(
     reads: &[&[u8]],
     seed_idx: usize,
     config: &PoaConfig,
 ) -> Result<Vec<Consensus>, PoaError> {
     validate(reads, seed_idx)?;
+    warn_long_unbanded(reads, config);
     // Multi-allele runs on the clean poa2 HYBRID engine: structural-bubble
     // discovery proposes splits, linkage discovery + consensus-difference /
     // bimodality confirmation refines them and rejects false splits. It picks its
@@ -416,7 +462,151 @@ pub fn consensus_multi(
     // robustness matrix it beats the legacy engine on read-assignment cleanliness
     // and single-allele safety at near-equal split sensitivity. (Same-length
     // substitution haplotypes are the one weaker case; tracked separately.)
-    crate::poa2::hybrid_consensus_multi(reads, config)
+    crate::multi::hybrid_consensus_multi(reads, config)
+}
+
+/// Fraction of reads that must fail to span both flanks before the flanked
+/// entry points switch to anchored mode (restrict to spanning reads).
+const FLANK_ANCHOR_TRIGGER: f64 = 0.1;
+
+/// Indices of the reads that span BOTH flanks (i.e. are not partial). We anchor
+/// by restricting to these reads but keep them WHOLE — the flanks provide unique
+/// anchoring context the aligner and (especially) the multi-allele length-phasing
+/// need; trimming to the bare repeat first makes periodic segments align
+/// ambiguously and collapses length alleles together (measured 2026-07-30:
+/// keeping reads whole calls 182/216 length-diploids correct vs 103 when trimmed).
+/// The output is sliced back to the repeat region afterwards for a consistent
+/// flanks-excluded result.
+fn spanning_indices(reads: &[&[u8]], left: &[u8], right: &[u8]) -> Vec<usize> {
+    (0..reads.len())
+        .filter(|&i| crate::flank::flank_span(reads[i], left, right).is_some())
+        .collect()
+}
+
+/// Anchor only when a meaningful fraction of reads fail to span (so partials are
+/// distorting the raw consensus) AND enough reads still span to build from (so we
+/// don't trade a partials problem for a depth problem — the raw fallback covers
+/// the rest).
+fn should_anchor(total: usize, spanning: usize, config: &PoaConfig) -> bool {
+    if total == 0 {
+        return false;
+    }
+    let partial_frac = 1.0 - (spanning as f64 / total as f64);
+    partial_frac >= FLANK_ANCHOR_TRIGGER && spanning >= config.min_reads
+}
+
+/// Slice a whole-region `Consensus` down to the repeat segment between `left` and
+/// `right` (located in the consensus's own low-error sequence), so a flanked
+/// result always describes the sequence BETWEEN the flanks. Returns the consensus
+/// unchanged if the flanks cannot be located in it (rare; the consensus is clean).
+fn slice_to_repeat(c: Consensus, left: &[u8], right: &[u8]) -> Consensus {
+    let Some((s, e)) = crate::flank::flank_span(&c.sequence, left, right) else {
+        return c;
+    };
+    if e > c.sequence.len() || s >= e {
+        return c;
+    }
+    Consensus {
+        sequence: c.sequence[s..e].to_vec(),
+        coverage: c
+            .coverage
+            .get(s..e)
+            .map(<[u32]>::to_vec)
+            .unwrap_or_default(),
+        path_weights: c
+            .path_weights
+            .get(s..e)
+            .map(<[i32]>::to_vec)
+            .unwrap_or_default(),
+        n_reads: c.n_reads,
+        graph_stats: c.graph_stats,
+        gaps: c
+            .gaps
+            .into_iter()
+            .filter(|g| g.start >= s && g.end <= e)
+            .map(|g| CoverageGap {
+                start: g.start - s,
+                end: g.end - s,
+                kind: g.kind,
+            })
+            .collect(),
+        bubble_sites: c
+            .bubble_sites
+            .into_iter()
+            .filter(|b| b.consensus_pos >= s && b.consensus_pos < e)
+            .map(|mut b| {
+                b.consensus_pos -= s;
+                b
+            })
+            .collect(),
+        read_indices: c.read_indices,
+    }
+}
+
+/// Single-allele consensus of the repeat region between `left_flank` and
+/// `right_flank`, auto-anchoring when the read set is partial-heavy.
+///
+/// Reads that do not span both flanks (partial / non-spanning reads) distort a
+/// raw consensus. When a meaningful fraction of reads fail to span, this builds
+/// only from the reads that DO span (kept whole, so the flanks still anchor the
+/// alignment); otherwise it builds from all reads. Either way the result is sliced
+/// so the returned [`Consensus`] describes the sequence **between** the flanks
+/// (flanks excluded). Falls back to the raw all-reads consensus when too few reads
+/// span to anchor safely. Flanks of at least ~20 bp of unique sequence are
+/// recommended.
+pub fn consensus_flanked(
+    reads: &[&[u8]],
+    left_flank: &[u8],
+    right_flank: &[u8],
+    config: &PoaConfig,
+) -> Result<Consensus, PoaError> {
+    validate(reads, 0)?;
+    let span = spanning_indices(reads, left_flank, right_flank);
+    let full = if should_anchor(reads.len(), span.len(), config) {
+        // Partial-heavy: build only from the spanning reads (kept whole).
+        let refs: Vec<&[u8]> = span.iter().map(|&i| reads[i]).collect();
+        consensus(&refs, 0, config)
+    } else {
+        // Spanning-heavy or too few spanned to anchor safely: all reads.
+        consensus(reads, 0, config)
+    }?;
+    Ok(slice_to_repeat(full, left_flank, right_flank))
+}
+
+/// Multi-allele version of [`consensus_flanked`]: returns one [`Consensus`] per
+/// detected allele, each describing the repeat region between the flanks. Uses
+/// the same partial-heavy auto-anchoring; `read_indices` are always reported as
+/// indices into the input `reads` slice (remapped from the anchored subset).
+pub fn consensus_multi_flanked(
+    reads: &[&[u8]],
+    left_flank: &[u8],
+    right_flank: &[u8],
+    config: &PoaConfig,
+) -> Result<Vec<Consensus>, PoaError> {
+    validate(reads, 0)?;
+    let span = spanning_indices(reads, left_flank, right_flank);
+    if should_anchor(reads.len(), span.len(), config) {
+        // Partial-heavy: phase only the spanning reads (kept whole so the flanks
+        // still anchor the length-bubble detection), then slice each allele to the
+        // repeat and remap read indices from the spanning subset back to originals.
+        let refs: Vec<&[u8]> = span.iter().map(|&i| reads[i]).collect();
+        if let Ok(mut alleles) = consensus_multi(&refs, 0, config) {
+            for a in &mut alleles {
+                for idx in &mut a.read_indices {
+                    *idx = span[*idx];
+                }
+            }
+            return Ok(alleles
+                .into_iter()
+                .map(|c| slice_to_repeat(c, left_flank, right_flank))
+                .collect());
+        }
+    }
+    let full = consensus_multi(reads, 0, config)?;
+    Ok(full
+        .into_iter()
+        .map(|c| slice_to_repeat(c, left_flank, right_flank))
+        .collect())
 }
 
 /// Build a consensus from two non-overlapping read groups with a gap of

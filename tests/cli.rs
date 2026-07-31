@@ -174,9 +174,10 @@ fn cli_stdin_input() {
 #[test]
 fn cli_single_record_passthrough() {
     build_cli();
+    // Passthrough only when the depth floor allows it (`--min-reads 1`).
     let fasta = b">solo\nACGTACGT\n";
     let mut child = poa_bin()
-        .arg("-")
+        .args(["--min-reads", "1", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -190,6 +191,28 @@ fn cli_single_record_passthrough() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let seq = stdout.lines().nth(1).unwrap_or("");
     assert_eq!(seq, "ACGTACGT");
+}
+
+#[test]
+fn cli_single_record_below_min_reads_errors() {
+    build_cli();
+    // A single read with the default min_reads (3) must NOT silently pass through
+    // — it should fail the depth floor (F36).
+    let fasta = b">solo\nACGTACGT\n";
+    let mut child = poa_bin()
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn failed");
+    use std::io::Write as _;
+    child.stdin.take().unwrap().write_all(fasta).unwrap();
+    let out = child.wait_with_output().expect("wait failed");
+    assert!(
+        !out.status.success(),
+        "single read below --min-reads should error"
+    );
 }
 
 // ── band flag propagated to header ───────────────────────────────────────────

@@ -186,6 +186,13 @@ pub fn allele_fractions(site: &BubbleSite) -> Vec<f64> {
 ///
 /// `confidence` must be in (0, 1).  Typical values: 0.90, 0.95, 0.99.
 ///
+/// **Large-sample approximation:** this uses the normal quantile `z`, not the
+/// Student-t quantile, so with the sample standard deviation `s` it is
+/// *anticonservative* (interval slightly too narrow) at small `n` — noticeably so
+/// below ~15 observations, where `t` ≫ `z`. Treat the interval as approximate for
+/// the small read counts typical of STR loci; multiply the half-width by ~1.1–1.3
+/// at n ≈ 5–10 for a conservative bound.
+///
 /// Returns `(NaN, NaN)` for an empty slice and `(values[0], values[0])` for a
 /// single observation (interval undefined, point estimate returned).
 ///
@@ -320,12 +327,17 @@ pub fn has_competing_allele(consensus: &Consensus, min_freq: f64) -> Option<&Bub
     if consensus.n_reads == 0 {
         return None;
     }
-    let n = consensus.n_reads as f64;
+    // Use the SAME minority-arm floor the multi-allele splitter uses, so this
+    // recommendation never fires at a looser threshold than the engine acts on
+    // (e.g. at low depth the old `c/n >= min_freq` fractional test flagged a
+    // 1-read arm the `ceil(n·f).max(2)` splitter would decline). See
+    // `poa2::phasing_floor`.
+    let floor = crate::multi::phasing_floor(consensus.n_reads, min_freq);
     consensus.bubble_sites.iter().find(|site| {
         // Sort descending; the second entry is the strongest minority arm.
         let mut counts = site.arm_read_counts.clone();
         counts.sort_unstable_by(|a, b| b.cmp(a));
-        counts.get(1).is_some_and(|&c| c as f64 / n >= min_freq)
+        counts.get(1).is_some_and(|&c| c >= floor)
     })
 }
 
@@ -545,9 +557,9 @@ pub struct InteriorSupportWarning {
 /// Fired when `consensus_len / median_input_read_len` is below the configured
 /// threshold (default 0.60).  The most common cause is highly repetitive sequence
 /// (e.g. AAAAG 5-mer) where multiple DP diagonals score identically; the band
-/// locks onto the wrong one without approaching the band edge, so no
-/// `BandTooNarrow` error is raised.  The remedy is to retry with `band_width = 0`
-/// (unbanded), which forces the traceback to reach the correct endpoint.
+/// locks onto the wrong one silently (the static-diagonal-union band keeps the
+/// endpoint reachable, so no error is raised).  The remedy is to retry with
+/// `band_width = 0` (unbanded), which forces the traceback to the correct endpoint.
 #[derive(Debug, Clone)]
 pub struct TruncationWarning {
     /// Length of the consensus sequence produced.
@@ -749,7 +761,7 @@ pub fn consensus_fit(
     }
     // Delegate the per-read alignment to the poa2 engine; keep this function's
     // own per-read length-normalised averaging (its established scale).
-    let counts = crate::poa2::align_indel_counts(consensus_seq, reads, config);
+    let counts = crate::multi::align_indel_counts(consensus_seq, reads, config);
     if counts.is_empty() {
         return 0.0;
     }
@@ -1192,8 +1204,10 @@ mod tests {
         n_reads: usize,
         median_read_len: usize,
     ) -> Consensus {
-        let mut gs = GraphStats::default();
-        gs.median_input_read_len = median_read_len;
+        let gs = GraphStats {
+            median_input_read_len: median_read_len,
+            ..Default::default()
+        };
         Consensus {
             sequence: vec![b'A'; seq_len],
             coverage: vec![n_reads as u32; seq_len],

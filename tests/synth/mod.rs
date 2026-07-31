@@ -35,7 +35,7 @@ impl Rng {
         lo + (self.next_u64() as usize) % (hi - lo)
     }
     pub fn base_other_than(&mut self, b: u8) -> u8 {
-        let bases = [b'A', b'C', b'G', b'T'];
+        let bases = *b"ACGT";
         loop {
             let x = bases[(self.next_u64() % 4) as usize];
             if x != b {
@@ -44,7 +44,7 @@ impl Rng {
         }
     }
     pub fn base(&mut self) -> u8 {
-        [b'A', b'C', b'G', b'T'][(self.next_u64() % 4) as usize]
+        b"ACGT"[(self.next_u64() % 4) as usize]
     }
 }
 

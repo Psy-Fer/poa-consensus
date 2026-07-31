@@ -255,7 +255,7 @@ fn dbg_linkage_split_counts() {
     let run = |spec: &Spec| -> usize {
         let reads = synth::generate(spec);
         let seqs = Read::seqs(&reads);
-        match poa_consensus::poa2::linkage_consensus_multi(&seqs, &cfg()) {
+        match poa_consensus::multi::linkage_consensus_multi(&seqs, &cfg()) {
             Ok(a) => a.len(),
             Err(_) => 0,
         }

@@ -1,6 +1,6 @@
 [package]
 name = "poa-consensus"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Banded Partial Order Alignment (POA) consensus for short tandem repeat and amplicon reads"
@@ -12,6 +12,14 @@ readme = "README.md"
 authors = ["James Ferguson <j.ferguson@garvan.org.au>"]
 keywords = ["bioinformatics", "consensus", "alignment", "genomics", "nanopore"]
 categories = ["science", "algorithms"]
+# Keep the published tarball lean: large real-data test fixtures and the
+# benchmark harness are not needed to build or use the library.
+exclude = [
+    "tests/fixtures/hg002_muc1_hap1.fa",
+    "tests/fixtures/hg002_muc1_hap2.fa",
+    "tests/hg002_muc1_real_data.rs",
+    "bench/",
+]
 
 [lib]
 name = "poa_consensus"
@@ -24,6 +32,9 @@ required-features = ["cli"]
 
 [features]
 cli = ["dep:clap", "dep:noodles"]
+# Internal profiling: enables zero-overhead-when-off phase timers in the engine
+# (topo / align / integrate), read by the speed harness. Not part of the public API.
+profile = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }

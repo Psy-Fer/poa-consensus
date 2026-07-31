@@ -21,8 +21,7 @@ The graph is sorted into a linear ordering where every node appears before all n
 an outgoing edge to. This is required by the DP: the aligner processes nodes in topological
 order so that all predecessors of a node have been scored before the node itself is scored.
 
-The sort runs in O(V + E) and is cached between reads via the **stale spine** mechanism
-described in [Banded DP Alignment](banded-dp.md).
+The sort runs in O(V + E) and is recomputed for each read that is added.
 
 ### 2. DP alignment
 
@@ -37,7 +36,7 @@ The traceback is replayed to update the graph:
 |---|---|
 | Match | Increment the node's `coverage` and the incoming edge weight |
 | Insert | Create a new node; connect it to the previous and next nodes in the traceback |
-| Delete | Increment the skipped node's `delete_count` only; record the reconnection as a bypass edge around the skipped run |
+| Delete | Increment the skipped node's `del` count only; the reconnecting edge is flagged as delete-bypass traffic and excluded from the matched-edge view used for phasing |
 
 **Insert nodes** are allocated with coverage 1 (the current read is the first to traverse
 them). Subsequent reads that match the same insert base will merge into the existing node
@@ -45,10 +44,11 @@ rather than creating a new one, because the DP naturally finds the highest-scori
 a match to an existing node scores positively while opening a fresh insert pays the gap
 penalty.
 
-**Deletes** touch the skipped node only through its `delete_count`; the read's path is
-reconnected by a separate bypass edge around the skipped run. A deleted node therefore gains
-no `coverage` and no incoming/outgoing match-edge weight, so it does not count as evidence
-that the node's base is correct. This is the key design choice that makes boundary trim work:
+**Deletes** touch the skipped node only through its `del` count; the edge that reconnects the
+read's path after a delete run is recorded but flagged as bypass traffic, so it is excluded
+from the *matched* adjacencies used for bubble detection and phasing. A deleted node
+therefore gains no `coverage`, and its skip does not count as matched evidence that the
+node's base is correct. This is the key design choice that makes boundary trim work:
 nodes that are skipped by the majority of reads have low `coverage` even though many reads
 traversed the graph position.
 

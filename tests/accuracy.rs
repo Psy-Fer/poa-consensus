@@ -70,10 +70,10 @@ fn random_base(state: &mut u64) -> u8 {
 
 fn random_base_not(exclude: u8, state: &mut u64) -> u8 {
     let opts: [u8; 3] = match exclude {
-        b'A' => [b'C', b'G', b'T'],
-        b'C' => [b'A', b'G', b'T'],
-        b'G' => [b'A', b'C', b'T'],
-        _ => [b'A', b'C', b'G'],
+        b'A' => *b"CGT",
+        b'C' => *b"AGT",
+        b'G' => *b"ACT",
+        _ => *b"ACG",
     };
     opts[(xorshift(state) % 3) as usize]
 }

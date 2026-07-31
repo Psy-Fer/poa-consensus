@@ -19,11 +19,14 @@ static LIVE: AtomicUsize = AtomicUsize::new(0);
 static BASE: AtomicUsize = AtomicUsize::new(0);
 /// Maximum live bytes seen since the most recent reset_peak() call.
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Monotonic count of `alloc` calls (allocation CHURN — distinct from peak bytes).
+static ALLOC_N: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
+            ALLOC_N.fetch_add(1, Ordering::Relaxed);
             let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             let mut peak = PEAK.load(Ordering::Relaxed);
             while live > peak {
@@ -56,6 +59,12 @@ fn reset_peak() {
 fn peak_alloc() -> usize {
     PEAK.load(Ordering::SeqCst)
         .saturating_sub(BASE.load(Ordering::SeqCst))
+}
+
+/// Total `alloc` calls so far (monotonic); take a delta around a timed region to
+/// get allocation churn.
+fn alloc_calls() -> usize {
+    ALLOC_N.load(Ordering::SeqCst)
 }
 
 // ─── Harness ─────────────────────────────────────────────────────────────────
@@ -370,6 +379,65 @@ fn speed_comparison() {
     println!();
 }
 
+// ═══ Phase attribution (feature = "profile") ══════════════════════════════════
+// Splits a consensus() call into build phases (topo / align / integrate, summed
+// over add_read) vs extraction (the remainder). Run with:
+//   cargo test --release --features profile --test speed profile_phases -- --nocapture
+
+#[cfg(feature = "profile")]
+#[test]
+fn profile_phases() {
+    use poa_consensus::poa2::profile;
+
+    fn run(label: &str, reads: Vec<Vec<u8>>, reps: usize) {
+        let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+        let cfg = PoaConfig {
+            min_reads: 3,
+            band_width: 50,
+            adaptive_band: true,
+            ..Default::default()
+        };
+        let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap(); // warmup
+        profile::reset();
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
+        }
+        let total = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+        let (topo, align, integ) = profile::take();
+        let (topo, align, integ) = (
+            topo as f64 / 1e6 / reps as f64,
+            align as f64 / 1e6 / reps as f64,
+            integ as f64 / 1e6 / reps as f64,
+        );
+        let extract = (total - topo - align - integ).max(0.0);
+        let pct = |x: f64| 100.0 * x / total;
+        println!(
+            "  {label:<26} total {total:>8.3} ms | topo {topo:>7.3} ({:>4.1}%)  align {align:>7.3} ({:>4.1}%)  integ {integ:>7.3} ({:>4.1}%)  extract {extract:>7.3} ({:>4.1}%)",
+            pct(topo),
+            pct(align),
+            pct(integ),
+            pct(extract),
+        );
+    }
+
+    println!("\n=== POA phase attribution (release, --features profile) ===");
+    println!("  build = topo + align + integrate (summed over add_read); extract = remainder\n");
+    run("600bp × 20 (5% err)", gen_reads(600, 20, 0xA00), 9);
+    run("600bp × 50 (5% err)", gen_reads(600, 50, 0xA01), 5);
+    run("200bp × 200 (5% err)", gen_reads(200, 200, 0xA02), 5);
+    run("2000bp × 15 (5% err)", gen_reads(2000, 15, 0xA03), 5);
+    run(
+        "CAG×40 × 50 (5% err)",
+        {
+            let base = repeat_seq(b"CAG", 40);
+            (0..50).map(|i| mutate(&base, 0.05, 0xA04 + i)).collect()
+        },
+        9,
+    );
+    println!();
+}
+
 // ═══ Performance matrix: isolate cost drivers (length × depth × band) ══════════
 //
 // The workloads above are fixed scenarios. This second harness varies ONE axis
@@ -417,15 +485,17 @@ fn cfg_fixed(w: usize) -> PoaConfig {
 
 /// Run `f` `reps` times (after one warmup), returning (median, min, max) wall
 /// time and the peak heap increase (MB) observed across the timed reps.
-fn bench<F: Fn()>(reps: usize, f: F) -> (Duration, Duration, Duration, f64) {
+fn bench<F: Fn()>(reps: usize, f: F) -> (Duration, Duration, Duration, f64, usize) {
     f(); // warmup + allocator baseline
     reset_peak();
+    let a0 = alloc_calls();
     let mut times = Vec::with_capacity(reps);
     for _ in 0..reps {
         let t0 = Instant::now();
         f();
         times.push(t0.elapsed());
     }
+    let allocs_per_rep = (alloc_calls() - a0) / reps.max(1);
     let peak_mb = peak_alloc() as f64 / (1024.0 * 1024.0);
     times.sort();
     (
@@ -433,6 +503,7 @@ fn bench<F: Fn()>(reps: usize, f: F) -> (Duration, Duration, Duration, f64) {
         times[0],
         times[times.len() - 1],
         peak_mb,
+        allocs_per_rep,
     )
 }
 
@@ -443,11 +514,32 @@ fn ms(d: Duration) -> f64 {
 /// One end-to-end consensus() measurement row (median ms, spread ms, peak MB).
 fn row_consensus(label: &str, reads: &[Vec<u8>], cfg: &PoaConfig, reps: usize) {
     let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
-    let (med, lo, hi, peak) = bench(reps, || {
+    let (med, lo, hi, peak, allocs) = bench(reps, || {
         let _ = poa_consensus::consensus(&refs, 0, cfg).unwrap();
     });
     println!(
-        "  {label:<40} {:>9.3} ms  [{:>7.3}–{:<7.3}]  {peak:>7.1} MB",
+        "  {label:<40} {:>9.3} ms  [{:>7.3}–{:<7.3}]  {peak:>7.1} MB  {allocs:>9} allocs",
+        ms(med),
+        ms(lo),
+        ms(hi),
+    );
+}
+
+/// Time a specific `ConsensusMode` on the same reads, to isolate the best-fit
+/// extraction overhead (BestFit = best-fit builds BOTH candidates + fit-scores;
+/// MajorityFrequency builds only the MSA-column consensus).
+fn row_mode(label: &str, reads: &[Vec<u8>], mode: poa_consensus::ConsensusMode, reps: usize) {
+    let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+    let cfg = PoaConfig {
+        min_reads: 3,
+        consensus_mode: mode,
+        ..Default::default()
+    };
+    let (med, lo, hi, peak, allocs) = bench(reps, || {
+        let _ = poa_consensus::consensus(&refs, 0, &cfg).unwrap();
+    });
+    println!(
+        "  {label:<40} {:>9.3} ms  [{:>7.3}–{:<7.3}]  {peak:>7.1} MB  {allocs:>9} allocs",
         ms(med),
         ms(lo),
         ms(hi),
@@ -499,6 +591,54 @@ fn perf_matrix() {
     row_consensus("adaptive (w≈30)", &r2k, &cfg_adaptive(), 5);
     row_consensus("fixed band w=200", &r2k, &cfg_fixed(200), 5);
     row_consensus("unbanded (band_width=0)", &r2k, &cfg_unbanded(), 3);
+
+    // ── Best-fit extraction overhead (F25) ────────────────────────────────────
+    // Default BestFit is "best-fit": it builds a heaviest-path AND a
+    // majority-frequency consensus and, when they differ, re-aligns every read
+    // against each candidate (fit_score). MajorityFrequency builds only the MSA
+    // consensus. The gap between the two rows is the best-fit overhead on a
+    // periodic repeat (CAG×40 × 50 reads), where the candidates usually diverge.
+    println!("\n  BEST-FIT OVERHEAD  (CAG×40 × 50 reads; 5% error)");
+    println!("  {}", "-".repeat(80));
+    let cag = {
+        let base = repeat_seq(b"CAG", 40);
+        (0..50)
+            .map(|i| mutate(&base, 0.05, 0x500 + i))
+            .collect::<Vec<_>>()
+    };
+    row_mode(
+        "CAG×40 @5%: BestFit(best-fit)",
+        &cag,
+        poa_consensus::ConsensusMode::BestFit,
+        9,
+    );
+    row_mode(
+        "CAG×40 @5%: MajorityFrequency",
+        &cag,
+        poa_consensus::ConsensusMode::MajorityFrequency,
+        9,
+    );
+    // Homopolymer at high error → heaviest-path and majority usually DIVERGE, so
+    // best-fit runs fit_score twice (2 extra throwaway graph builds). This bounds
+    // the F25 worst case.
+    let aaaag = {
+        let base = repeat_seq(b"AAAAG", 30);
+        (0..50)
+            .map(|i| mutate(&base, 0.10, 0x600 + i))
+            .collect::<Vec<_>>()
+    };
+    row_mode(
+        "AAAAG×30 @10%: BestFit(best-fit)",
+        &aaaag,
+        poa_consensus::ConsensusMode::BestFit,
+        9,
+    );
+    row_mode(
+        "AAAAG×30 @10%: MajorityFrequency",
+        &aaaag,
+        poa_consensus::ConsensusMode::MajorityFrequency,
+        9,
+    );
 
     // Overall process peak RSS (monotonic high-water mark; heap peaks above are
     // per-workload and resettable, this is the whole-process ceiling).

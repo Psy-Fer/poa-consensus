@@ -6,7 +6,7 @@
 mod synth;
 
 use poa_consensus::PoaConfig;
-use poa_consensus::poa2::hybrid_consensus_multi;
+use poa_consensus::multi::hybrid_consensus_multi;
 use synth::{AlleleSpec, Read, Spec};
 
 fn cfg() -> PoaConfig {

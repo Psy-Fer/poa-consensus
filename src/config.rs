@@ -13,7 +13,7 @@ pub enum ConsensusMode {
     /// — heaviest on clean/short, majority on high-error length-variable repeats
     /// — so picking per call gets the better of both. Never worse than plain
     /// heaviest path.
-    HeaviestPath,
+    BestFit,
     /// Force the majority-frequency (MSA-column) consensus regardless of fit:
     /// each column emits its plurality base, counting read deletions explicitly.
     /// Best when column majority is trusted outright, e.g. high-depth amplicons.
@@ -38,7 +38,16 @@ pub struct PoaConfig {
     pub gap_extend: i32,
     /// Fraction of reads that must cover a node for it to appear in consensus.
     pub min_coverage_fraction: f64,
-    /// Minimum fraction of reads supporting an allele for bubble detection.
+    /// Minimum fraction of reads supporting an allele for it to be called (the
+    /// minority-arm support floor is `ceil(n * min_allele_freq).max(2)`).
+    ///
+    /// This is a **hard mosaic-sensitivity boundary**, not just a noise filter: an
+    /// allele below this frequency is merged into the majority and does **not**
+    /// appear anywhere in the output (its bubble is emitted only at or above this
+    /// floor). A single run therefore cannot report a sub-threshold mosaic — to
+    /// detect a low-frequency / subclonal allele (e.g. a 10-15% mosaic), lower
+    /// `min_allele_freq` and re-run `consensus_multi`. On noisy ONT data raise it
+    /// (~0.40) instead, to avoid error-driven false second-allele calls.
     pub min_allele_freq: f64,
     /// Minimum number of reads required to build a consensus.
     pub min_reads: usize,
@@ -50,23 +59,6 @@ pub struct PoaConfig {
     /// for cross-bubble phasing. Bubbles below this threshold (SNPs, short indels)
     /// use the existing single-bubble partitioning. Default 10.
     pub phasing_bubble_min_span: usize,
-    /// Whether this graph is being built for **multi-allele** consensus.
-    ///
-    /// Controls two mode-dependent behaviours whose correct setting differs
-    /// between single- and multi-allele consensus:
-    /// - the O(1) diagonal-skip fast path in alignment (kept in multi-allele
-    ///   mode to lock reads onto their own length-allele track; disabled in
-    ///   single-allele mode where its greedy forward-match over-calls periodic
-    ///   repeats by matching reads through phantom units), and
-    /// - the whole-graph unbanded rebuild on band-retry (needed only for
-    ///   multi-allele bubble-structure consistency).
-    ///
-    /// The functional wrappers set this automatically ([`consensus_multi`]
-    /// builds with it `true`; single-allele paths leave it `false`), so most
-    /// callers never touch it. Default: `false` (single-allele).
-    ///
-    /// [`consensus_multi`]: crate::consensus_multi
-    pub multi_allele: bool,
 }
 
 impl Default for PoaConfig {
@@ -89,12 +81,11 @@ impl Default for PoaConfig {
             gap_extend: -3,
             min_coverage_fraction: 0.0,
             min_allele_freq: 0.2,
-            min_reads: 1,
+            min_reads: 3,
             alignment_mode: AlignmentMode::SemiGlobal,
-            consensus_mode: ConsensusMode::HeaviestPath,
+            consensus_mode: ConsensusMode::BestFit,
             warn_on_long_unbanded: true,
             phasing_bubble_min_span: 10,
-            multi_allele: false,
         }
     }
 }

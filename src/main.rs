@@ -11,8 +11,9 @@ use poa_consensus::{
 /// Consensus extraction mode, mirrored from [`ConsensusMode`] for the CLI.
 #[derive(Clone, Copy, ValueEnum)]
 enum ConsensusModeArg {
-    /// Heaviest-path (edge-weight) traversal. Best default for STR/VNTR data.
-    Heaviest,
+    /// Best-fit (default): builds both a heaviest-path and a majority-frequency
+    /// consensus and keeps whichever the reads better support. Best for STR/VNTR.
+    BestFit,
     /// Most-frequent-base per column (MSA majority). Better for near-equal-length
     /// HiFi read sets; counts Delete traversals explicitly.
     Majority,
@@ -21,7 +22,7 @@ enum ConsensusModeArg {
 impl From<ConsensusModeArg> for ConsensusMode {
     fn from(m: ConsensusModeArg) -> Self {
         match m {
-            ConsensusModeArg::Heaviest => ConsensusMode::HeaviestPath,
+            ConsensusModeArg::BestFit => ConsensusMode::BestFit,
             ConsensusModeArg::Majority => ConsensusMode::MajorityFrequency,
         }
     }
@@ -110,7 +111,7 @@ struct Args {
     min_coverage_fraction: f64,
 
     /// Consensus extraction mode.
-    #[arg(long, value_enum, default_value_t = ConsensusModeArg::Heaviest, help_heading = "Coverage / consensus")]
+    #[arg(long, value_enum, default_value_t = ConsensusModeArg::BestFit, help_heading = "Coverage / consensus")]
     consensus_mode: ConsensusModeArg,
 
     // ── Alignment ─────────────────────────────────────────────────────────────
@@ -132,6 +133,18 @@ struct Args {
     /// for cross-bubble phasing; below this uses single-bubble (SNP) partitioning.
     #[arg(long, default_value_t = 10, help_heading = "Multi-allele")]
     phasing_bubble_min_span: usize,
+
+    // ── Flanking ────────────────────────────────────────────────────────────────
+    /// Left flank sequence anchoring the repeat region (use with --right-flank).
+    /// When both are set, the consensus is restricted to the segment BETWEEN the
+    /// flanks and non-spanning (partial) reads are auto-excluded when they are a
+    /// meaningful fraction of the pool. Use ≥ ~20 bp of unique flank.
+    #[arg(long, value_name = "SEQ", help_heading = "Flanking")]
+    left_flank: Option<String>,
+
+    /// Right flank sequence (see --left-flank). Both flanks must be given together.
+    #[arg(long, value_name = "SEQ", help_heading = "Flanking")]
+    right_flank: Option<String>,
 
     // ── Diagnostics ───────────────────────────────────────────────────────────
     /// Suppress the long-read unbanded warning (reads > ~1 kb with band 0).
@@ -198,7 +211,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Single-record passthrough ─────────────────────────────────────────────
-    if reads.len() == 1 {
+    // Only when the depth floor permits it (`--min-reads <= 1`). Otherwise fall
+    // through so the normal path returns InsufficientDepth rather than silently
+    // emitting a one-read "consensus" that bypasses the floor.
+    if reads.len() == 1 && args.min_reads <= 1 {
         let stdout = io::stdout();
         let mut out = stdout.lock();
         writeln!(out, ">consensus reads=1 seed=0 band=unbanded")?;
@@ -270,9 +286,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         consensus_mode: args.consensus_mode.into(),
         warn_on_long_unbanded: !args.no_long_unbanded_warning,
         phasing_bubble_min_span: args.phasing_bubble_min_span,
-        // multi_allele is managed by the library (consensus_multi sets it true);
-        // the CLI's --multi selects the code path rather than setting this.
-        ..PoaConfig::default()
     };
 
     // Diagnostic thresholds shared by both the single- and multi-allele paths.
@@ -300,9 +313,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = stdout.lock();
     let n = reads.len();
 
+    // Flanking-anchor mode: both flanks together restrict the output to the repeat
+    // segment and auto-exclude partial reads (see `consensus_flanked`).
+    let flanks: Option<(Vec<u8>, Vec<u8>)> = match (&args.left_flank, &args.right_flank) {
+        (Some(l), Some(r)) => Some((l.as_bytes().to_vec(), r.as_bytes().to_vec())),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--left-flank and --right-flank must be provided together".into());
+        }
+        (None, None) => None,
+    };
+
     if args.multi {
-        let alleles = poa_consensus::consensus_multi(&slices, seed_idx, &config)
-            .inspect_err(|e| explain_error(e, n))?;
+        let alleles = match &flanks {
+            Some((l, r)) => poa_consensus::consensus_multi_flanked(&slices, l, r, &config),
+            None => poa_consensus::consensus_multi(&slices, seed_idx, &config),
+        }
+        .inspect_err(|e| explain_error(e, n))?;
         let total = alleles.len();
         let allele_cfg = DiagnoseConfig {
             is_allele_partition: true,
@@ -335,8 +361,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // carry -- the seed-sensitivity retry (`consensus_fit_scored`), the
         // banded-truncation unbanded-rebuild retry, and the interior filter --
         // none of which the clean engine needs.
-        let result = poa_consensus::consensus(&slices, seed_idx, &config)
-            .inspect_err(|e| explain_error(e, n))?;
+        let result = match &flanks {
+            Some((l, r)) => poa_consensus::consensus_flanked(&slices, l, r, &config),
+            None => poa_consensus::consensus(&slices, seed_idx, &config),
+        }
+        .inspect_err(|e| explain_error(e, n))?;
         // `consensus()` picks the median-length read as seed internally; recompute
         // it here purely for the informational FASTA header.
         let mut order: Vec<usize> = (0..slices.len()).collect();
@@ -366,16 +395,6 @@ fn explain_error(e: &PoaError, n_reads: usize) {
                      suffer at low depth)"
                 );
             }
-        }
-        PoaError::BandTooNarrow {
-            configured,
-            required,
-        } => {
-            eprintln!(
-                "poa-consensus: error: band width {configured} is too narrow \
-                 (need ≥ {required} for this read set)"
-            );
-            eprintln!("  hint: try --adaptive-band, or --band-width {required}");
         }
         PoaError::NoSpanningReads {
             left_depth,

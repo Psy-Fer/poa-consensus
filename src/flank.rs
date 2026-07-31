@@ -18,12 +18,25 @@ pub fn extract_flanked_region<'a>(
     left_flank: &[u8],
     right_flank: &[u8],
 ) -> Option<&'a [u8]> {
-    let seg_start = find_flank_end(read, left_flank)?;
-    let seg_end = find_right_flank_start(read, right_flank)?;
-    if seg_start >= seg_end {
-        return None;
+    let (start, end) = flank_span(read, left_flank, right_flank)?;
+    Some(&read[start..end])
+}
+
+/// The byte range `[start, end)` of the repeat segment between the flanks (the
+/// range [`extract_flanked_region`] slices out). Returns `None` if either flank
+/// cannot be confidently located or the located positions are inconsistent.
+pub(crate) fn flank_span(
+    read: &[u8],
+    left_flank: &[u8],
+    right_flank: &[u8],
+) -> Option<(usize, usize)> {
+    let start = find_flank_end(read, left_flank)?;
+    let end = find_right_flank_start(read, right_flank)?;
+    if start >= end {
+        None
+    } else {
+        Some((start, end))
     }
-    Some(&read[seg_start..seg_end])
 }
 
 // Gap penalty used by find_flank_end.  Must be more negative than half the match
@@ -92,6 +105,13 @@ fn find_flank_end(read: &[u8], flank: &[u8]) -> Option<usize> {
 /// Returns the position in `read` where the right flank begins (i.e. where the repeat
 /// segment should end).  Implemented by reversing both sequences and calling
 /// `find_flank_end`, then converting back to the original coordinate space.
+///
+/// Because `find_flank_end` takes the *first* max in the reversed read, this anchors
+/// to the *last* equally-scoring right-flank position in the original — the mirror of
+/// the left anchor's "earliest" choice. With a unique flank there is a single max, so
+/// the choice is unambiguous; only on a repeat-adjacent / degenerate right flank does
+/// this bias the extracted segment slightly longer (it may absorb a flank-like unit).
+/// Use ≥ ~20 bp of genuinely unique flanking sequence to avoid this.
 fn find_right_flank_start(read: &[u8], right_flank: &[u8]) -> Option<usize> {
     if right_flank.is_empty() {
         return Some(read.len());

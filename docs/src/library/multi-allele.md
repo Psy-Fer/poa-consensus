@@ -53,7 +53,7 @@ For a diploid STR locus with known depth:
 ```rust
 let mut cfg = PoaConfig::default();
 cfg.min_reads       = 5;    // require 5 reads per allele minimum
-cfg.min_allele_freq = 0.30; // ONT: raise from default 0.25 to suppress error-rate bubbles
+cfg.min_allele_freq = 0.30; // ONT: raise from default 0.2 to suppress error-rate bubbles
 
 let alleles = consensus_multi(&reads, seed_idx, &cfg)?;
 ```

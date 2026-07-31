@@ -11,10 +11,6 @@ pub enum PoaError {
         index: usize,
         len: usize,
     },
-    BandTooNarrow {
-        configured: usize,
-        required: usize,
-    },
     /// `SeedSelection::Auto` found non-overlapping left-only and right-only
     /// read groups with no spanning read.  Use `bridged_consensus` instead:
     /// the left group seeds the left half, the right group seeds the right half,
@@ -39,16 +35,6 @@ impl fmt::Display for PoaError {
             }
             PoaError::SeedOutOfBounds { index, len } => {
                 write!(f, "seed index {index} is out of bounds for {len} reads")
-            }
-            PoaError::BandTooNarrow {
-                configured,
-                required,
-            } => {
-                write!(
-                    f,
-                    "band width {configured} too narrow; estimated {required} required — \
-                     retry with a wider band or enable adaptive_band"
-                )
             }
             PoaError::NoSpanningReads {
                 left_depth,
