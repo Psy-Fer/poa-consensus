@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [0.6.0] - 2026-07-30
+## [0.6.0] - 2026-07-31
 
 Correctness, safety-default, API, and documentation pass following a full deep-dive
 review. Fixes several silent correctness bugs in the default path, adds an opt-in
