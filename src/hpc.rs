@@ -259,7 +259,8 @@ fn run_len_at(seq: &[u8]) -> Vec<usize> {
 
 /// Splice the two consensuses: align `hpc` to `raw`, and for each block where
 /// they differ take the compressed call only if the block touches a run of
-/// `>= min_run` bases in either sequence; elsewhere keep the raw call.
+/// `>= min_run` bases and, on both sides, consists only of run bases and
+/// single interrupts between runs; elsewhere keep the raw call.
 /// Compression only claims to help inside homopolymers, and outside them the
 /// raw engine is the better-tested answer (e.g. a periodic repeat's unit
 /// count). Per-position fields come from whichever side each base came from;
@@ -272,6 +273,15 @@ fn splice(raw: &Consensus, hpc: &Consensus, min_run: usize, config: &PoaConfig) 
         let lo = a.saturating_sub(1);
         let hi = (b + 1).min(runs.len());
         runs[lo..hi.max(lo)].iter().any(|&x| x >= min_run)
+    };
+    // Every base of the block is in a run, or is a single base between two runs
+    // (the interrupt). Without this a GC-rich VNTR, where almost everything
+    // touches a GG/CC, could take a whole extra repeat unit from the candidate.
+    let local = |runs: &[usize], a: usize, b: usize| {
+        (a..b).all(|x| {
+            runs[x] >= min_run
+                || (x > 0 && x + 1 < runs.len() && runs[x - 1] >= min_run && runs[x + 1] >= min_run)
+        })
     };
     let cfg = PoaConfig {
         alignment_mode: crate::config::AlignmentMode::Global,
@@ -288,7 +298,10 @@ fn splice(raw: &Consensus, hpc: &Consensus, min_run: usize, config: &PoaConfig) 
     let flush =
         |block: &mut Option<(usize, usize)>, i2: usize, j2: usize, src: &mut Vec<(bool, usize)>| {
             if let Some((i1, j1)) = block.take() {
-                if touches(&rr, i1, i2) || touches(&hr, j1, j2) {
+                if (touches(&rr, i1, i2) || touches(&hr, j1, j2))
+                    && local(&rr, i1, i2)
+                    && local(&hr, j1, j2)
+                {
                     src.extend((j1..j2).map(|x| (true, x)));
                 } else {
                     src.extend((i1..i2).map(|x| (false, x)));
@@ -469,5 +482,39 @@ mod tests {
             assert_eq!(c.sequence, mk(12, 11), "min_run={min_run}");
             assert_eq!(c.coverage.len(), c.sequence.len());
         }
+    }
+
+    fn splice_case(raw_seq: &[u8], hpc_seq: &[u8]) -> Vec<u8> {
+        let cfg = PoaConfig::default();
+        let raw = crate::engine_consensus(&[raw_seq, raw_seq, raw_seq], &cfg);
+        assert_eq!(raw.sequence, raw_seq);
+        let mut hpc = raw.clone();
+        hpc.sequence = hpc_seq.to_vec();
+        hpc.coverage = vec![3; hpc_seq.len()];
+        hpc.path_weights = vec![3; hpc_seq.len()];
+        splice(&raw, &hpc, 2, &cfg).sequence
+    }
+
+    #[test]
+    fn splice_takes_shifted_interrupt() {
+        let raw = b"TGCATGCCAAAAGAAAAAAACGTCCATGCT";
+        let hpc = b"TGCATGCCAAAAAAGAAAAACGTCCATGCT";
+        assert_eq!(splice_case(raw, hpc), hpc);
+    }
+
+    #[test]
+    fn splice_rejects_extra_unit_that_only_touches_runs() {
+        // GC-rich unit with GG/CC runs: an extra copy touches runs but is not a
+        // homopolymer edit, so the raw call must stand.
+        let unit = b"GGCTCAGGTGGCAGCG";
+        let mk = |n: usize| {
+            let mut v = b"ATGACTAGTATCAGAT".to_vec();
+            for _ in 0..n {
+                v.extend_from_slice(unit);
+            }
+            v.extend_from_slice(b"ATCTGATACTAGTCAT");
+            v
+        };
+        assert_eq!(splice_case(&mk(3), &mk(4)), mk(3));
     }
 }

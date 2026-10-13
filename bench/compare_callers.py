@@ -833,9 +833,11 @@ def run_longtier(args):
                 shutil.rmtree(work, ignore_errors=True)
             continue
 
+
         # poa-consensus: isolated CLI invocation (band-width 50 + adaptive default,
         # matching validate.run_consensus for single-allele).
-        poa_argv = [str(v.POA_BIN), "--band-width", "50", "--min-reads", "2", str(extracted_path)]
+        poa_argv = ([str(v.POA_BIN), "--band-width", "50", "--min-reads", "2"]
+                    + v.os.environ.get("POA_EXTRA_FLAGS", "").split() + [str(extracted_path)])
         poa_out, poa_status, poa_rt, poa_peak = _run_isolated(poa_argv, work, "poa")
         poa_cons = None
         if poa_status == "ok" and poa_out:
