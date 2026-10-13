@@ -269,6 +269,42 @@ impl Poa {
             self.cfg.gap_extend,
         );
         let semi = self.cfg.alignment_mode == AlignmentMode::SemiGlobal;
+        // Homopolymer-aware gap costs (`PoaConfig::homopolymer_gap`): an indel
+        // inside a homopolymer pays (hgo, hge) instead of (go, ge). Both sides
+        // must really be a run, or a periodic repeat's unit indel (CAG|CAG, the
+        // deleted C next to the read's next C) would count and get cheap.
+        // Insertion of read[j-1]: that base is part of a run in the read.
+        // Deletion of node t at read column j: t has a same-base graph
+        // neighbour, and the read has that base adjacent (read[j-1] or read[j]).
+        let hp = self.cfg.homopolymer_gap;
+        let ins_run: Vec<bool> = (0..=l)
+            .map(|j| {
+                hp.is_some()
+                    && j >= 1
+                    && ((j >= 2 && read[j - 1] == read[j - 2]) || (j < l && read[j - 1] == read[j]))
+            })
+            .collect();
+        let node_run: Vec<bool> = if hp.is_some() {
+            self.nodes
+                .iter()
+                .map(|nd| {
+                    nd.inc.iter().any(|&p| self.nodes[p].base == nd.base)
+                        || nd.out.iter().any(|e| self.nodes[e.to].base == nd.base)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ins_cost = |j: usize| match hp {
+            Some(c) if ins_run[j] => c,
+            _ => (go, ge),
+        };
+        let del_cost = |t: usize, j: usize, b: u8| match hp {
+            Some(c) if node_run[t] && ((j >= 1 && read[j - 1] == b) || (j < l && read[j] == b)) => {
+                c
+            }
+            _ => (go, ge),
+        };
 
         // ---- Adaptive static-diagonal-union band (abPOA-style anti-fold) ----
         // Per row we score only query columns [lo, hi] = union of the
@@ -365,18 +401,19 @@ impl Poa {
             {
                 let mut best = NEG_INF;
                 let mut bk = (0u8, VSTART);
+                let (dgo, dge) = del_cost(t, 0, base);
                 if is_source {
                     // leading deletion from the virtual start
-                    if go + ge > best {
-                        best = go + ge;
+                    if dgo + dge > best {
+                        best = dgo + dge;
                         bk = (0, VSTART);
                     }
                 }
                 for &p in &self.nodes[t].inc {
                     let pr = rank_of[p] as u32;
                     let de = d0[rank_of[p]];
-                    if de != NEG_INF && de + ge > best {
-                        best = de + ge;
+                    if de != NEG_INF && de + dge > best {
+                        best = de + dge;
                         bk = (2, pr);
                     }
                 }
@@ -429,17 +466,19 @@ impl Poa {
                     } else {
                         (NEG_INF, NEG_INF)
                     };
+                    let (igo, ige) = ins_cost(j);
                     let mut best = NEG_INF;
                     if mo != NEG_INF {
-                        best = mo + go + ge;
+                        best = mo + igo + ige;
                     }
-                    if io != NEG_INF && io + ge > best {
-                        best = io + ge;
+                    if io != NEG_INF && io + ige > best {
+                        best = io + ige;
                     }
                     irow[k] = best;
                 }
                 // ---- D[t][j] ---- (node t skipped; predecessors at same j) ----
                 {
+                    let (dgo, dge) = del_cost(t, j, base);
                     let mut best = NEG_INF;
                     let mut bk = (0u8, VSTART);
                     for &p in &self.nodes[t].inc {
@@ -447,16 +486,16 @@ impl Poa {
                         let mo = bget(&mflat, &off, &lo_, &hi_, pr, j);
                         let io = bget(&iflat, &off, &lo_, &hi_, pr, j);
                         let de = bgetd(&dflat, &d0, &off, &lo_, &hi_, pr, j);
-                        if mo != NEG_INF && mo + go + ge > best {
-                            best = mo + go + ge;
+                        if mo != NEG_INF && mo + dgo + dge > best {
+                            best = mo + dgo + dge;
                             bk = (0, pr as u32);
                         }
-                        if io != NEG_INF && io + go + ge > best {
-                            best = io + go + ge;
+                        if io != NEG_INF && io + dgo + dge > best {
+                            best = io + dgo + dge;
                             bk = (1, pr as u32);
                         }
-                        if de != NEG_INF && de + ge > best {
-                            best = de + ge;
+                        if de != NEG_INF && de + dge > best {
+                            best = de + dge;
                             bk = (2, pr as u32);
                         }
                     }
@@ -514,6 +553,8 @@ impl Poa {
                 }
                 1 => {
                     ops.push(Op::Ins(read[j - 1]));
+                    // Open cost of THIS insert cell (must match the fill).
+                    let igo = ins_cost(j).0;
                     j -= 1;
                     if j == 0 {
                         rr = VSTART;
@@ -527,7 +568,7 @@ impl Poa {
                         // multi-base insert run one base short, mis-emitting an
                         // inserted base as a Match. Guard the NEG_INF M cell so an
                         // unreachable M can never win the comparison.
-                        state = if o != NEG_INF && o + go >= e { 0 } else { 1 };
+                        state = if o != NEG_INF && o + igo >= e { 0 } else { 1 };
                     }
                 }
                 _ => {
@@ -975,17 +1016,23 @@ impl Poa {
                 return (seq, cov);
             }
         };
-        // Per-column base tallies (A,C,G,T) plus present-read count.
-        let mut tally = vec![[0u32; 4]; ncol];
+        // Per-column symbol tallies (A,C,G,T, then the homopolymer-compressed
+        // poly-A..poly-T symbols, which set the high bit; see `crate::hpc`)
+        // plus present-read count.
+        let mut tally = vec![[0u32; 8]; ncol];
         let mut present = vec![0u32; ncol];
-        // ACGT → bucket index; any other base (N / IUPAC) → None so it is NOT
-        // folded into the T tally (it still counts as column occupancy below).
-        let code = |b: u8| match b {
-            b'A' => Some(0usize),
-            b'C' => Some(1),
-            b'G' => Some(2),
-            b'T' => Some(3),
-            _ => None,
+        // ACGT (± poly bit) → bucket index; any other base (N / IUPAC) → None
+        // so it is NOT folded into a real tally (it still counts as column
+        // occupancy below).
+        let code = |b: u8| {
+            let i = match b & 0x7f {
+                b'A' => 0usize,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                _ => return None,
+            };
+            Some(if b & 0x80 != 0 { i + 4 } else { i })
         };
         // `covering[c]` = reads whose occupied column *range* brackets column `c`
         // (via a difference array over each read's [min,max] column). A read that
@@ -1008,7 +1055,7 @@ impl Poa {
                 last_col = c;
                 present[c] += 1; // column occupancy (any base, incl. N)
                 if let Some(ci) = code(self.nodes[nd].base) {
-                    tally[c][ci] += 1; // base plurality: ACGT only
+                    tally[c][ci] += 1; // base plurality: ACGT (+ poly) only
                 }
             }
             if lo != usize::MAX {
@@ -1022,7 +1069,16 @@ impl Poa {
             acc += cover_delta[c];
             covering[c] = acc.max(0) as u32;
         }
-        let bases = *b"ACGT";
+        let bases = [
+            b'A',
+            b'C',
+            b'G',
+            b'T',
+            b'A' | 0x80,
+            b'C' | 0x80,
+            b'G' | 0x80,
+            b'T' | 0x80,
+        ];
         let mut out = Vec::with_capacity(ncol);
         let mut cov = Vec::with_capacity(ncol);
         // A column is emitted only if a majority of the whole read set REACHES it
@@ -1756,5 +1812,548 @@ mod tests_semiglobal {
             "partial reads must not truncate the consensus; got {}",
             String::from_utf8_lossy(&g.consensus())
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_homopolymer_probe {
+    use super::*;
+
+    fn read_fasta(path: &str) -> Vec<Vec<u8>> {
+        let fa = std::fs::read_to_string(path).expect("fasta");
+        let mut reads = Vec::new();
+        let mut cur = Vec::new();
+        for line in fa.lines() {
+            if line.starts_with('>') {
+                if !cur.is_empty() {
+                    reads.push(std::mem::take(&mut cur));
+                }
+            } else {
+                cur.extend_from_slice(line.trim().as_bytes());
+            }
+        }
+        if !cur.is_empty() {
+            reads.push(cur);
+        }
+        reads
+    }
+
+    /// Dump MSA columns of a real/handmade read set to see whether a single
+    /// interrupting base between two variable homopolymers lands in one column
+    /// or is split across several. PROBE_FA overrides the input.
+    #[test]
+    #[ignore = "probe; run with --ignored --nocapture"]
+    fn probe_split_interrupt_column() {
+        let path = std::env::var("PROBE_FA").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/homopolymers/msa.fasta").into()
+        });
+        let reads = read_fasta(&path);
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        let mut order: Vec<usize> = (0..reads.len()).collect();
+        order.sort_by_key(|&i| reads[i].len());
+        let med = order[order.len() / 2];
+        let mut g = Poa::new(&reads[med], PoaConfig::default());
+        for (i, r) in reads.iter().enumerate() {
+            if i != med {
+                g.add_read(r);
+            }
+        }
+        let (node_col, ncol) = g.msa_columns().expect("acyclic columns");
+        let mut cols: Vec<Vec<usize>> = vec![Vec::new(); ncol];
+        for (nd, &c) in node_col.iter().enumerate() {
+            cols[c].push(nd);
+        }
+        for (c, nodes) in cols.iter().enumerate() {
+            let s: Vec<String> = nodes
+                .iter()
+                .map(|&n| {
+                    format!(
+                        "n{}:{} cov{} del{}",
+                        n, g.nodes[n].base as char, g.nodes[n].cov, g.nodes[n].del
+                    )
+                })
+                .collect();
+            eprintln!("col {c:4}: {}", s.join(" | "));
+        }
+        eprintln!("heaviest : {}", String::from_utf8_lossy(&g.consensus()));
+        eprintln!(
+            "majority : {}",
+            String::from_utf8_lossy(&g.consensus_majority())
+        );
+        eprintln!(
+            "best-fit : {}",
+            String::from_utf8_lossy(&g.consensus_best_fit(&refs))
+        );
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn unit(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 31) as f64
+        }
+    }
+
+    /// Run-length jitter: 0 with p0, else +/-1 (mostly) or +/-2.
+    fn jitter(rng: &mut Lcg, p0: f64) -> i32 {
+        let u = rng.unit();
+        if u < p0 {
+            return 0;
+        }
+        let mag = if rng.unit() < 0.8 { 1 } else { 2 };
+        if rng.unit() < 0.5 { -mag } else { mag }
+    }
+
+    fn rand_flank(rng: &mut Lcg, n: usize) -> Vec<u8> {
+        // No A at the junctions so the runs are unambiguous.
+        let mut v: Vec<u8> = (0..n).map(|_| b"ACGT"[(rng.next() % 4) as usize]).collect();
+        let k = v.len();
+        v[k - 1] = b'C';
+        v[0] = b'T';
+        v
+    }
+
+    /// Sweep: flankL + A^a G A^b + flankR, each read jitters a and b
+    /// independently. Count how often the interrupt G is split across MSA
+    /// columns, and how often the public `consensus()` output is wrong
+    /// (G lost/duplicated, or run lengths off).
+    #[test]
+    #[ignore = "probe; run with --ignored --nocapture"]
+    fn probe_interrupt_sweep() {
+        for &(a0, b0) in &[(12usize, 11usize), (8, 8), (20, 20)] {
+            for &p0 in &[0.7, 0.5, 0.3] {
+                for &depth in &[10usize, 20, 40] {
+                    let trials = 200;
+                    let (mut split, mut g_wrong, mut len_wrong) = (0, 0, 0);
+                    for t in 0..trials {
+                        let mut rng = Lcg(1 + t as u64 * 7919 + depth as u64 * 31);
+                        let lf = rand_flank(&mut rng, 30);
+                        let mut rf = rand_flank(&mut rng, 30);
+                        rf[0] = b'C';
+                        let mk = |a: usize, b: usize| {
+                            let mut r = lf.clone();
+                            r.extend(std::iter::repeat_n(b'A', a));
+                            r.push(b'G');
+                            r.extend(std::iter::repeat_n(b'A', b));
+                            r.extend_from_slice(&rf);
+                            r
+                        };
+                        let reads: Vec<Vec<u8>> = (0..depth)
+                            .map(|_| {
+                                let a = (a0 as i32 + jitter(&mut rng, p0)).max(1) as usize;
+                                let b = (b0 as i32 + jitter(&mut rng, p0)).max(1) as usize;
+                                mk(a, b)
+                            })
+                            .collect();
+                        let truth = mk(a0, b0);
+                        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+                        // Column split check on the same graph the library builds.
+                        let mut order: Vec<usize> = (0..reads.len()).collect();
+                        order.sort_by_key(|&i| reads[i].len());
+                        let med = order[order.len() / 2];
+                        let mut g = Poa::new(&reads[med], PoaConfig::default());
+                        for (i, r) in reads.iter().enumerate() {
+                            if i != med {
+                                g.add_read(r);
+                            }
+                        }
+                        let (node_col, _) = g.msa_columns().expect("acyclic");
+                        let mut gcols: Vec<usize> = (0..g.nodes.len())
+                            .filter(|&n| g.nodes[n].base == b'G' && g.nodes[n].cov >= 2)
+                            .map(|n| node_col[n])
+                            .collect();
+                        // Only the interrupt region: columns past the left flank.
+                        gcols.retain(|&c| c >= lf.len() && c < lf.len() + a0 + b0 + 6);
+                        gcols.sort_unstable();
+                        gcols.dedup();
+                        if gcols.len() > 1 {
+                            split += 1;
+                        }
+                        let cons = crate::consensus(&refs, 0, &PoaConfig::default())
+                            .unwrap()
+                            .sequence;
+                        let mid =
+                            &cons[lf.len().min(cons.len())..cons.len().saturating_sub(rf.len())];
+                        let ng = mid.iter().filter(|&&c| c == b'G').count();
+                        if ng != 1 {
+                            g_wrong += 1;
+                        } else if cons != truth {
+                            len_wrong += 1;
+                        }
+                    }
+                    eprintln!(
+                        "A{a0}GA{b0} p0={p0} depth={depth:2}: G split across columns {split:3}/{trials} | consensus G lost/dup {g_wrong:3} | runs wrong {len_wrong:3}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_homopolymer_compare {
+    use crate::config::PoaConfig;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn unit(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 31) as f64
+        }
+    }
+
+    fn jitter(rng: &mut Lcg, p0: f64) -> i32 {
+        if rng.unit() < p0 {
+            return 0;
+        }
+        let mag = if rng.unit() < 0.8 { 1 } else { 2 };
+        if rng.unit() < 0.5 { -mag } else { mag }
+    }
+
+    /// Raw vs homopolymer-compressed consensus on flankL + A^12 G A^11 + flankR,
+    /// with per-read run-length jitter and random substitutions (rate `e`).
+    /// Reports exact-match rate and G-lost/duplicated rate per mode.
+    #[test]
+    #[ignore = "probe; run with --ignored --nocapture"]
+    fn probe_hpc_vs_raw() {
+        let (a0, b0) = (12usize, 11usize);
+        for &e in &[0.0, 0.01, 0.03] {
+            for &p0 in &[0.7, 0.5, 0.3] {
+                for &depth in &[10usize, 20, 40] {
+                    let trials = 200;
+                    let modes = [
+                        (0usize, false),
+                        (2, false),
+                        (4, false),
+                        (2, true),
+                        (4, true),
+                    ];
+                    let mut exact = [0usize; 5];
+                    let mut gbad = [0usize; 5];
+                    for t in 0..trials {
+                        let mut rng = Lcg(1 + t as u64 * 7919 + depth as u64 * 31);
+                        let flank = |rng: &mut Lcg| -> Vec<u8> {
+                            (0..30).map(|_| b"CGT"[(rng.next() % 3) as usize]).collect()
+                        };
+                        let lf = flank(&mut rng);
+                        let rf = flank(&mut rng);
+                        let mk = |a: usize, b: usize| {
+                            let mut r = lf.clone();
+                            r.extend(std::iter::repeat_n(b'A', a));
+                            r.push(b'G');
+                            r.extend(std::iter::repeat_n(b'A', b));
+                            r.extend_from_slice(&rf);
+                            r
+                        };
+                        let truth = mk(a0, b0);
+                        let reads: Vec<Vec<u8>> = (0..depth)
+                            .map(|_| {
+                                let a = (a0 as i32 + jitter(&mut rng, p0)).max(1) as usize;
+                                let b = (b0 as i32 + jitter(&mut rng, p0)).max(1) as usize;
+                                let mut r = mk(a, b);
+                                for x in r.iter_mut() {
+                                    if rng.unit() < e {
+                                        let alts: Vec<u8> =
+                                            b"ACGT".iter().copied().filter(|&c| c != *x).collect();
+                                        *x = alts[(rng.next() % 3) as usize];
+                                    }
+                                }
+                                r
+                            })
+                            .collect();
+                        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+                        for (mi, &(m, best)) in modes.iter().enumerate() {
+                            let mut cfg = PoaConfig {
+                                homopolymer_min_run: m,
+                                ..PoaConfig::default()
+                            };
+                            if std::env::var("MF").is_ok() {
+                                cfg.consensus_mode =
+                                    crate::config::ConsensusMode::MajorityFrequency;
+                            }
+                            let cons = if m == 0 || best {
+                                crate::consensus(&refs, 0, &cfg).unwrap().sequence
+                            } else {
+                                crate::hpc::consensus_compressed(&refs, &cfg).sequence
+                            };
+                            if cons == truth {
+                                exact[mi] += 1;
+                            } else if std::env::var("SHOW").is_ok()
+                                && m == 4
+                                && best
+                                && e > 0.02
+                                && p0 > 0.6
+                                && depth == 20
+                                && t < 15
+                            {
+                                let f = |s: &[u8]| {
+                                    String::from_utf8_lossy(&s[25..s.len().saturating_sub(25)])
+                                        .into_owned()
+                                };
+                                eprintln!("  truth {}\n  k2    {}", f(&truth), f(&cons));
+                            }
+                            // The interrupt region is the only place with A's (flanks are C/G/T).
+                            let first = cons.iter().position(|&c| c == b'A');
+                            let last = cons.iter().rposition(|&c| c == b'A');
+                            let ng = match (first, last) {
+                                (Some(f), Some(l)) => {
+                                    cons[f..=l].iter().filter(|&&c| c == b'G').count()
+                                }
+                                _ => 0,
+                            };
+                            if ng != 1 {
+                                gbad[mi] += 1;
+                            }
+                        }
+                    }
+                    let fmt = |v: &[usize; 5]| {
+                        v.iter()
+                            .map(|x| format!("{x:3}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    eprintln!(
+                        "e={e:.2} p0={p0} d={depth:2} | exact raw/k2/k4/k2best/k4best: {} | G bad: {}",
+                        fmt(&exact),
+                        fmt(&gbad)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_hp_methods {
+    use crate::config::PoaConfig;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn unit(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 31) as f64
+        }
+    }
+
+    fn jitter(rng: &mut Lcg, p0: f64) -> i32 {
+        if rng.unit() < p0 {
+            return 0;
+        }
+        let mag = if rng.unit() < 0.8 { 1 } else { 2 };
+        if rng.unit() < 0.5 { -mag } else { mag }
+    }
+
+    fn flank(rng: &mut Lcg) -> Vec<u8> {
+        let mut v: Vec<u8> = (0..30).map(|_| b"CGT"[(rng.next() % 3) as usize]).collect();
+        v[0] = b'C';
+        v[29] = b'C';
+        v
+    }
+
+    fn methods() -> Vec<(&'static str, PoaConfig)> {
+        let d = PoaConfig::default();
+        vec![
+            ("raw", d.clone()),
+            // "!" = engine with gap costs directly, no splice/fit guard.
+            (
+                "gap!",
+                PoaConfig {
+                    homopolymer_gap: Some((-2, -1)),
+                    ..d.clone()
+                },
+            ),
+            (
+                "gap",
+                PoaConfig {
+                    homopolymer_gap: Some((-2, -1)),
+                    ..d.clone()
+                },
+            ),
+            (
+                "hpc2",
+                PoaConfig {
+                    homopolymer_min_run: 2,
+                    ..d.clone()
+                },
+            ),
+            (
+                "hpc4",
+                PoaConfig {
+                    homopolymer_min_run: 4,
+                    ..d.clone()
+                },
+            ),
+            (
+                "hpc2+gap",
+                PoaConfig {
+                    homopolymer_min_run: 2,
+                    homopolymer_gap: Some((-2, -1)),
+                    ..d.clone()
+                },
+            ),
+        ]
+    }
+
+    /// `make(rng) -> (truth, reads)`; prints exact-match count and mean edit
+    /// distance per method.
+    /// (truth, reads)
+    type Case = (Vec<u8>, Vec<Vec<u8>>);
+
+    fn run(label: &str, trials: usize, make: &dyn Fn(&mut Lcg) -> Case) {
+        let ms = methods();
+        let mut exact = vec![0usize; ms.len()];
+        let mut edits = vec![0usize; ms.len()];
+        let mut units = vec![0usize; ms.len()];
+        for t in 0..trials {
+            let mut rng = Lcg(17 + t as u64 * 104729);
+            let (truth, reads) = make(&mut rng);
+            let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            for (mi, (_, cfg)) in ms.iter().enumerate() {
+                let cons = if ms[mi].0.ends_with('!') {
+                    crate::engine_consensus(&refs, cfg).sequence
+                } else {
+                    crate::consensus(&refs, 0, cfg).unwrap().sequence
+                };
+                let ed = crate::poa2::tests::lev(&cons, &truth);
+                edits[mi] += ed;
+                let nt = |s: &[u8]| s.iter().filter(|&&c| c == b'T').count();
+                if nt(&cons) == nt(&truth) {
+                    units[mi] += 1;
+                }
+                if ed == 0 {
+                    exact[mi] += 1;
+                }
+            }
+        }
+        let cells: Vec<String> = ms
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| {
+                format!(
+                    "{n} {:3}/{:3} ({:.2})",
+                    exact[i],
+                    units[i],
+                    edits[i] as f64 / trials as f64
+                )
+            })
+            .collect();
+        eprintln!("{label} | {}", cells.join(" | "));
+    }
+
+    fn subs(rng: &mut Lcg, r: &mut [u8], e: f64) {
+        for x in r.iter_mut() {
+            if rng.unit() < e {
+                let alts: Vec<u8> = b"ACGT".iter().copied().filter(|&c| c != *x).collect();
+                *x = alts[(rng.next() % 3) as usize];
+            }
+        }
+    }
+
+    /// Per method: exact matches / T-count matches (unit count for the AT
+    /// repeat) out of N, and mean edit distance.
+    #[test]
+    #[ignore = "probe; run with --ignored --nocapture"]
+    fn probe_hp_methods() {
+        let trials: usize = std::env::var("TRIALS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let only = std::env::var("ONLY").unwrap_or_default();
+        for &e in &[0.0, 0.01, 0.03] {
+            for &p0 in &[0.7, 0.4] {
+                for &depth in &[10usize, 20, 40] {
+                    if only.is_empty() || only == "g" {
+                        run(
+                            &format!("G   e={e:.2} p0={p0} d={depth:2}"),
+                            trials,
+                            &|rng| {
+                                let (lf, rf) = (flank(rng), flank(rng));
+                                let mk = |a: usize, b: usize| {
+                                    let mut r = lf.clone();
+                                    r.extend(std::iter::repeat_n(b'A', a));
+                                    r.push(b'G');
+                                    r.extend(std::iter::repeat_n(b'A', b));
+                                    r.extend_from_slice(&rf);
+                                    r
+                                };
+                                let reads = (0..depth)
+                                    .map(|_| {
+                                        let a = (12 + jitter(rng, p0)).max(1) as usize;
+                                        let b = (11 + jitter(rng, p0)).max(1) as usize;
+                                        let mut r = mk(a, b);
+                                        subs(rng, &mut r, e);
+                                        r
+                                    })
+                                    .collect();
+                                (mk(12, 11), reads)
+                            },
+                        );
+                    }
+                    if only.is_empty() || only == "r" {
+                        run(
+                            &format!("AT  e={e:.2} p0={p0} d={depth:2}"),
+                            trials,
+                            &|rng| {
+                                let (lf, rf) = (flank(rng), flank(rng));
+                                // 15 units of A{n}T; ~30% of units are genuinely A3/A5
+                                // in every read (shared), the rest A4.
+                                let units: Vec<usize> = (0..15)
+                                    .map(|_| {
+                                        let u = rng.unit();
+                                        if u < 0.15 {
+                                            3
+                                        } else if u < 0.3 {
+                                            5
+                                        } else {
+                                            4
+                                        }
+                                    })
+                                    .collect();
+                                let mk = |ns: &[usize]| {
+                                    let mut r = lf.clone();
+                                    for &n in ns {
+                                        r.extend(std::iter::repeat_n(b'A', n));
+                                        r.push(b'T');
+                                    }
+                                    r.extend_from_slice(&rf);
+                                    r
+                                };
+                                let reads = (0..depth)
+                                    .map(|_| {
+                                        // Per-read unique noise on every A run.
+                                        let ns: Vec<usize> = units
+                                            .iter()
+                                            .map(|&n| (n as i32 + jitter(rng, p0)).max(1) as usize)
+                                            .collect();
+                                        let mut r = mk(&ns);
+                                        subs(rng, &mut r, e);
+                                        r
+                                    })
+                                    .collect();
+                                (mk(&units), reads)
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 }

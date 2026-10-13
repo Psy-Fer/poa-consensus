@@ -134,6 +134,17 @@ struct Args {
     #[arg(long, default_value_t = 10, help_heading = "Multi-allele")]
     phasing_bubble_min_span: usize,
 
+    /// Experimental homopolymer compression: align runs of >= N identical bases
+    /// as one symbol and re-estimate their lengths after consensus (0 = off;
+    /// 1 = pure HPC; 2 = A,C,G,T,polyA..polyT). Single-allele only.
+    #[arg(long, default_value_t = 0, help_heading = "Coverage / consensus")]
+    homopolymer_min_run: usize,
+
+    /// Experimental homopolymer-aware gap costs, as OPEN,EXTEND (e.g. -2,-1):
+    /// used instead of --gap-open/--gap-extend for indels inside a homopolymer.
+    #[arg(long, value_name = "OPEN,EXTEND", value_parser = parse_gap_pair, allow_hyphen_values = true, help_heading = "Scoring")]
+    homopolymer_gap: Option<(i32, i32)>,
+
     // ── Flanking ────────────────────────────────────────────────────────────────
     /// Left flank sequence anchoring the repeat region (use with --right-flank).
     /// When both are set, the consensus is restricted to the segment BETWEEN the
@@ -286,6 +297,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         consensus_mode: args.consensus_mode.into(),
         warn_on_long_unbanded: !args.no_long_unbanded_warning,
         phasing_bubble_min_span: args.phasing_bubble_min_span,
+        homopolymer_min_run: args.homopolymer_min_run,
+        homopolymer_gap: args.homopolymer_gap,
     };
 
     // Diagnostic thresholds shared by both the single- and multi-allele paths.
@@ -488,4 +501,10 @@ fn first_byte<R: BufRead>(reader: &mut R) -> Result<Option<u8>, Box<dyn std::err
         }
         return Ok(Some(b));
     }
+}
+
+fn parse_gap_pair(s: &str) -> Result<(i32, i32), String> {
+    let (o, e) = s.split_once(',').ok_or("expected OPEN,EXTEND")?;
+    let p = |x: &str| x.trim().parse::<i32>().map_err(|e| e.to_string());
+    Ok((p(o)?, p(e)?))
 }

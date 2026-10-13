@@ -623,6 +623,8 @@ def run_consensus(extracted: Path, work: Path, scenario: Scenario) -> Optional[P
         [str(POA_BIN)] + band_args
         + (["--multi"] if scenario.multi else [])
         + scenario.poa_flags
+        # Extra CLI flags for experiments (e.g. POA_EXTRA_FLAGS="--homopolymer-min-run 4").
+        + os.environ.get("POA_EXTRA_FLAGS", "").split()
         + ["--min-reads", "2", str(extracted)]
     )
     try:

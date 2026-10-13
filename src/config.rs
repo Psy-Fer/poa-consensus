@@ -59,6 +59,20 @@ pub struct PoaConfig {
     /// for cross-bubble phasing. Bubbles below this threshold (SNPs, short indels)
     /// use the existing single-bubble partitioning. Default 10.
     pub phasing_bubble_min_span: usize,
+    /// Homopolymer compression (experimental). `0` = off. Otherwise runs of
+    /// `>= homopolymer_min_run` identical bases are aligned as one "poly"
+    /// symbol and their lengths re-estimated (median) after consensus; `1` is
+    /// pure homopolymer compression, `2` the `A,C,G,T,polyA..polyT` alphabet.
+    /// Single-allele `consensus` only.
+    pub homopolymer_min_run: usize,
+    /// Homopolymer-aware gap costs (experimental). `None` = off. `Some((open,
+    /// extend))` replaces `gap_open`/`gap_extend` for an indel inside a
+    /// homopolymer context: an inserted read base equal to a read neighbour or
+    /// to the node it follows, or a deleted node whose base equals an adjacent
+    /// read base. Cheap enough values (e.g. `(-2, -1)`) make a base shifted
+    /// within a run align as indels rather than a mismatch pair. Single-allele
+    /// `consensus` only, guarded like `homopolymer_min_run`.
+    pub homopolymer_gap: Option<(i32, i32)>,
 }
 
 impl Default for PoaConfig {
@@ -86,6 +100,8 @@ impl Default for PoaConfig {
             consensus_mode: ConsensusMode::BestFit,
             warn_on_long_unbanded: true,
             phasing_bubble_min_span: 10,
+            homopolymer_min_run: 0,
+            homopolymer_gap: None,
         }
     }
 }
