@@ -194,13 +194,18 @@ def catalog_allele(motif: str, truth_len: int) -> str:
 
 def bam_callers(reads_fq: Path, left: str, right: str, ref_allele: str, motif: str,
                 work: Path, preset: str) -> dict:
-    """Align `reads_fq` to left+ref_allele+right and run TRGT / LongTR on it."""
+    """Align `reads_fq` to left+ref_allele+right and run TRGT / LongTR on it.
+
+    Each call is the VCF allele spliced into the catalog reference by its
+    coordinates, with SPLICE_FLANK bp of flank kept on each side, so it can be
+    scored against a flanked truth (VCF alleles may carry padding bases)."""
     res = {"TRGT": None, "LongTR": None}
     if not (TRGT_BIN or LONGTR_BIN):
         return res
     work.mkdir(parents=True, exist_ok=True)
     ref = work / "catalog_ref.fa"
-    ref.write_text(f">locus\n{left}{ref_allele}{right}\n")
+    full = f"{left}{ref_allele}{right}"
+    ref.write_text(f">locus\n{full}\n")
     _run(["samtools", "faidx", ref])
     start, end = len(left), len(left) + len(ref_allele)
     mm = _run(["minimap2", "-ax", preset, "-y", "-R", r"@RG\tID:sim\tSM:sim\tLB:sim", ref, reads_fq])
@@ -218,7 +223,7 @@ def bam_callers(reads_fq: Path, left: str, right: str, ref_allele: str, motif: s
         (work / "trgt.log").write_bytes(p.stdout + p.stderr)
         vcf = Path(f"{prefix}.vcf.gz")
         if p.returncode == 0 and vcf.exists():
-            res["TRGT"] = _vcf_allele(vcf)
+            res["TRGT"] = _splice(full, start, end, _vcf_allele(vcf))
 
     if LONGTR_BIN:
         bed = work / "longtr.bed"
@@ -230,12 +235,24 @@ def bam_callers(reads_fq: Path, left: str, right: str, ref_allele: str, motif: s
                   "--min-mean-qual", "0", "--min-reads", "3"])
         (work / "longtr.log").write_bytes(p.stdout + p.stderr)
         if p.returncode == 0 and vcf.exists():
-            res["LongTR"] = _vcf_allele(vcf)
+            res["LongTR"] = _splice(full, start, end, _vcf_allele(vcf))
     return res
 
 
-def _vcf_allele(vcf: Path) -> Optional[bytes]:
-    """First called allele of the first record (REF/ALT chosen by GT)."""
+SPLICE_FLANK = 50
+
+
+def _splice(full: str, start: int, end: int, call) -> Optional[bytes]:
+    if not call:
+        return None
+    pos, ref, allele = call
+    out = full[:pos] + allele + full[pos + len(ref):]
+    return out[max(0, start - SPLICE_FLANK):end + SPLICE_FLANK + len(out) - len(full)].encode()
+
+
+def _vcf_allele(vcf: Path) -> Optional[tuple[int, str, str]]:
+    """(0-based POS, REF, called allele) of the first record; the allele is
+    REF/ALT chosen by the first GT index."""
     p = _run(["bash", "-c", f"gzip -dc {vcf} 2>/dev/null || cat {vcf}"])
     for line in p.stdout.decode().splitlines():
         if line.startswith("#") or not line.strip():
@@ -251,5 +268,5 @@ def _vcf_allele(vcf: Path) -> Optional[bytes]:
             return None
         k = int(idx)
         allele = ref if k == 0 else alts[k - 1] if k - 1 < len(alts) else None
-        return allele.encode() if allele else None
+        return (int(f[1]) - 1, ref, allele) if allele else None
     return None
