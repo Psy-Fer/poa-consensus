@@ -798,27 +798,48 @@ impl Poa {
     }
 
     /// Fit score for a candidate consensus: build a throwaway graph seeded on
-    /// `candidate`, align every read to it, and return the mean per-base total of
-    /// Insert + Delete ops (content the candidate doesn't explain / doesn't
-    /// confirm). Lower = better fit; 0.0 = every read matches exactly. Used to
-    /// pick between heaviest-path and majority-frequency candidates per call.
+    /// `candidate`, align every read to it, and return the mean per-base affine
+    /// indel penalty: each Insert/Delete event pays `|gap_open|`, each indel
+    /// base `|gap_extend|` (content the candidate doesn't explain / doesn't
+    /// confirm). Mismatches are not counted: on noisy reads they are mostly
+    /// read error, and counting them let a frame-broken majority candidate win
+    /// on ONT CAG50. Lower = better fit; 0.0 = no read needs an indel. Used to
+    /// pick between heaviest-path and majority-frequency candidates.
+    ///
+    /// Counting indel *bases* alone (the earlier metric) rewards a candidate
+    /// halfway between two repeat lengths: in a (CA)n locus where reads say 19
+    /// and 20 units, a frame-broken `(CA)19 C` is one base from every read, so
+    /// it beat both real lengths. Charging an open per event makes a one-base
+    /// frame break cost the same per read as a whole-unit difference, so the
+    /// in-frame candidate wins.
     fn fit_score(candidate: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> f64 {
         if candidate.is_empty() {
             return f64::MAX;
         }
         let g = Poa::new(candidate, cfg.clone());
         let (topo, rank) = g.topo_order();
-        let mut indel = 0usize;
+        let (open, extend) = (
+            cfg.gap_open.unsigned_abs() as u64,
+            cfg.gap_extend.unsigned_abs() as u64,
+        );
+        let mut penalty = 0u64;
         let mut bases = 0usize;
         for r in reads {
+            let mut prev = 0u8; // 0 = match, 1 = insert, 2 = delete
             for op in g.align(r, &topo, &rank) {
-                if matches!(op, Op::Ins(_) | Op::Del(_)) {
-                    indel += 1;
+                let kind = match op {
+                    Op::Match(_) => 0,
+                    Op::Ins(_) => 1,
+                    Op::Del(_) => 2,
+                };
+                if kind != 0 {
+                    penalty += extend + if kind != prev { open } else { 0 };
                 }
+                prev = kind;
             }
             bases += r.len();
         }
-        indel as f64 / bases.max(1) as f64
+        penalty as f64 / bases.max(1) as f64
     }
 
     /// Best of heaviest-path and majority-frequency, chosen by `fit_score`
@@ -1007,13 +1028,20 @@ impl Poa {
     /// of reads present at that column). Falls back to heaviest-path (with its
     /// path coverage) if the column DAG is unusable.
     fn consensus_majority_cov(&self) -> (Vec<u8>, Vec<u32>) {
+        let (seq, cov, _) = self.consensus_majority_cols();
+        (seq, cov)
+    }
+
+    /// `consensus_majority_cov` plus the MSA column of each emitted base
+    /// (`None` when it fell back to the heaviest path).
+    fn consensus_majority_cols(&self) -> (Vec<u8>, Vec<u32>, Option<Vec<usize>>) {
         let (node_col, ncol) = match self.msa_columns() {
             Some(x) => x,
             None => {
                 let path = self.heaviest_path_nodes();
                 let seq = path.iter().map(|&nd| self.nodes[nd].base).collect();
                 let cov = path.iter().map(|&nd| self.nodes[nd].cov).collect();
-                return (seq, cov);
+                return (seq, cov, None);
             }
         };
         // Per-column symbol tallies (A,C,G,T, then the homopolymer-compressed
@@ -1081,6 +1109,7 @@ impl Poa {
         ];
         let mut out = Vec::with_capacity(ncol);
         let mut cov = Vec::with_capacity(ncol);
+        let mut cols = Vec::with_capacity(ncol);
         // A column is emitted only if a majority of the whole read set REACHES it
         // (`covering >= floor`) AND its plurality base beats genuine deletions
         // among the reads that span it (`bc > gap`). The `covering` floor keeps
@@ -1099,9 +1128,42 @@ impl Poa {
             if bc > gap && covering[c] >= floor {
                 out.push(bases[bi]);
                 cov.push(bc); // reads supporting the emitted base at this column
+                cols.push(c);
             }
         }
-        (out, cov)
+        (out, cov, Some(cols))
+    }
+
+    /// For a consensus `cons` of this graph (its heaviest path or its
+    /// majority-frequency sequence): the MSA column of every node, and the
+    /// column of every consensus position. `None` if `cons` is neither or the
+    /// column DAG is unusable.
+    pub(crate) fn consensus_columns(&self, cons: &[u8]) -> Option<(Vec<usize>, Vec<usize>)> {
+        let (node_col, _) = self.msa_columns()?;
+        let path = self.heaviest_path_nodes();
+        if path.len() == cons.len()
+            && path
+                .iter()
+                .zip(cons)
+                .all(|(&n, &b)| self.nodes[n].base == b)
+        {
+            let pos_col = path.iter().map(|&n| node_col[n]).collect();
+            return Some((node_col, pos_col));
+        }
+        let (mf, _, cols) = self.consensus_majority_cols();
+        if mf == cons {
+            return Some((node_col, cols?));
+        }
+        None
+    }
+
+    /// Occupied nodes per read, in insertion order (seed first).
+    pub(crate) fn read_paths(&self) -> &[Vec<usize>] {
+        &self.read_paths
+    }
+
+    pub(crate) fn node_base(&self, n: usize) -> u8 {
+        self.nodes[n].base
     }
 
     /// Materialise an arm from `start` until the first reconvergence (2+ in-edges)
@@ -1783,6 +1845,54 @@ mod tests_mismatch {
             "expected majority C at pos4, got {}",
             String::from_utf8_lossy(&cons)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_best_fit_frame {
+    use super::*;
+
+    /// ONT (CA)20 reads from bladerunner / str-replicant (synthetic): four
+    /// exact, three one CA short, the median-length seed (r4) missing one A.
+    /// Majority-frequency splits the column vote where the short reads place
+    /// their deletion and emits a frame-broken `(CA)19 C`; an indel-*bases*
+    /// fit score preferred it (one base from every read). The heaviest path is
+    /// right, and BestFit must keep it in every read order.
+    const READS: [&[u8]; 10] = [
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACCACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACCACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTCACACACACACACACACAACACACACACACACACACACAGGATCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCAGG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+    ];
+    const TRUTH: &[u8] =
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG";
+
+    #[test]
+    fn best_fit_rejects_frame_broken_majority_in_every_order() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for trial in 0..50 {
+            let mut order: Vec<usize> = (0..READS.len()).collect();
+            for i in (1..order.len()).rev() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                order.swap(i, (state % (i as u64 + 1)) as usize);
+            }
+            let reads: Vec<&[u8]> = order.iter().map(|&i| READS[i]).collect();
+            let c = crate::consensus(&reads, 0, &PoaConfig::default()).unwrap();
+            assert_eq!(
+                c.sequence,
+                TRUTH,
+                "trial {trial} order {order:?}: got {}",
+                String::from_utf8_lossy(&c.sequence)
+            );
+        }
     }
 }
 

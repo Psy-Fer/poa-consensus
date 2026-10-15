@@ -54,9 +54,12 @@ POA_MODES = [
     ("poa", []),
     ("poa:gap", ["--homopolymer-gap=-2,-1"]),
     ("poa:hpc2g", ["--homopolymer-min-run", "2", "--homopolymer-gap=-2,-1"]),
+    ("hpc2", ["--homopolymer-min-run", "2"]),
 ]
-CALLERS = ([m for m, _ in POA_MODES] + ["abPOA", "SPOA", "POASTA"]
-           + ["MAFFT", "Kalign", "medoid", "pileup"])
+# --poa-only: skip the external callers (set via env so pool workers see it).
+POA_ONLY = os.environ.get("POA_ONLY") == "1"
+CALLERS = [m for m, _ in POA_MODES] + ([] if POA_ONLY else
+           ["abPOA", "SPOA", "POASTA", "MAFFT", "Kalign", "medoid", "pileup"])
 # pbsim modes only: need a BAM (TRGT, LongTR) or real-length reads (hifiasm).
 BAM_CALLERS = ["hifiasm", "TRGT", "LongTR"]
 
@@ -120,6 +123,8 @@ def run_all(fa: Path, seqs: list[bytes], work: Path, preset: str = "map-ont") ->
         cmd = [str(v.POA_BIN), "--band-width", "50", "--min-reads", "2", *flags, str(fa)]
         p = subprocess.run(cmd, capture_output=True)
         res[name] = first_fasta_seq(p.stdout) if p.returncode == 0 else None
+    if POA_ONLY:
+        return res
     res["abPOA"] = cc.run_abpoa(seqs)
     res["SPOA"] = cc.run_spoa(seqs)
     p = subprocess.run(["poasta", "align", "-O", "fasta", str(fa)], capture_output=True)
@@ -774,9 +779,13 @@ def main():
                     help="HiFi (str-replicant) with somatic mosaicism / an expanded subclone")
     ap.add_argument("--conditions", nargs="*", help="--mosaic: subset of condition labels")
     ap.add_argument("--loci", nargs="*")
+    ap.add_argument("--poa-only", action="store_true",
+                    help="only the poa-consensus modes (re-exec with POA_ONLY=1)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--workdir", default="bench/work_homopolymer")
     args = ap.parse_args()
+    if args.poa_only and not POA_ONLY:
+        os.execve(sys.executable, [sys.executable] + sys.argv, {**os.environ, "POA_ONLY": "1"})
     if not v.POA_BIN.exists():
         sys.exit(f"build the CLI first: cargo build --release --features cli ({v.POA_BIN})")
     print("loci:")

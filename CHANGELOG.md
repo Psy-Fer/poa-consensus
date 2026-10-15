@@ -7,6 +7,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **`BestFit` no longer picks a frame-broken majority consensus in dinucleotide repeats.**
+  On ONT `(CA)n` reads with real 19/20-unit length noise, the majority-frequency candidate
+  could split its column vote and emit `(CA)19` plus a stray base. The best-fit selector
+  scored candidates by indel *bases*, which a halfway length minimises, so it chose that
+  candidate over a correct heaviest path. The 1 bp change surfaced in bladerunner as a
+  spurious interruption. The fit score now charges each indel event a gap open plus a
+  per-base extend (the configured affine costs), so the in-frame candidate wins.
+  Behaviour change: `consensus` output can differ wherever the two candidates disagreed.
+  `validate.py` 20/20 and `compare_callers.py` 16/16 are unchanged.
+
+---
+
 ## [0.6.0] - 2026-07-31
 
 Correctness, safety-default, API, and documentation pass following a full deep-dive
