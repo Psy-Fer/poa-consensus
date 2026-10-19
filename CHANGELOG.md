@@ -21,6 +21,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Behaviour change: `consensus` output can differ wherever the two candidates disagreed.
   `validate.py` 20/20 and `compare_callers.py` 16/16 are unchanged.
 
+### Performance
+
+- **The alignment DP is 2.5-4x faster and uses up to 2.8x less peak memory, with
+  byte-identical output.** The fill now loops predecessor-outer / column-inner, taking a
+  running max over each predecessor's band slice instead of three bounds-checked lookups
+  per cell. Match/delete cells are computed in a branch-free pass, and only the insert
+  recurrence runs sequentially along the row. Backpointers are no longer stored: traceback
+  replays the fill's comparisons in the same order, so ties resolve exactly as before. That
+  cuts writes from 28 to 12 bytes per DP cell. The banded matrices are also reused across
+  reads instead of regrowing per read. Measured CPU per call (median, before -> after):
+  HG002 ONT 151 loci 11 -> 5 ms; simulated suites 58 -> 18 ms; MUC1 haplotypes
+  780 -> 226 ms. With homopolymer compression and gap costs on, the corresponding medians
+  are 28 -> 10, 176 -> 51 and 2025 -> 551 ms. Output was identical on all 251 HG002 /
+  simulated / MUC1 read sets and the 14 multi-kb long-tier sets, in both modes.
+
 ---
 
 ## [0.6.0] - 2026-07-31

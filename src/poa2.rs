@@ -24,6 +24,7 @@
 //! then real-data validation vs abPOA; then two-piece convex gaps and SIMD.
 
 use crate::config::{AlignmentMode, PoaConfig};
+use std::cell::Cell;
 use std::collections::HashMap;
 
 /// Internal per-phase profiling (topo / align / integrate), gated behind the
@@ -190,6 +191,17 @@ pub struct Poa {
     /// `Edge.weight` (which folds in delete-bypass traffic and would make a
     /// length variant's short-allele bypass look like a competing arm).
     read_matched_edges: Vec<Vec<(usize, usize)>>,
+    /// `align`'s banded M/I/D matrices, kept between calls so their capacity
+    /// is reused: the band is wider than its estimate wherever the adaptive
+    /// and static diagonals diverge, and regrowing per read was ~9% of runtime.
+    align_bufs: Cell<AlignBufs>,
+}
+
+#[derive(Default)]
+struct AlignBufs {
+    m: Vec<i32>,
+    i: Vec<i32>,
+    d: Vec<i32>,
 }
 
 impl Poa {
@@ -225,6 +237,7 @@ impl Poa {
             read_lens: vec![seed.len()],
             read_paths: vec![seed_path],
             read_matched_edges: vec![seed_medges],
+            align_bufs: Cell::default(),
         }
     }
 
@@ -295,14 +308,24 @@ impl Poa {
         } else {
             Vec::new()
         };
-        let ins_cost = |j: usize| match hp {
-            Some(c) if ins_run[j] => c,
-            _ => (go, ge),
-        };
+        // Per-column insert costs, and the read padded by one sentinel on each
+        // side (`rpad[j] = read[j-1]`, outside 1..=l a value no u8 base equals)
+        // so the fill's delete-cost test needs no bounds checks.
+        let icost: Vec<(i32, i32)> = ins_run
+            .iter()
+            .map(|&run| match hp {
+                Some(c) if run => c,
+                _ => (go, ge),
+            })
+            .collect();
+        let ins_cost = |j: usize| icost[j];
+        const NO_BASE: u16 = 0x100;
+        let rpad: Vec<u16> = std::iter::once(NO_BASE)
+            .chain(read.iter().map(|&b| b as u16))
+            .chain(std::iter::once(NO_BASE))
+            .collect();
         let del_cost = |t: usize, j: usize, b: u8| match hp {
-            Some(c) if node_run[t] && ((j >= 1 && read[j - 1] == b) || (j < l && read[j] == b)) => {
-                c
-            }
+            Some(c) if node_run[t] && (rpad[j] == b as u16 || rpad[j + 1] == b as u16) => c,
             _ => (go, ge),
         };
 
@@ -349,24 +372,30 @@ impl Poa {
         } else {
             n * (l + 1)
         };
-        let mut mflat: Vec<i32> = Vec::with_capacity(cap);
-        let mut iflat: Vec<i32> = Vec::with_capacity(cap);
-        let mut dflat: Vec<i32> = Vec::with_capacity(cap);
-        let mut mbk: Vec<(u8, u32)> = Vec::with_capacity(cap);
-        let mut dbk: Vec<(u8, u32)> = Vec::with_capacity(cap);
+        let AlignBufs {
+            m: mut mflat,
+            i: mut iflat,
+            d: mut dflat,
+        } = self.align_bufs.take();
+        for v in [&mut mflat, &mut iflat, &mut dflat] {
+            v.clear();
+            v.reserve(cap);
+        }
         let mut d0 = vec![NEG_INF; n];
         let mut d0bk = vec![(0u8, VSTART); n];
         let mut best_j = vec![1usize; n]; // per-rank winning column (adaptive center)
 
-        // Per-row DP scratch, reused across nodes (cleared + resized to each row's
-        // `width` below). Hoisted out of the loop so the hot path does not allocate
-        // 5 Vecs per node — the dominant allocation churn (see the `profile` phase
-        // attribution: `align` is ~96% of build time).
-        let mut mrow: Vec<i32> = Vec::new();
-        let mut irow: Vec<i32> = Vec::new();
-        let mut drow: Vec<i32> = Vec::new();
-        let mut mbrow: Vec<(u8, u32)> = Vec::new();
-        let mut dbrow: Vec<(u8, u32)> = Vec::new();
+        // Per-row accumulators over the predecessors, reused across nodes:
+        // `macc[k]` = max of a predecessor's M/I/D at column j-1 (feeds M[j]),
+        // `oacc[k]` = max of its M/I at j (D gap-open), `eacc[k]` = max of its
+        // D at j (D extend). Every stored cell is exactly NEG_INF or a real
+        // score, so a raw max is NEG_INF iff no predecessor reaches the cell,
+        // and adding the cell's (shared) cost afterwards gives the same value
+        // as the per-candidate comparison. Predecessor-outer / column-inner
+        // keeps these loops branch-free over contiguous slices.
+        let mut macc: Vec<i32> = Vec::new();
+        let mut oacc: Vec<i32> = Vec::new();
+        let mut eacc: Vec<i32> = Vec::new();
 
         for &t in topo.iter() {
             let r = rank_of[t];
@@ -421,100 +450,170 @@ impl Poa {
                 d0bk[r] = bk;
             }
 
-            mrow.clear();
-            mrow.resize(width, NEG_INF);
-            irow.clear();
-            irow.resize(width, NEG_INF);
-            drow.clear();
-            drow.resize(width, NEG_INF);
-            mbrow.clear();
-            mbrow.resize(width, (0u8, VSTART));
-            dbrow.clear();
-            dbrow.resize(width, (0u8, VSTART));
-            let mut row_best = NEG_INF;
-            let mut row_best_j = best_j[r];
-
-            for j in lo..=hi {
-                let k = j - lo;
-                // ---- M[t][j] ----
-                let sc = if base == read[j - 1] { mm } else { mis };
-                let mut best = NEG_INF;
-                let mut bk = (0u8, VSTART);
-                if (is_source || semi) && j == 1 && sc > best {
-                    // free start: read[0] begins the alignment here
-                    best = sc;
-                    bk = (0, VSTART);
+            macc.clear();
+            macc.resize(width, NEG_INF);
+            oacc.clear();
+            oacc.resize(width, NEG_INF);
+            eacc.clear();
+            eacc.resize(width, NEG_INF);
+            for &p in &self.nodes[t].inc {
+                let pr = rank_of[p];
+                let (plo, phi, po) = (lo_[pr], hi_[pr], off[pr]);
+                let pw = phi + 1 - plo;
+                let (pm, pi, pd) = (
+                    &mflat[po..po + pw],
+                    &iflat[po..po + pw],
+                    &dflat[po..po + pw],
+                );
+                // M[j] reads the predecessor at j-1; j-1 = 0 is the D0 column.
+                if lo == 1 {
+                    macc[0] = macc[0].max(d0[pr]);
                 }
-                for &p in &self.nodes[t].inc {
-                    let pr = rank_of[p];
-                    let vm = bget(&mflat, &off, &lo_, &hi_, pr, j - 1);
-                    let vi = bget(&iflat, &off, &lo_, &hi_, pr, j - 1);
-                    let vd = bgetd(&dflat, &d0, &off, &lo_, &hi_, pr, j - 1);
-                    for (st, v) in [(0u8, vm), (1u8, vi), (2u8, vd)] {
-                        if v != NEG_INF && v + sc > best {
-                            best = v + sc;
-                            bk = (st, pr as u32);
-                        }
+                let (a, b) = (lo.max(plo + 1), hi.min(phi + 1));
+                if a <= b {
+                    let (k0, p0, len) = (a - lo, a - 1 - plo, b + 1 - a);
+                    let acc = &mut macc[k0..k0 + len];
+                    let src = pm[p0..p0 + len]
+                        .iter()
+                        .zip(&pi[p0..p0 + len])
+                        .zip(&pd[p0..p0 + len]);
+                    for (x, ((&m, &i), &d)) in acc.iter_mut().zip(src) {
+                        *x = (*x).max(m.max(i).max(d));
                     }
                 }
-                mrow[k] = best;
-                mbrow[k] = bk;
-                // ---- I[t][j] ---- (read base inserted; same row, j-1) ----
-                {
-                    let (mo, io) = if j > lo {
-                        (mrow[k - 1], irow[k - 1])
-                    } else {
-                        (NEG_INF, NEG_INF)
-                    };
-                    let (igo, ige) = ins_cost(j);
-                    let mut best = NEG_INF;
-                    if mo != NEG_INF {
-                        best = mo + igo + ige;
+                // D[j] reads the predecessor at the same j.
+                let (a, b) = (lo.max(plo), hi.min(phi));
+                if a <= b {
+                    let (k0, p0, len) = (a - lo, a - plo, b + 1 - a);
+                    let open = oacc[k0..k0 + len]
+                        .iter_mut()
+                        .zip(pm[p0..p0 + len].iter().zip(&pi[p0..p0 + len]));
+                    for (x, (&m, &i)) in open {
+                        *x = (*x).max(m.max(i));
                     }
-                    if io != NEG_INF && io + ige > best {
-                        best = io + ige;
+                    for (x, &d) in eacc[k0..k0 + len].iter_mut().zip(&pd[p0..p0 + len]) {
+                        *x = (*x).max(d);
                     }
-                    irow[k] = best;
-                }
-                // ---- D[t][j] ---- (node t skipped; predecessors at same j) ----
-                {
-                    let (dgo, dge) = del_cost(t, j, base);
-                    let mut best = NEG_INF;
-                    let mut bk = (0u8, VSTART);
-                    for &p in &self.nodes[t].inc {
-                        let pr = rank_of[p];
-                        let mo = bget(&mflat, &off, &lo_, &hi_, pr, j);
-                        let io = bget(&iflat, &off, &lo_, &hi_, pr, j);
-                        let de = bgetd(&dflat, &d0, &off, &lo_, &hi_, pr, j);
-                        if mo != NEG_INF && mo + dgo + dge > best {
-                            best = mo + dgo + dge;
-                            bk = (0, pr as u32);
-                        }
-                        if io != NEG_INF && io + dgo + dge > best {
-                            best = io + dgo + dge;
-                            bk = (1, pr as u32);
-                        }
-                        if de != NEG_INF && de + dge > best {
-                            best = de + dge;
-                            bk = (2, pr as u32);
-                        }
-                    }
-                    drow[k] = best;
-                    dbrow[k] = bk;
-                }
-                let cell = mrow[k].max(irow[k]).max(drow[k]);
-                if cell != NEG_INF && cell > row_best {
-                    row_best = cell;
-                    row_best_j = j;
                 }
             }
+
+            // ---- M[t][j] and D[t][j] ---- No dependency along the row, so this
+            // pass is branch-free (selects only) and vectorises.
+            let o = mflat.len();
+            mflat.resize(o + width, NEG_INF);
+            iflat.resize(o + width, NEG_INF);
+            dflat.resize(o + width, NEG_INF);
+            let (mrow, irow, drow) = (&mut mflat[o..], &mut iflat[o..], &mut dflat[o..]);
+            // Delete costs: homopolymer-priced where t is in a graph run and the
+            // read has t's base adjacent to column j (see `del_cost`).
+            let hp_row = hp.filter(|_| node_run[t]);
+            let (hgo, hge) = hp_row.unwrap_or((go, ge));
+            let bb = base as u16;
+            let cols = rpad[lo..=hi].iter().zip(&rpad[lo + 1..=hi + 1]);
+            let accs = macc.iter().zip(oacc.iter().zip(&eacc));
+            let outs = mrow.iter_mut().zip(drow.iter_mut());
+            for (((m, d), (&ma, (&oa, &ea))), (&rb, &rn)) in outs.zip(accs).zip(cols) {
+                let sc = if rb == bb { mm } else { mis };
+                *m = if ma == NEG_INF { NEG_INF } else { ma + sc };
+                let in_run = hp_row.is_some() && (rb == bb || rn == bb);
+                let (dgo, dge) = if in_run { (hgo, hge) } else { (go, ge) };
+                let d_open = if oa == NEG_INF {
+                    NEG_INF
+                } else {
+                    oa + dgo + dge
+                };
+                let d_ext = if ea == NEG_INF { NEG_INF } else { ea + dge };
+                *d = d_open.max(d_ext);
+            }
+            if (is_source || semi) && lo == 1 {
+                // free start: read[0] begins the alignment here
+                let sc = if base == read[0] { mm } else { mis };
+                mrow[0] = mrow[0].max(sc);
+            }
+
+            // ---- I[t][j] ---- (read base inserted; same row, j-1) and the
+            // row's best column. Sequential along the row.
+            let mut row_best = NEG_INF;
+            let mut row_best_j = best_j[r];
+            let (mut m_prev, mut i_prev) = (NEG_INF, NEG_INF);
+            for (k, (&(igo, ige), (&m, (ins_out, &d)))) in icost[lo..=hi]
+                .iter()
+                .zip(mrow.iter().zip(irow.iter_mut().zip(drow.iter())))
+                .enumerate()
+            {
+                let i_open = if m_prev == NEG_INF {
+                    NEG_INF
+                } else {
+                    m_prev + igo + ige
+                };
+                let i_ext = if i_prev == NEG_INF {
+                    NEG_INF
+                } else {
+                    i_prev + ige
+                };
+                let ins = i_open.max(i_ext);
+                *ins_out = ins;
+                let cell = m.max(ins).max(d);
+                if cell != NEG_INF && cell > row_best {
+                    row_best = cell;
+                    row_best_j = lo + k;
+                }
+                (m_prev, i_prev) = (m, ins);
+            }
             best_j[r] = row_best_j;
-            mflat.extend_from_slice(&mrow);
-            iflat.extend_from_slice(&irow);
-            dflat.extend_from_slice(&drow);
-            mbk.extend_from_slice(&mbrow);
-            dbk.extend_from_slice(&dbrow);
         }
+
+        // Backpointers are not stored during the fill: traceback re-derives the
+        // winning predecessor of an M / D cell by replaying the fill's
+        // comparisons in the same order (free start, then each predecessor's
+        // M, I, D, strict `>`), so ties resolve exactly as a per-cell record
+        // would. This is O(in-degree) per traceback step instead of 16 bytes
+        // written per DP cell.
+        let m_back = |r: usize, j: usize| -> (u8, u32) {
+            let t = topo[r];
+            let sc = if self.nodes[t].base == read[j - 1] {
+                mm
+            } else {
+                mis
+            };
+            let mut best = NEG_INF;
+            let mut bk = (0u8, VSTART);
+            if (self.nodes[t].inc.is_empty() || semi) && j == 1 {
+                best = sc;
+            }
+            for &p in &self.nodes[t].inc {
+                let pr = rank_of[p];
+                let vm = bget(&mflat, &off, &lo_, &hi_, pr, j - 1);
+                let vi = bget(&iflat, &off, &lo_, &hi_, pr, j - 1);
+                let vd = bgetd(&dflat, &d0, &off, &lo_, &hi_, pr, j - 1);
+                for (st, v) in [(0u8, vm), (1u8, vi), (2u8, vd)] {
+                    if v != NEG_INF && v + sc > best {
+                        best = v + sc;
+                        bk = (st, pr as u32);
+                    }
+                }
+            }
+            bk
+        };
+        let d_back = |r: usize, j: usize| -> (u8, u32) {
+            let t = topo[r];
+            let (dgo, dge) = del_cost(t, j, self.nodes[t].base);
+            let mut best = NEG_INF;
+            let mut bk = (0u8, VSTART);
+            for &p in &self.nodes[t].inc {
+                let pr = rank_of[p];
+                let mo = bget(&mflat, &off, &lo_, &hi_, pr, j);
+                let io = bget(&iflat, &off, &lo_, &hi_, pr, j);
+                let de = bgetd(&dflat, &d0, &off, &lo_, &hi_, pr, j);
+                for (st, v, c) in [(0u8, mo, dgo + dge), (1u8, io, dgo + dge), (2u8, de, dge)] {
+                    if v != NEG_INF && v + c > best {
+                        best = v + c;
+                        bk = (st, pr as u32);
+                    }
+                }
+            }
+            bk
+        };
 
         // Terminal (read fully consumed at j=l). Global: end at a sink; semi:
         // end at ANY node (free trailing graph gap).
@@ -546,7 +645,7 @@ impl Poa {
             match state {
                 0 => {
                     ops.push(Op::Match(t));
-                    let (pst, pr) = mbk[off[r] + (j - lo_[r])];
+                    let (pst, pr) = m_back(r, j);
                     j -= 1;
                     state = pst;
                     rr = pr;
@@ -573,11 +672,7 @@ impl Poa {
                 }
                 _ => {
                     ops.push(Op::Del(t));
-                    let (pst, pr) = if j == 0 {
-                        d0bk[r]
-                    } else {
-                        dbk[off[r] + (j - lo_[r])]
-                    };
+                    let (pst, pr) = if j == 0 { d0bk[r] } else { d_back(r, j) };
                     state = pst;
                     rr = pr;
                 }
@@ -590,6 +685,11 @@ impl Poa {
                 break;
             }
         }
+        self.align_bufs.set(AlignBufs {
+            m: mflat,
+            i: iflat,
+            d: dflat,
+        });
         ops.reverse();
         ops
     }
