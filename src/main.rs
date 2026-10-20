@@ -154,6 +154,14 @@ struct Args {
     #[arg(long, value_name = "OPEN,EXTEND", default_value = "-2,-1", value_parser = parse_hp_gap, allow_hyphen_values = true, help_heading = "Scoring")]
     homopolymer_gap: HpGap,
 
+    /// Tandem-repeat gap costs, as OPEN,EXTEND ("off" to disable): an indel
+    /// that copies its neighbouring 2-6 base unit in a locally periodic part
+    /// of a read costs this instead of --gap-open/--gap-extend. Builds a
+    /// candidate only where the plain call is weakly supported, kept only if
+    /// it fits the reads better. Single-allele only.
+    #[arg(long, value_name = "OPEN,EXTEND", default_value = "-2,-1", value_parser = parse_hp_gap, allow_hyphen_values = true, help_heading = "Scoring")]
+    tandem_gap: HpGap,
+
     /// Disable homopolymer handling entirely (same as --homopolymer-min-run 0
     /// --homopolymer-gap off): the plain engine consensus only.
     #[arg(long, help_heading = "Coverage / consensus")]
@@ -327,6 +335,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             args.homopolymer_gap.0
         },
+        tandem_gap: args.tandem_gap.0,
     };
 
     // Diagnostic thresholds shared by both the single- and multi-allele paths.
@@ -571,7 +580,7 @@ fn first_byte<R: BufRead>(reader: &mut R) -> Result<Option<u8>, Box<dyn std::err
     }
 }
 
-/// `--homopolymer-gap` value: `OPEN,EXTEND`, or `off`.
+/// `--homopolymer-gap` / `--tandem-gap` value: `OPEN,EXTEND`, or `off`.
 #[derive(Clone, Copy, Debug)]
 struct HpGap(Option<(i32, i32)>);
 

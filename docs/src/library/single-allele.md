@@ -111,7 +111,8 @@ Cost is about 2.4x the plain engine's CPU time (the plain engine is itself 2.5-4
 than in v0.6.0, so the default is still faster than v0.6.0 was). It matters mainly on noisy
 reads (ONT); on clean HiFi it rarely changes anything. Turn it off to save CPU on clean
 HiFi data, or to get the plain engine's call (CLI: `--no-homopolymer`, or
-`--homopolymer-gap off` to drop only the gap costs):
+`--homopolymer-gap off` to drop only the gap costs). See also
+[When to turn these off](#when-to-turn-these-off):
 
 ```rust
 use poa_consensus::{consensus, PoaConfig};
@@ -122,6 +123,66 @@ let config = PoaConfig {
     ..PoaConfig::default()
 };
 let result = consensus(&reads, 0, &config)?;
+```
+
+## Repeat-unit slips (tandem gap costs)
+
+Inside a tandem repeat the commonest real difference between reads is one more or one
+fewer copy of the unit: polymerase slippage, and sequencing stutter. Plain affine gap
+costs price that like any other indel, so reads reach for alignments that only look
+cheaper. A read whose extra length is really a `CT` unit in a `(CT)n` flank can slide
+across the boundary into a neighbouring `(CA)n` repeat with two mismatches and pass
+through an extra `CA` node another read created, because matching an existing node is
+free. If enough reads do that, the heaviest path carries a wrong extra unit, and whether
+it happens depends on read order.
+
+`tandem_gap` (default `Some((-2, -1))`) makes the honest alignment cheap: an indel that
+copies its neighbour in a locally periodic stretch of the read (a 2-6 base unit
+immediately followed by a copy of itself) pays these costs instead of `gap_open` /
+`gap_extend`. The test is local to each alignment step; no repeat tract or unit count is
+identified, and nothing about repeats is reported.
+
+Like homopolymer handling it only builds a candidate. The candidate replaces the plain
+call only if it fits the reads strictly better, and it is built only when the plain call
+has a base with [support quality](diagnostics.md#per-base-support-quality) below 10
+(somewhere the reads disagree), so clean loci cost nothing extra. The guard matters:
+applied unguarded, the same costs pull a genuine length split toward the shorter
+length. Like the homopolymer options it applies to `consensus`, `consensus_flanked` and
+`bridged_consensus`; `consensus_multi` ignores it.
+
+## When to turn these off
+
+The defaults give more correct calls overall, so leave them on unless one of these
+applies:
+
+- **Reproducing a plain POA call.** For a like-for-like comparison with another POA tool,
+  or with earlier poa-consensus output, turn all three off (`homopolymer_min_run: 0`,
+  `homopolymer_gap: None`, `tandem_gap: None`; CLI `--no-homopolymer --tandem-gap off`).
+  Earlier versions also differ in the best-fit rule, so v0.6.0 output is not reproduced
+  exactly.
+- **Speed on clean data.** Homopolymer handling costs about 2.4x the plain engine's CPU on
+  every call. On HiFi reads it rarely changes a call; `--no-homopolymer` saves that time.
+  Tandem gap costs are only paid where the reads disagree, so leaving them on is cheap.
+- **Checking a call that matters.** Run once with the options off. If the call changes,
+  the reads are contested there (the support quality will usually say so too) and the
+  locus deserves a closer look.
+- **Known weak spots.** Homopolymer compression can call one unit short on clean ONT
+  expansions of repeats whose units contain two-base runs (`GGC`, `CCG`): about 2 in 100
+  in simulation. On heavily smeared (mosaic) expansions tandem gap costs recover calls
+  that otherwise break, but where both versions give an intact call they are roughly a
+  wash on length.
+
+```rust
+use poa_consensus::{consensus, PoaConfig};
+
+// the plain engine: no homopolymer handling, no tandem gap costs
+let plain = PoaConfig {
+    homopolymer_min_run: 0,
+    homopolymer_gap: None,
+    tandem_gap: None,
+    ..PoaConfig::default()
+};
+let result = consensus(&reads, 0, &plain)?;
 ```
 
 ## Checking result quality

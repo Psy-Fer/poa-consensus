@@ -462,11 +462,17 @@ fn splice(raw: &Consensus, hpc: &Consensus, min_run: usize, config: &PoaConfig) 
     out
 }
 
-/// The homopolymer candidates, each with the run length its splice uses: the
-/// compressed consensus when `homopolymer_min_run > 0`, and the engine run with
-/// homopolymer gap costs when `homopolymer_gap` is set (gap costs are not
-/// applied inside the compressed build: compressed reads have no runs).
-fn candidates(reads: &[&[u8]], config: &PoaConfig) -> Vec<(Consensus, usize)> {
+/// Support quality below which the plain call counts as contested, so the
+/// tandem-gap candidate is worth building.
+const TANDEM_GATE_QUALITY: u8 = 10;
+
+/// The candidates, each with the run length its splice uses: the compressed
+/// consensus when `homopolymer_min_run > 0`, the engine run with homopolymer
+/// gap costs when `homopolymer_gap` is set (gap costs are not applied inside
+/// the compressed build: compressed reads have no runs), and, when
+/// `tandem_gap` is set and `raw` has a weakly supported base, the engine run
+/// with tandem gap costs (run length 0: competes unspliced).
+fn candidates(reads: &[&[u8]], config: &PoaConfig, raw: &Consensus) -> Vec<(Consensus, usize)> {
     let k = config.homopolymer_min_run;
     let mut cands = Vec::new();
     if k > 0 {
@@ -486,10 +492,25 @@ fn candidates(reads: &[&[u8]], config: &PoaConfig) -> Vec<(Consensus, usize)> {
             if k > 0 { k } else { 2 },
         ));
     }
+    // Tandem gap costs: built only where the plain call has weak support
+    // (somewhere the reads disagree), so clean loci pay nothing. It competes
+    // as a whole call (`min_run` 0: no homopolymer splice); the fit guard in
+    // `consensus_homopolymer` decides.
+    if let Some(tg) = config.tandem_gap {
+        if raw.support_quality.iter().any(|&q| q < TANDEM_GATE_QUALITY) {
+            let cfg = PoaConfig {
+                homopolymer_min_run: 0,
+                homopolymer_gap: None,
+                tandem_gap: None,
+                ..config.clone()
+            };
+            cands.push((crate::engine_consensus_with(reads, &cfg, Some(tg)), 0));
+        }
+    }
     cands
 }
 
-/// Homopolymer-aware candidates combined with the plain engine call `raw`
+/// Homopolymer-aware and tandem-gap candidates combined with the plain engine call `raw`
 /// (built with `base`: both homopolymer options off). Each candidate is
 /// spliced into `raw` only within homopolymer runs (`splice`), and the
 /// best-fitting splice is kept only if it fits the raw reads strictly better
@@ -509,19 +530,42 @@ pub(crate) fn consensus_homopolymer(
     // full realignment pass costs about as much as a candidate build.
     let mut fr: Option<f64> = None;
     let mut best: Option<(f64, Consensus)> = None;
-    for (cand, min_run) in candidates(reads, config) {
+    for (cand, min_run) in candidates(reads, config, &raw) {
         if cand.sequence == raw.sequence {
             continue;
         }
-        let merged = splice(&raw, &cand, min_run, base);
+        let merged = if min_run == 0 {
+            let mut c = cand;
+            c.support_quality = Vec::new(); // rescored if chosen
+            c
+        } else {
+            splice(&raw, &cand, min_run, base)
+        };
         if merged.sequence == raw.sequence {
             continue;
         }
         let fr = *fr.get_or_insert_with(|| raw_misfit(&raw.sequence, reads, base));
         let fm = raw_misfit(&merged.sequence, reads, base);
-        if fm < fr && best.as_ref().is_none_or(|(b, _)| fm < *b) {
-            best = Some((fm, merged));
+        if fm >= fr || best.as_ref().is_some_and(|(b, _)| fm >= *b) {
+            continue;
         }
+        // A whole-call candidate may differ in length over the entire read, and
+        // a semi-global fit (free end gaps) lets a short read sit inside a long
+        // candidate for free while a long read pays for insertions against a
+        // short one: in a flankless repeat that alone favours the longer call.
+        // It must also fit better when every read accounts for both ends.
+        if min_run == 0 {
+            let global = PoaConfig {
+                alignment_mode: crate::config::AlignmentMode::Global,
+                ..base.clone()
+            };
+            if raw_misfit(&merged.sequence, reads, &global)
+                >= raw_misfit(&raw.sequence, reads, &global)
+            {
+                continue;
+            }
+        }
+        best = Some((fm, merged));
     }
     best.map_or(raw, |(_, mut c)| {
         c.support_quality = crate::poa2::support_quality_by_realignment(&c.sequence, reads, base);

@@ -42,8 +42,9 @@ pub enum ConsensusMode {
 ///
 /// `PoaConfig::default()` suits STR / VNTR loci from long reads (band 50 +
 /// adaptive, semi-global, scoring 2 / -4 / -4 / -3, best-fit consensus,
-/// homopolymer handling on). Set `homopolymer_min_run: 0` and
-/// `homopolymer_gap: None` for the plain engine path (about 2.4x less CPU).
+/// homopolymer handling and tandem gap costs on). Set `homopolymer_min_run:
+/// 0`, `homopolymer_gap: None` and `tandem_gap: None` for the plain engine path
+/// (about 2.4x less CPU).
 ///
 /// # Banding
 ///
@@ -140,6 +141,30 @@ pub struct PoaConfig {
     /// strictly better fit; splice run threshold 2 when used alone), with the
     /// same entry-point scope.
     pub homopolymer_gap: Option<(i32, i32)>,
+    /// Tandem-repeat gap costs. Default `Some((-2, -1))`; `None` = off.
+    ///
+    /// Gaining or losing one copy of a short repeat unit (polymerase slippage,
+    /// sequencing stutter) is the commonest real difference inside a tandem
+    /// repeat, but plain affine costs price it like any other indel. Reads
+    /// then reach for cheaper-looking alignments: sliding across a repeat
+    /// boundary with mismatches and reusing a node another read created, which
+    /// can carry a wrong extra unit onto the heaviest path depending on read
+    /// order. With this set, an indel that copies its neighbour in a locally
+    /// periodic stretch of the read (a 2-6 base unit immediately followed by a
+    /// copy of itself) pays `(open, extend)` instead. The test is local to each
+    /// alignment cell: no repeat tract or unit count is identified.
+    ///
+    /// Like the homopolymer options this only builds a candidate, never changes
+    /// the plain engine: a consensus is built with these costs, and it replaces
+    /// the plain call only if it fits the reads strictly better (fewer
+    /// mismatches plus indel bases per read base). Applied wholesale, unguarded, the costs pull
+    /// split-length repeats toward the shorter length. The candidate is built
+    /// only when the plain call has a base with support quality below 10
+    /// (somewhere the reads disagree), so clean loci pay nothing. Applies via
+    /// [`consensus`](crate::consensus), [`consensus_flanked`](crate::consensus_flanked)
+    /// and [`bridged_consensus`](crate::bridged_consensus); the multi-allele
+    /// entry points ignore it. CLI `--tandem-gap OPEN,EXTEND|off`.
+    pub tandem_gap: Option<(i32, i32)>,
 }
 
 impl Default for PoaConfig {
@@ -173,6 +198,9 @@ impl Default for PoaConfig {
             // support. ~2.4x the plain engine's CPU.
             homopolymer_min_run: 2,
             homopolymer_gap: Some((-2, -1)),
+            // Tandem gap costs on by default: a guarded candidate, built only
+            // where the plain call has weak support (see the field docs).
+            tandem_gap: Some((-2, -1)),
         }
     }
 }

@@ -11,6 +11,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Breaking
 
+- **Tandem gap costs are on by default** (`tandem_gap: Some((-2, -1))`). Single-allele
+  calls in tandem repeats can change where the reads support a different unit count than
+  the plain engine called. `tandem_gap: None` (CLI `--tandem-gap off`) restores the
+  previous behaviour.
 - **`Consensus` has a new public field, `support_quality: Vec<u8>`** (see Added). Code
   that builds a `Consensus` with a struct literal must add it.
 - **Homopolymer handling is on by default** (`homopolymer_min_run: 2`,
@@ -21,6 +25,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   is unaffected.
 
 ### Added
+
+- **Tandem gap costs: `PoaConfig::tandem_gap`** (default `Some((-2, -1))`; CLI
+  `--tandem-gap OPEN,EXTEND|off`). Fixes an order-dependent heaviest-path error in tandem
+  repeats: a read whose extra length belongs elsewhere (e.g. a `CT` unit in a `(CT)n`
+  flank) aligned more cheaply by sliding across the repeat boundary with mismatches and
+  reusing an extra node another read inserted, so a wrong extra `CA` unit could win.
+  With this set, an indel that copies its neighbouring 2-6 base unit in a locally periodic
+  stretch of the read pays the tandem costs, so a read's own unit slip is the cheaper
+  alignment. No repeat tract or count is identified; the test only prices one gap. It
+  builds a guarded candidate (kept only if it fits the reads strictly better), and only
+  when the plain call has a base below support quality 10, so clean loci pay nothing.
+  On bladerunner's ONT `(CA)n` regression cases it fixes 2 of the 3 one-unit-long calls
+  (one of them in all 50 read orders) without moving a genuine length split; on the
+  run-length-noise benchmark exact calls rise 2086 -> 2094; on simulated GC-rich smeared
+  expansions it recovers 43 calls that previously lost a flank and loses none.
+  `validate.py` 20/20, `compare_callers.py` 16/16 and `--comprehensive` are unchanged.
 
 - **Per-base support quality: `Consensus::support_quality`** (CLI `--fastq`), and
   `analysis::low_support_regions`. One Phred-scaled value per consensus base, capped at

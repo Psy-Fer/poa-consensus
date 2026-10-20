@@ -92,6 +92,17 @@ let cfg = PoaConfig {
 
 CLI: `--no-homopolymer`.
 
+### Tandem gap costs (on by default)
+
+Inside a tandem repeat, reads most often differ by one copy of the unit. With plain gap
+costs a read can prefer to slide across the edge of the repeat with mismatches and reuse
+another read's node, which puts a wrong extra unit into the call depending on read order.
+`tandem_gap: Some((-2, -1))` makes an indel that copies its neighbouring 2-6 base unit
+cheaper, so reads describe their own slip. It builds a candidate only where the plain
+call has weakly supported bases, kept only if it fits the reads strictly better, so clean
+loci pay nothing. Single-allele only. Turn off with `tandem_gap: None` (CLI
+`--tandem-gap off`); `--no-homopolymer --tandem-gap off` gives the plain engine.
+
 ### Seed selection
 
 ```rust

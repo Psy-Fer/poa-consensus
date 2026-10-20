@@ -142,6 +142,30 @@ unlike best fit, because a shifted base inside a run shows up as mismatches). Mu
 calls do not use homopolymer handling. See
 [Single-Allele Consensus](../library/single-allele.md#homopolymer-handling) for usage.
 
+## Tandem gap costs
+
+Also on by default for single-allele calls (`tandem_gap = Some((-2, -1))`; `None` or CLI
+`--tandem-gap off` to disable). It targets a heaviest-path error that depends on read
+order: a read whose extra length belongs elsewhere (say a `CT` unit in a `(CT)n` flank)
+aligns more cheaply by sliding across the repeat boundary with mismatches and reusing a
+node another read inserted, so a wrong extra repeat unit can collect enough weight to
+win.
+
+During alignment, each read is scanned for locally periodic stretches: a 2-6 base unit
+immediately followed by a copy of itself. An insertion of read bases inside such a
+stretch, or a deletion of a node whose base belongs to the local unit, pays the tandem
+`(open, extend)` instead of the normal gap costs. That makes a read's own unit slip
+cheaper than the mismatch-and-reuse detour. No tract, unit or count is ever reported;
+the test only prices one gap.
+
+It is used for a third candidate, never the plain engine: the consensus is rebuilt with
+tandem costs and replaces the plain call only if it fits the reads strictly better (the
+same measure as the homopolymer splice, compared over the whole call). The candidate is
+built only when the plain call has a base with support quality below 10, so loci where
+the reads agree pay nothing. Applied to the plain engine without the guard, the same
+costs pull genuine length splits toward the shorter length; as a guarded candidate they
+fixed the order-dependent extra-unit calls without moving those splits.
+
 ## Semi-global alignment and boundary trim
 
 With `AlignmentMode::SemiGlobal` (the default), partial reads take free terminal gaps rather

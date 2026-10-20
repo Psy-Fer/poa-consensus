@@ -261,6 +261,10 @@ pub struct Poa {
     /// is reused: the band is wider than its estimate wherever the adaptive
     /// and static diagonals diverge, and regrowing per read was ~9% of runtime.
     align_bufs: Cell<AlignBufs>,
+    /// Gap costs `(open, extend)` for an indel that copies its neighbouring
+    /// unit in a locally periodic stretch of the read (periods 2-6), or `None`.
+    /// Set only on candidate builds (`with_tandem_gap`).
+    tandem_gap: Option<(i32, i32)>,
 }
 
 #[derive(Default)]
@@ -304,7 +308,15 @@ impl Poa {
             read_paths: vec![seed_path],
             read_matched_edges: vec![seed_medges],
             align_bufs: Cell::default(),
+            tandem_gap: None,
         }
+    }
+
+    /// Price indels that copy a neighbouring repeat unit at `(open, extend)`
+    /// (see the tandem context in `align`).
+    pub(crate) fn with_tandem_gap(mut self, costs: (i32, i32)) -> Self {
+        self.tandem_gap = Some(costs);
+        self
     }
 
     /// Kahn's topological order over the current DAG. Returns (topo, rank_of).
@@ -378,10 +390,44 @@ impl Poa {
         // Per-column insert costs, and the read padded by one sentinel on each
         // side (`rpad[j] = read[j-1]`, outside 1..=l a value no u8 base equals)
         // so the fill's delete-cost test needs no bounds checks.
+        let tg = self.tandem_gap;
+        // Periodic stretches of the read for periods 2..=6: wherever a unit is
+        // immediately followed by a copy of itself, both copies are flagged, and
+        // each read column inside such a stretch records which bases its unit
+        // contains (bit per A/C/G/T). Purely local: no tract or unit is
+        // identified, only "an indel here would copy its neighbour".
+        let base_bit = |b: u8| match b {
+            b'A' | b'a' => 1u8,
+            b'C' | b'c' => 2,
+            b'G' | b'g' => 4,
+            b'T' | b't' => 8,
+            _ => 0,
+        };
+        let mut tpos = vec![false; l];
+        let mut tmask = vec![0u8; l + 1]; // per column j (between read[j-1] and read[j])
+        if tg.is_some() {
+            for per in 2..=6usize {
+                if l < 2 * per {
+                    break;
+                }
+                for st in 0..=l - 2 * per {
+                    if read[st..st + per] == read[st + per..st + 2 * per] {
+                        let m = read[st..st + per].iter().fold(0u8, |m, &b| m | base_bit(b));
+                        tpos[st..st + 2 * per].fill(true);
+                        // interior columns of the stretch
+                        for x in &mut tmask[st + 1..st + 2 * per] {
+                            *x |= m;
+                        }
+                    }
+                }
+            }
+        }
         let icost: Vec<(i32, i32)> = ins_run
             .iter()
-            .map(|&run| match hp {
-                Some(c) if run => c,
+            .enumerate()
+            .map(|(j, &run)| match (hp, tg) {
+                (Some(c), _) if run => c,
+                (_, Some(c)) if j >= 1 && tpos[j - 1] => c,
                 _ => (go, ge),
             })
             .collect();
@@ -391,8 +437,9 @@ impl Poa {
             .chain(read.iter().map(|&b| b as u16))
             .chain(std::iter::once(NO_BASE))
             .collect();
-        let del_cost = |t: usize, j: usize, b: u8| match hp {
-            Some(c) if node_run[t] && (rpad[j] == b as u16 || rpad[j + 1] == b as u16) => c,
+        let del_cost = |t: usize, j: usize, b: u8| match (hp, tg) {
+            (Some(c), _) if node_run[t] && (rpad[j] == b as u16 || rpad[j + 1] == b as u16) => c,
+            (_, Some(c)) if tmask[j] & base_bit(b) != 0 => c,
             _ => (go, ge),
         };
 
@@ -576,14 +623,27 @@ impl Poa {
             let hp_row = hp.filter(|_| node_run[t]);
             let (hgo, hge) = hp_row.unwrap_or((go, ge));
             let bb = base as u16;
-            let cols = rpad[lo..=hi].iter().zip(&rpad[lo + 1..=hi + 1]);
+            let tmask_row = &tmask[lo..=hi];
+            let tbit = if tg.is_some() { base_bit(base) } else { 0 };
+            let (tgo, tge) = tg.unwrap_or((go, ge));
+            let cols = rpad[lo..=hi]
+                .iter()
+                .zip(&rpad[lo + 1..=hi + 1])
+                .zip(tmask_row);
             let accs = macc.iter().zip(oacc.iter().zip(&eacc));
             let outs = mrow.iter_mut().zip(drow.iter_mut());
-            for (((m, d), (&ma, (&oa, &ea))), (&rb, &rn)) in outs.zip(accs).zip(cols) {
+            for (((m, d), (&ma, (&oa, &ea))), ((&rb, &rn), &tm)) in outs.zip(accs).zip(cols) {
                 let sc = if rb == bb { mm } else { mis };
                 *m = if ma == NEG_INF { NEG_INF } else { ma + sc };
                 let in_run = hp_row.is_some() && (rb == bb || rn == bb);
-                let (dgo, dge) = if in_run { (hgo, hge) } else { (go, ge) };
+                let in_tandem = tm & tbit != 0;
+                let (dgo, dge) = if in_run {
+                    (hgo, hge)
+                } else if in_tandem {
+                    (tgo, tge)
+                } else {
+                    (go, ge)
+                };
                 let d_open = if oa == NEG_INF {
                     NEG_INF
                 } else {

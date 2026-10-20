@@ -50,12 +50,15 @@ import compare_callers as cc
 import other_callers as oc
 import validate as v
 
-# Explicit flags, independent of the CLI defaults (hpc2g is the default since 0.7).
+# Explicit flags, independent of the CLI defaults (homopolymer handling and
+# tandem gap costs are on by default since 0.7). "poa" is the plain engine;
+# "poa:default" is what a caller gets with no flags.
 POA_MODES = [
-    ("poa", ["--no-homopolymer"]),
-    ("poa:gap", ["--homopolymer-min-run", "0", "--homopolymer-gap=-2,-1"]),
-    ("poa:hpc2g", ["--homopolymer-min-run", "2", "--homopolymer-gap=-2,-1"]),
-    ("hpc2", ["--homopolymer-min-run", "2", "--homopolymer-gap", "off"]),
+    ("poa", ["--no-homopolymer", "--tandem-gap", "off"]),
+    ("poa:gap", ["--homopolymer-min-run", "0", "--homopolymer-gap=-2,-1", "--tandem-gap", "off"]),
+    ("poa:hpc2g", ["--homopolymer-min-run", "2", "--homopolymer-gap=-2,-1", "--tandem-gap", "off"]),
+    ("hpc2", ["--homopolymer-min-run", "2", "--homopolymer-gap", "off", "--tandem-gap", "off"]),
+    ("poa:default", []),
 ]
 # --poa-only: skip the external callers (set via env so pool workers see it).
 POA_ONLY = os.environ.get("POA_ONLY") == "1"

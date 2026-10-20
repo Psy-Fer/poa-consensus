@@ -69,7 +69,8 @@ Run `poa-consensus --help` for the full list with descriptions. The main ones:
 | `--phasing-bubble-min-span N` | 10 | Multi-allele: minimum arm span for a structural bubble |
 | `--homopolymer-min-run N` | 2 | Homopolymer compression (0 = off); see below |
 | `--homopolymer-gap OPEN,EXTEND` | -2,-1 | Homopolymer-aware gap costs (`off` to disable); see below |
-| `--no-homopolymer` | off | Disable homopolymer handling entirely (plain engine) |
+| `--no-homopolymer` | off | Disable homopolymer handling entirely |
+| `--tandem-gap OPEN,EXTEND` | -2,-1 | Repeat-unit slip gap costs (`off` to disable); see below |
 | `-s`, `--seed N` | auto | Seed read index for orientation and multi-allele. The single-allele path re-seeds on the median-length read, so this rarely changes its output |
 | `-q`, `--quiet` | off | Suppress warnings and notes; errors are always printed |
 
@@ -91,8 +92,8 @@ poa-consensus reads.fa --multi
 # Only the repeat between two flanks (partial reads excluded automatically)
 poa-consensus reads.fa --left-flank TCGAGTCCCTCAAGTCCTTC --right-flank CTCCTCAGCTTCCTCAGCCG
 
-# Plain engine without homopolymer handling (about 2.4x less CPU)
-poa-consensus reads.fa --no-homopolymer
+# Plain engine: no homopolymer handling, no tandem gap costs (about 2.4x less CPU)
+poa-consensus reads.fa --no-homopolymer --tandem-gap off
 
 # Fully unbanded (short reads, or to cross-check a banded result)
 poa-consensus reads.fa --band-width 0 --no-adaptive-band
@@ -122,6 +123,25 @@ homopolymer runs, and kept only if it fits the reads strictly better, so elsewhe
 output is the plain engine's. It applies to single-allele consensus only (ignored with
 `--multi`) and costs about 2.4× the plain engine's CPU. On clean HiFi data it rarely
 changes anything; use `--no-homopolymer` to skip it.
+
+## Tandem gap costs
+
+Inside a tandem repeat, reads differ most often by one copy of the unit. With plain gap
+costs a read sometimes prefers to slide across the edge of the repeat with mismatches and
+reuse another read's extra node, which can put a wrong extra unit in the call. With
+`--tandem-gap -2,-1` (the default) an indel that copies its neighbouring 2-6 base unit
+costs less, so reads describe their own slip instead. It builds a candidate only where
+the plain call is weakly supported, kept only if it fits the reads better, so clean loci
+pay nothing. Single-allele only.
+
+## When to turn these off
+
+Leaving both options on gives more correct calls overall. Turn them off
+(`--no-homopolymer --tandem-gap off`) to compare like for like with another POA tool or
+with earlier plain output, or to save CPU on clean HiFi data (homopolymer handling costs
+about 2.4x; tandem gap costs are only paid where reads disagree). Running once with them
+off is also a quick check on a call that matters: if it changes, the reads are contested
+there. See the library guide for the known weak spots.
 
 ## Warnings and notes
 

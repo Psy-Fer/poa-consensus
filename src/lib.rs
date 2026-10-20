@@ -447,16 +447,19 @@ pub fn consensus(
     // outlier's length; median avoids it). `seed_idx` is still validated for
     // bounds above, preserving the error contract.
     let _ = seed_idx;
-    // Homopolymer handling (compression and/or homopolymer-aware
-    // gap costs) builds its own candidate; the plain engine call `raw` is built
-    // with both off and is the fallback/judge.
-    let hp_on = config.homopolymer_min_run > 0 || config.homopolymer_gap.is_some();
-    if !hp_on {
+    // Homopolymer handling (compression and/or homopolymer-aware gap costs)
+    // and tandem gap costs each build a candidate; the plain engine call `raw`
+    // is built with all of them off and is the fallback and judge.
+    let cands_on = config.homopolymer_min_run > 0
+        || config.homopolymer_gap.is_some()
+        || config.tandem_gap.is_some();
+    if !cands_on {
         return Ok(engine_consensus(reads, config));
     }
     let base = PoaConfig {
         homopolymer_min_run: 0,
         homopolymer_gap: None,
+        tandem_gap: None,
         ..config.clone()
     };
     let raw = engine_consensus(reads, &base);
@@ -466,10 +469,22 @@ pub fn consensus(
 /// The engine path of [`consensus`]: build on the median-length read, then
 /// extract per `consensus_mode`.
 pub(crate) fn engine_consensus(reads: &[&[u8]], config: &PoaConfig) -> Consensus {
+    engine_consensus_with(reads, config, None)
+}
+
+/// [`engine_consensus`] with optional tandem-context gap costs on the build.
+pub(crate) fn engine_consensus_with(
+    reads: &[&[u8]],
+    config: &PoaConfig,
+    tandem_gap: Option<(i32, i32)>,
+) -> Consensus {
     let mut order: Vec<usize> = (0..reads.len()).collect();
     order.sort_by_key(|&i| reads[i].len());
     let med = order[order.len() / 2];
     let mut g = crate::poa2::Poa::new(reads[med], config.clone());
+    if let Some(c) = tandem_gap {
+        g = g.with_tandem_gap(c);
+    }
     for (i, r) in reads.iter().enumerate() {
         if i != med {
             g.add_read(r);
@@ -524,11 +539,12 @@ pub fn consensus_multi(
     // robustness matrix it beats the legacy engine on read-assignment cleanliness
     // and single-allele safety at near-equal split sensitivity. (Same-length
     // substitution haplotypes are the one weaker case; tracked separately.)
-    // The homopolymer options are single-allele only (their
+    // The homopolymer and tandem options are single-allele only (their
     // splice/fit guard lives in `consensus`); run multi-allele without them.
     let config = &PoaConfig {
         homopolymer_min_run: 0,
         homopolymer_gap: None,
+        tandem_gap: None,
         ..config.clone()
     };
     crate::multi::hybrid_consensus_multi(reads, config)

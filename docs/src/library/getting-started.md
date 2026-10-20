@@ -79,6 +79,7 @@ PoaConfig {
     phasing_bubble_min_span: 10,             // min arm span (nodes) for a structural bubble
     homopolymer_min_run: 2,                  // align runs >= 2 bases as one symbol (0 = off)
     homopolymer_gap: Some((-2, -1)),         // gap open/extend inside homopolymers (None = off)
+    tandem_gap: Some((-2, -1)),             // repeat-unit slip gap costs (None = off)
 }
 ```
 
