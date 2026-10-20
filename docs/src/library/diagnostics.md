@@ -81,7 +81,13 @@ that built it. The most common cause is banded DP converging to the wrong diagon
 highly repetitive locus.
 
 Diagnostics only report this signal; they do not retry. When it fires, the caller should
-rebuild with `band_width = 0` (unbanded) and compare.
+rebuild fully unbanded and compare. That needs both `band_width: 0` and
+`adaptive_band: false`: with the default `adaptive_band: true`, `band_width: 0` alone still
+uses the adaptive band.
+
+The flank-anchored functions slice the output to the repeat, so it is naturally much
+shorter than the reads. Ignore this check for them (the CLI skips it when flanks are
+given), or set `truncation_ratio_threshold: 0.0`.
 
 ### 5. Structural competing allele
 
@@ -92,9 +98,12 @@ if let Some(w) = &warnings.structural_competing {
 }
 ```
 
-Fires (single-allele mode only) when `Consensus::bubble_sites` contains a structural
-(length-changing) bubble whose minority arm clears the allele-frequency floor — a hint the
-locus may be heterozygous and worth re-running with `consensus_multi`. Suppressed when
+Fires when `Consensus::bubble_sites` contains any structural (length-changing) site, a
+hint that the locus may be heterozygous and worth re-running with `consensus_multi`.
+`diagnose` applies no frequency threshold of its own; it relies on `bubble_sites` holding
+only sites whose arms met `min_allele_freq` when the consensus was built. `site_count` is the
+number of structural sites; `min_arm_reads` is the smallest non-zero arm read count across
+all of them (an arm, not necessarily a minority arm). Suppressed when
 `DiagnoseConfig::is_allele_partition = true` (the caller is already in multi-allele mode).
 
 ## `DiagnoseConfig`

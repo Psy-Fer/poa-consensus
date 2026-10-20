@@ -13,9 +13,16 @@
 //! two MSA columns. In compressed space every such read reads `polyA G polyA`,
 //! so the base has exactly one place to go.
 //!
-//! Run lengths are recovered after consensus: every read is aligned to the
-//! compressed consensus, and each consensus poly symbol takes the median run
-//! length of the reads that matched it with the same symbol.
+//! Run lengths are recovered after consensus: each consensus poly symbol takes
+//! the (lower) median run length of the reads carrying the same symbol in its
+//! graph column (`run_lengths_from_graph`). When that vote is weak, the whole
+//! call falls back to realigning every read to the compressed consensus
+//! (`estimate_run_lengths`).
+//!
+//! The compressed consensus (and the homopolymer-gap-cost consensus) is only a
+//! candidate: `consensus_homopolymer` splices it into the plain engine call
+//! only inside homopolymer runs (`splice`) and keeps the result only if it fits
+//! the reads strictly better (`raw_misfit`).
 
 use crate::config::{ConsensusMode, PoaConfig};
 use crate::poa2::{Op, Poa};
@@ -290,7 +297,7 @@ pub(crate) fn consensus_compressed(reads: &[&[u8]], config: &PoaConfig) -> Conse
 
 /// Raw-space misfit of `candidate` to `reads`: mismatches + inserted +
 /// deleted bases per read base (lower is better). Unlike the engine's
-/// indel-only `fit_score`, mismatches count: a G shifted within a homopolymer
+/// indel-only `Poa::fit`, mismatches count: a G shifted within a homopolymer
 /// aligns as two G/A mismatches under harsh affine gaps, not as indels.
 fn raw_misfit(candidate: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> f64 {
     if candidate.is_empty() {

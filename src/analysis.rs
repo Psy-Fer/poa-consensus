@@ -203,7 +203,7 @@ pub fn allele_fractions(site: &BubbleSite) -> Vec<f64> {
 /// // Ten per-read repeat-count estimates with little variance.
 /// let counts = vec![40.0, 41.0, 39.0, 40.0, 42.0, 40.0, 41.0, 39.0, 40.0, 41.0];
 /// let (lo, hi) = count_credible_interval(&counts, 0.95);
-/// // Mean ≈ 40.3, CI ≈ [39.5, 41.1] — both tools in this range are equivalent.
+/// // Mean = 40.3, CI ≈ [39.7, 40.9]: both tools in this range are equivalent.
 /// assert!(lo < 40.3 && 40.3 < hi);
 /// ```
 ///
@@ -425,7 +425,7 @@ impl ConsensusConfidence {
 /// Compute a [`ConsensusConfidence`] summary for a consensus result.
 ///
 /// `min_allele_freq` is forwarded to [`has_competing_allele`] and should match
-/// the value used when building the graph (default: 0.25).
+/// the value used when building the graph (default: 0.2).
 ///
 /// # Examples
 /// ```
@@ -558,8 +558,9 @@ pub struct InteriorSupportWarning {
 /// threshold (default 0.60).  The most common cause is highly repetitive sequence
 /// (e.g. AAAAG 5-mer) where multiple DP diagonals score identically; the band
 /// locks onto the wrong one silently (the static-diagonal-union band keeps the
-/// endpoint reachable, so no error is raised).  The remedy is to retry with
-/// `band_width = 0` (unbanded), which forces the traceback to the correct endpoint.
+/// endpoint reachable, so no error is raised).  The remedy is to retry unbanded
+/// (`band_width = 0` and `adaptive_band = false`; CLI: `--band-width 0
+/// --no-adaptive-band`) and compare.
 #[derive(Debug, Clone)]
 pub struct TruncationWarning {
     /// Length of the consensus sequence produced.
@@ -616,7 +617,7 @@ pub struct ConsensusWarnings {
     pub structural_competing: Option<StructuralCompetingSummary>,
     /// Suspected silent truncation: consensus is much shorter than the median
     /// input read, suggesting banded DP converged to the wrong diagonal.
-    /// Retry with `band_width = 0` (unbanded) to recover.
+    /// Retry unbanded (`band_width = 0` and `adaptive_band = false`) to recover.
     pub truncation_suspected: Option<TruncationWarning>,
 }
 
@@ -708,7 +709,8 @@ impl ConsensusWarnings {
                 format!(
                     "{label}: consensus ({} bp) is {:.0}% of median input read length \
                      ({} bp) — banded DP may have converged to the wrong diagonal on \
-                     highly repetitive sequence; retry with band_width=0",
+                     highly repetitive sequence; retry unbanded (band_width = 0 and \
+                     adaptive_band = false; CLI: --band-width 0 --no-adaptive-band)",
                     t.consensus_len,
                     t.ratio * 100.0,
                     t.median_read_len,
@@ -732,10 +734,11 @@ impl ConsensusWarnings {
 /// exactly.**
 ///
 /// This is a *relative* scorer, meant to compare several candidate
-/// consensuses built from the same read population against each other (the
-/// single-allele [`consensus`](crate::consensus) path uses it internally to
-/// pick between heaviest-path and majority-frequency) — not an absolute,
-/// scenario-independent "this consensus is wrong" threshold. Empirical
+/// consensuses built from the same read population against each other, not
+/// an absolute, scenario-independent "this consensus is wrong" threshold.
+/// (The engine's own best-fit choice between heaviest-path and
+/// majority-frequency uses a different, affine-weighted indel score; see
+/// [`ConsensusMode::BestFit`](crate::ConsensusMode::BestFit).) Empirical
 /// investigation (see CHANGELOG) found no single
 /// graph-level statistic (`GraphStats::single_support_fraction`,
 /// `bubble_count`, `edge_weight_gini`, seed length relative to the read
@@ -743,9 +746,7 @@ impl ConsensusWarnings {
 /// ordinary sequencing-noise-heavy ones across scenario families (CAG/GAA at
 /// various lengths and depths, ONT R9/R10, HiFi); comparing this score
 /// *across candidates built from the same reads* discriminated far better in
-/// that investigation, though even it is not perfectly reliable in isolation
-/// (see the seed-sensitivity retry's own doc comment for the specific,
-/// confirmed failure mode this does not fully solve).
+/// that investigation, though even it is not perfectly reliable in isolation.
 ///
 /// Cost: one graph build plus one alignment per read — comparable to
 /// building one more candidate consensus, not a cheap O(1) check. Reserve it
@@ -775,7 +776,7 @@ pub fn consensus_fit(
 
 /// Compute actionable diagnostic warnings for a [`Consensus`].
 ///
-/// Checks four independent signals:
+/// Checks five independent signals:
 ///
 /// 1. **Low depth** — `n_reads` below `DiagnoseConfig::depth_warn_threshold`
 ///    (or `depth_allele_threshold` in allele-partition mode).
@@ -785,6 +786,8 @@ pub fn consensus_fit(
 ///    below `interior_support_threshold`.
 /// 4. **Structural competing alleles** — structural bubble sites above
 ///    `min_allele_freq` (only in single-allele mode).
+/// 5. **Suspected truncation**: consensus length below
+///    `truncation_ratio_threshold` × the median input read length.
 ///
 /// No signal overlaps with another; each `Some` or `true` field in the
 /// returned [`ConsensusWarnings`] is independently meaningful.

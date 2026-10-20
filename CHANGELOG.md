@@ -9,35 +9,55 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Breaking
+
+- **Homopolymer handling is on by default** (`homopolymer_min_run: 2`,
+  `homopolymer_gap: Some((-2, -1))`). Single-allele `consensus` output (and
+  `consensus_flanked` / `bridged_consensus`, which call it) can change at homopolymer runs
+  where the reads support a different call. Set `homopolymer_min_run: 0,
+  homopolymer_gap: None` (CLI `--no-homopolymer`) for the plain engine. `consensus_multi`
+  is unaffected.
+
 ### Added
 
-- **Experimental homopolymer mode: `PoaConfig::homopolymer_min_run` and
+- **Homopolymer handling: `PoaConfig::homopolymer_min_run` and
   `PoaConfig::homopolymer_gap`** (CLI `--homopolymer-min-run K`,
-  `--homopolymer-gap=OPEN,EXTEND`). Both are off by default and apply to single-allele
-  `consensus` only. They target a base between two length-variable homopolymers
-  (`A12 G A11`) and `(AAAAT)n`-type repeats. There the default scoring prefers two
-  mismatches over a deletion plus an insertion, splitting the base across two MSA columns
-  and sometimes miscounting repeat units. `homopolymer_min_run` aligns runs of at least
-  K identical bases as one symbol and restores their lengths afterwards.
-  `homopolymer_gap` makes indels inside a homopolymer cheaper. Each candidate is spliced
-  into the normal call only inside runs, and kept only if it fits the reads strictly
-  better. Recommended setting: `--homopolymer-min-run 2 --homopolymer-gap=-2,-1`. On a
-  run-length-noise benchmark it gives 2089 exact calls against 982 for the default.
-  `validate.py` 20/20 and `compare_callers.py` 16/16 still pass, HG002 ONT stays at
-  143/151 exact haplotypes, and MUC1 calls are byte-identical. The cost is about 2.4x the
-  default CPU. Design and results: `design/homopolymer_compression.md`.
+  `--homopolymer-gap OPEN,EXTEND|off`, `--no-homopolymer`). They target a base between two
+  length-variable homopolymers (`A12 G A11`) and `(AAAAT)n`-type repeats. There the plain
+  engine's scoring prefers two mismatches over a deletion plus an insertion, splitting the
+  base across two MSA columns and sometimes miscounting repeat units.
+  `homopolymer_min_run` aligns runs of at least K identical bases as one symbol and
+  restores their lengths afterwards; `homopolymer_gap` makes indels inside a homopolymer
+  cheaper. Each candidate is spliced into the plain consensus only inside runs, and kept
+  only if it fits the reads strictly better. On a run-length-noise benchmark the default
+  gives 2089 exact calls against 982 for the plain engine. `validate.py` 20/20 and
+  `compare_callers.py` 16/16 still pass, HG002 ONT stays at 143/151 exact haplotypes, and
+  MUC1 calls are byte-identical. It costs about 2.4x the plain engine's CPU, which after
+  the DP speed-up below is still faster than v0.6.0's default. Single-allele only
+  (`consensus_multi` ignores both). Design and results: `design/homopolymer_compression.md`.
 
 ### Fixed
 
 - **`BestFit` no longer picks a frame-broken majority consensus in dinucleotide repeats.**
-  On ONT `(CA)n` reads with real 19/20-unit length noise, the majority-frequency candidate
-  could split its column vote and emit `(CA)19` plus a stray base. The best-fit selector
-  scored candidates by indel *bases*, which a halfway length minimises, so it chose that
-  candidate over a correct heaviest path. The 1 bp change surfaced in bladerunner as a
-  spurious interruption. The fit score now charges each indel event a gap open plus a
-  per-base extend (the configured affine costs), so the in-frame candidate wins.
+  On ONT `(CA)n` reads with real 19/20-unit length noise, the majority-frequency (MF)
+  candidate could split its column vote and emit `(CA)19` plus a stray base. The best-fit
+  selector scored candidates by indel *bases*, which a halfway length minimises, so it
+  chose that candidate over a correct heaviest path. The 1 bp change surfaced in
+  bladerunner as a spurious interruption. MF now replaces the heaviest path only when it
+  fits the reads strictly better on both measures: fewer indel bases AND a lower affine
+  indel penalty (a gap open per event plus a per-base extend). An affine score alone was
+  tried first and broke exact indel-base ties toward the shorter candidate (a read longer
+  than the candidate absorbs its differences into one insertion run), which turned
+  correct `(CA)n` calls one unit short and a homozygous 6-C HiFi DM1 call into 5 C.
   Behaviour change: `consensus` output can differ wherever the two candidates disagreed.
-  `validate.py` 20/20 and `compare_callers.py` 16/16 are unchanged.
+
+- **CLI: no spurious truncation warning with `--left-flank` / `--right-flank`.** The
+  output is sliced to the repeat, so it is naturally much shorter than the reads; the
+  length-ratio truncation check is now skipped in flank mode.
+- **The truncation warning's remedy now produces an unbanded run.** It said "retry with
+  band_width=0", but with the adaptive band on (the default) that stays banded. It now
+  says `band_width = 0` and `adaptive_band = false` (CLI `--band-width 0
+  --no-adaptive-band`).
 
 ### Performance
 

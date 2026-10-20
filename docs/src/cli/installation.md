@@ -25,8 +25,9 @@ poa-consensus --help
 
 ## Requirements
 
-- Rust 1.85 or later
-- No system libraries required (pure Rust)
+- Rust 1.88 or later for the CLI (the `noodles` FASTA/FASTQ dependency needs it). The
+  library alone builds on Rust 1.85.
+- No system libraries required (pure Rust).
 
-Input files must be FASTA or FASTQ (uncompressed or gzip-compressed). The format is
-auto-detected from the first byte of the file.
+Input files must be uncompressed FASTA or FASTQ; gzip is not supported (decompress with
+`zcat reads.fa.gz | poa-consensus`). The format is auto-detected from the first byte.

@@ -1,14 +1,24 @@
 use std::fmt;
 
+/// Errors returned by the consensus entry points and [`select_seed`](crate::select_seed).
 #[derive(Debug)]
 pub enum PoaError {
+    /// No reads were provided.
     EmptyInput,
+    /// Fewer reads than [`PoaConfig::min_reads`](crate::PoaConfig::min_reads)
+    /// (in multi-allele mode: too few non-empty reads in total, or in one
+    /// allele group).
     InsufficientDepth {
+        /// Reads available.
         got: usize,
+        /// The `min_reads` floor that was not met.
         min: usize,
     },
+    /// The seed index is not a valid index into the reads.
     SeedOutOfBounds {
+        /// The index passed.
         index: usize,
+        /// Number of reads.
         len: usize,
     },
     /// `SeedSelection::Auto` found non-overlapping left-only and right-only
@@ -16,7 +26,9 @@ pub enum PoaError {
     /// the left group seeds the left half, the right group seeds the right half,
     /// and `bridged_consensus` concatenates them with a `GapKind::Unknown` gap.
     NoSpanningReads {
+        /// Reads that cover only the left side.
         left_depth: usize,
+        /// Reads that cover only the right side.
         right_depth: usize,
     },
 }

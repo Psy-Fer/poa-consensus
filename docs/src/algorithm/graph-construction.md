@@ -8,8 +8,8 @@ backbone; every subsequent read is aligned into it.
 
 The choice of seed matters, so `consensus()` self-seeds on the median-length read internally
 rather than trusting the caller's index. A seed that is much longer or shorter than the read
-set creates unnecessary early branches and inflates the band width the aligner needs to track
-them; a median-length spanning read avoids that (see [Seed Selection](../library/seed-selection.md)).
+set creates unnecessary early branches and biases periodic repeats toward its length; a
+median-length read avoids that (see [Seed Selection](../library/seed-selection.md)).
 
 ## Adding a read
 
@@ -25,8 +25,10 @@ The sort runs in O(V + E) and is recomputed for each read that is added.
 
 ### 2. DP alignment
 
-The read is aligned against the sorted graph using banded affine-gap DP. The alignment
-returns a sequence of operations: match (to a node), insert (a base), or delete (skip a node).
+The read is aligned against the sorted graph using banded affine-gap DP (see
+[Banded DP Alignment](banded-dp.md)). The alignment returns a sequence of operations:
+match (the read base is aligned to a node, whether or not the bases agree), insert (a read
+base with no graph node), or delete (a graph node the read skips).
 
 ### 3. Graph update
 
@@ -34,23 +36,27 @@ The traceback is replayed to update the graph:
 
 | Op | Action |
 |---|---|
-| Match | Increment the node's `coverage` and the incoming edge weight |
-| Insert | Create a new node; connect it to the previous and next nodes in the traceback |
-| Delete | Increment the skipped node's `del` count only; the reconnecting edge is flagged as delete-bypass traffic and excluded from the matched-edge view used for phasing |
+| Match, same base | Increment the node's `cov`; increment the edge from the read's previous node |
+| Match, different base | Node fusion: reuse the sibling in that column with the read's base, or create a new substitution node linked as an `aligned` sibling; increment its `cov` and the incoming edge |
+| Insert | Create a new node with `cov` 1; connect it from the read's previous node |
+| Delete | Increment the skipped node's `del` count only |
 
-**Insert nodes** are allocated with coverage 1 (the current read is the first to traverse
-them). Subsequent reads that match the same insert base will merge into the existing node
-rather than creating a new one, because the DP naturally finds the highest-scoring path and
-a match to an existing node scores positively while opening a fresh insert pays the gap
-penalty.
+**Node fusion** (as in SPOA and abPOA) keeps all alternative bases at a position as
+siblings in one alignment column. Later reads carrying the same alternative base reuse the
+sibling instead of fragmenting into fresh nodes, so allele counts accumulate correctly and
+the majority-frequency consensus can read each column directly.
 
-**Deletes** touch the skipped node only through its `del` count; the edge that reconnects the
-read's path after a delete run is recorded but flagged as bypass traffic, so it is excluded
-from the *matched* adjacencies used for bubble detection and phasing. A deleted node
-therefore gains no `coverage`, and its skip does not count as matched evidence that the
-node's base is correct. This is the key design choice that makes boundary trim work:
-nodes that are skipped by the majority of reads have low `coverage` even though many reads
-traversed the graph position.
+**Insert nodes** start with coverage 1. A later read with the same inserted base usually
+merges into the existing node, because matching an existing node scores positively while
+opening a fresh insert pays the gap penalty.
+
+**Deletes** touch the skipped node only through its `del` count. When the read rejoins the
+graph after a delete run, the edge it takes gets its weight incremented like any other edge,
+but that adjacency is left out of the read's *matched* adjacencies (`read_matched_edges`).
+Bubble reporting uses the matched view, so a length variant's short-allele bypass does not
+look like a competing arm; multi-allele phasing uses the full `read_paths`, where the bypass
+is exactly the shorter allele's arm. A deleted node gains no `cov`, so nodes skipped by most
+reads keep low coverage and boundary trim can remove them.
 
 ## Example: two-allele SNV graph
 
@@ -68,12 +74,15 @@ takes):
 
 ## Graph growth over a read set
 
-A typical graph on a clean 20-read set of 150 bp STR reads:
+Measured on 20 reads of a random 150 bp sequence with 5% substitution error (default
+configuration):
 
 - Seed: 150 nodes, 149 edges
-- After 20 reads (5% substitution error): ~165 nodes (15 error insert nodes), ~185 edges
-- Heaviest path: 150 nodes (the true consensus)
+- After 20 reads: 280 nodes, 403 edges. Almost all of the extra nodes are substitution
+  siblings created by node fusion (about 150 substitution errors in total, spread over 150
+  columns with three possible alternative bases each).
+- Consensus: 150 bp, identical to the truth
 
-Error insert nodes sit off the spine with edge weight 1 (or 2 if two reads share the same
-error). The `(weight - 1)` normalisation in the heaviest path DP gives them a negative
-contribution, keeping the heaviest path on the true spine.
+Error siblings sit off the spine with edge weight 1 (or 2 if two reads share the same
+error). The heaviest path always follows the largest out-edge weight, so it stays on the
+majority base at every column.

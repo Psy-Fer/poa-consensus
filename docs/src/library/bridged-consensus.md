@@ -35,6 +35,13 @@ The returned `Consensus` contains:
 - `gaps`: a single `CoverageGap { start, end, kind: GapKind::Unknown }` where
   `start == end` (zero-length in the sequence, because the gap size is unknown)
 - `n_reads`: `left.n_reads + right.n_reads`
+- `coverage` and `path_weights`: the two sides concatenated; any `Spanning` gaps from either
+  side are carried over (right-side positions offset by the join)
+- `graph_stats`: the **left** side's graph only
+- `bubble_sites` and `read_indices`: always empty
+
+Each side is built with `consensus()`, so each needs at least `min_reads` reads
+(`Err(PoaError::InsufficientDepth)` otherwise) and each seed index is only bounds-checked.
 
 Typical rendering:
 

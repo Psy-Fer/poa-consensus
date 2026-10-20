@@ -1,6 +1,11 @@
 use crate::types::Strand;
 use std::borrow::Cow;
 
+/// Reverse complement of `read`.
+///
+/// Output is uppercase: `ACGT` (either case) and the IUPAC ambiguity codes are
+/// complemented (`R`/`Y`, `K`/`M`, `B`/`V`, `D`/`H` swap; `S`, `W`, `N` map to
+/// themselves); any other byte is passed through unchanged.
 pub fn reverse_complement(read: &[u8]) -> Vec<u8> {
     read.iter().rev().map(|&b| complement(b)).collect()
 }
@@ -33,7 +38,12 @@ fn complement(b: u8) -> u8 {
 ///
 /// Counts shared k-mers between `read` and `seed` in the forward orientation,
 /// then between `reverse_complement(read)` and `seed`. Returns `Forward` if the
-/// forward count is greater or equal, `Reverse` otherwise.
+/// forward count is greater or equal, `Reverse` otherwise. Comparison is
+/// case-insensitive.
+///
+/// Returns `Forward` without evidence when either sequence is shorter than
+/// `k`, and on a tie (including zero shared k-mers), so a read unrelated to
+/// the seed is never flipped.
 ///
 /// Complexity: O(n) in the length of both sequences using a hash map.
 pub fn orient_to_seed(read: &[u8], seed: &[u8], k: usize) -> Strand {
@@ -78,7 +88,11 @@ pub fn orient_to_seed(read: &[u8], seed: &[u8], k: usize) -> Strand {
 ///
 /// Returns a `Vec<Cow<[u8]>>` where each element borrows the original read
 /// if it is already in the forward orientation, or owns the reverse complement
-/// if it was flipped.
+/// if it was flipped. Uses `k = min(8, seed_len - 1)` (at least 1).
+///
+/// # Panics
+///
+/// Panics if `seed_idx >= reads.len()`.
 pub fn auto_orient<'a>(reads: &'a [Vec<u8>], seed_idx: usize) -> Vec<Cow<'a, [u8]>> {
     let seed = &reads[seed_idx];
     let k = 8.min(seed.len().saturating_sub(1).max(1));

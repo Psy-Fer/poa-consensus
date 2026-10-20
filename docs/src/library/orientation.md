@@ -24,7 +24,9 @@ let result = consensus(&ref_slices, seed_idx, &PoaConfig::default())?;
 
 `auto_orient` returns `Cow<[u8]>` for each read: a borrowed slice if the read is already on
 the correct strand, or an owned `Vec<u8>` (the reverse complement) if it was flipped. This
-avoids copying reads that don't need it.
+avoids copying reads that don't need it. It compares each read to `reads[seed_idx]` with
+`orient_to_seed` using 8-mers (shorter for a very short reference read), so the reference
+should be a representative read that spans the locus.
 
 ## Per-read strand detection
 
@@ -38,9 +40,11 @@ match strand {
 }
 ```
 
-`orient_to_seed` builds a 15-mer frequency set from the seed and counts hits in both
-orientations of the read. The orientation with more matches wins. Falls back to alignment
-score comparison for ambiguous cases (low k-mer match counts, highly repetitive sequence).
+`orient_to_seed` counts the seed's k-mers (k is your argument; 15 above) found in the read
+and in its reverse complement, case-insensitively. The orientation with more hits wins. There
+is no alignment fallback: a tie (including zero hits, or a read or seed shorter than k)
+returns `Strand::Forward`, so low-complexity reads with no distinctive k-mers are left as
+they are.
 
 ## Reverse complement
 
