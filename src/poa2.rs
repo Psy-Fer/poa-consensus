@@ -2801,3 +2801,123 @@ mod tests_support_quality {
         }
     }
 }
+
+#[cfg(test)]
+mod tests_left_aligned_gaps {
+    //! The traceback runs right to left and prefers to keep matching, so a gap
+    //! opens only when forced: at the LEFTMOST of its equivalent positions
+    //! inside a run or tandem repeat. Every read therefore places the same
+    //! event at the same graph position, which is what lines reads up in the
+    //! graph (and what an explicit left-normalisation pass would do; one was
+    //! tried and moved nothing on the plain engine). These tests guard that
+    //! property against changes to the traceback order.
+    use super::*;
+
+    /// True if no indel run in `ops` can slide one base left: the op before a
+    /// run is not an exact match whose base equals the run's last base.
+    fn left_aligned(g: &Poa, read: &[u8], ops: &[Op]) -> bool {
+        let mut rp = 0usize;
+        let mut prev_match: Option<(usize, u8)> = None; // (node, read base)
+        let mut i = 0;
+        while i < ops.len() {
+            match ops[i] {
+                Op::Match(t) => {
+                    prev_match = Some((t, read[rp]));
+                    rp += 1;
+                    i += 1;
+                }
+                Op::Ins(_) | Op::Del(_) => {
+                    let is_del = matches!(ops[i], Op::Del(_));
+                    let mut e = i;
+                    while e < ops.len() && matches!(ops[e], Op::Del(_)) == is_del {
+                        if !is_del && !matches!(ops[e], Op::Ins(_)) {
+                            break;
+                        }
+                        if !is_del {
+                            rp += 1;
+                        }
+                        e += 1;
+                    }
+                    if let Some((p, rb)) = prev_match {
+                        let pb = g.nodes[p].base;
+                        let last = match ops[e - 1] {
+                            Op::Del(d) => g.nodes[d].base,
+                            Op::Ins(b) => b,
+                            Op::Match(_) => unreachable!(),
+                        };
+                        if pb == rb && last == pb {
+                            return false;
+                        }
+                    }
+                    prev_match = None;
+                    i = e;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn checker_rejects_a_right_placed_gap() {
+        use Op::{Del as D, Match as M};
+        let g = Poa::new(b"GCAAAAT", PoaConfig::default());
+        // GCAAAT with the deleted A on the last A of the run, then on the first
+        assert!(!left_aligned(
+            &g,
+            b"GCAAAT",
+            &[M(0), M(1), M(2), M(3), M(4), D(5), M(6)]
+        ));
+        assert!(left_aligned(
+            &g,
+            b"GCAAAT",
+            &[M(0), M(1), D(2), M(3), M(4), M(5), M(6)]
+        ));
+    }
+
+    #[test]
+    fn gaps_in_runs_and_repeats_are_left_aligned() {
+        let cfg = PoaConfig {
+            homopolymer_min_run: 0,
+            homopolymer_gap: None,
+            ..PoaConfig::default()
+        };
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let flank_l = b"GATCGTACGTTAGCATGCTG";
+        let flank_r = b"TTGCAGTCAGGATCCATGCA";
+        for trial in 0..200 {
+            // a homopolymer or dinucleotide tract, then one indel inside it
+            let tract: Vec<u8> = if trial % 2 == 0 {
+                vec![b"ACGT"[rnd(4)]; 6 + rnd(10)]
+            } else {
+                b"CA".repeat(5 + rnd(10))
+            };
+            let mut seed = flank_l.to_vec();
+            seed.extend(&tract);
+            seed.extend(flank_r);
+            let unit = if trial % 2 == 0 { 1 } else { 2 };
+            let at = flank_l.len() + unit * rnd(tract.len() / unit - 1);
+            let mut read = seed.clone();
+            if rnd(2) == 0 {
+                read.drain(at..at + unit);
+            } else {
+                let ins = read[at..at + unit].to_vec();
+                read.splice(at..at, ins);
+            }
+            let g = Poa::new(&seed, cfg.clone());
+            let (topo, rank) = g.topo_order();
+            let ops = g.align(&read, &topo, &rank);
+            assert!(
+                left_aligned(&g, &read, &ops),
+                "trial {trial}: gap not left-aligned\nseed {}\nread {}\nops {ops:?}",
+                String::from_utf8_lossy(&seed),
+                String::from_utf8_lossy(&read)
+            );
+        }
+    }
+}
