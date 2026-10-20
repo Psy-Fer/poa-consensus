@@ -1,27 +1,28 @@
-//! Clean partial-order alignment consensus engine (abPOA-style rebuild).
+//! Partial-order alignment consensus engine (abPOA-style).
 //!
-//! Deliberately mirrors abPOA's proven-clean core — full partial-order DP (one
-//! DP row per graph node, every node relaxes ALL its in-edges), heaviest
-//! bundling for consensus — with none of the accumulated machinery from
-//! `graph.rs` (spine-guided band, diagonal-skip, slide-lock, bypass edges,
-//! interior filter). The value the crate adds lives ABOVE this engine (analysis,
-//! CI, diagnostics); the engine itself just aims to match abPOA quality.
+//! Full partial-order affine-gap DP (one DP row per graph node in topological
+//! order, every node relaxes ALL its in-edges; columns are read positions),
+//! with an adaptive static-diagonal-union band and semi-global free ends by
+//! default. Banded rows store only their window, 12 bytes per cell (M/I/D
+//! `i32`); no backpointers are kept, the traceback replays the comparisons.
 //!
-//! Increment 1 (this file): data model, seed, full-PO affine **global** DP,
-//! read integration with SPOA/abPOA-style **node fusion** (match → reuse node;
+//! Read integration uses SPOA/abPOA-style **node fusion** (match → reuse node;
 //! mismatch → reuse an aligned sibling carrying that base, else create a new
 //! substitution node and cross-link it into the alignment column; insert → new
-//! node; delete → skip), heaviest-bundling consensus. Node fusion is in the core
-//! deliberately: full DP does NOT obviate it (DP decides the alignment; the
-//! graph-update must still represent a mismatch as a substitution node, or the
-//! read's base is dropped and the seed's minority base is wrongly kept — see
-//! `tests_mismatch::majority_substitution_over_seed_base`). abPOA/SPOA both do
-//! this via aligned-node columns.
+//! node; delete → skip the node and count it in its `del`). Node fusion is in
+//! the core deliberately: full DP does NOT obviate it (DP decides the
+//! alignment; the graph update must still represent a mismatch as a
+//! substitution node, or the read's base is dropped and the seed's minority
+//! base is wrongly kept; see
+//! `tests_mismatch::majority_substitution_over_seed_base`).
 //!
-//! Not yet (later increments, for scale/real data): adaptive static-diagonal-
-//! union band + semi-global free ends (full global DP is O(nodes×readlen) and
-//! fixed-end — fine for unit tests, too heavy/rigid for multi-kb partial reads);
-//! then real-data validation vs abPOA; then two-piece convex gaps and SIMD.
+//! Consensus: heaviest path, majority-frequency (MSA column plurality), or
+//! best-fit between the two (`ConsensusMode`). Per-read `read_paths` /
+//! `read_matched_edges` provenance feeds multi-allele phasing. The value the
+//! crate adds lives ABOVE this engine (analysis, diagnostics, multi-allele);
+//! the engine itself aims to match abPOA quality.
+//!
+//! Deferred: two-piece convex gaps and SIMD row scoring.
 
 use crate::config::{AlignmentMode, PoaConfig};
 use std::cell::Cell;
@@ -148,6 +149,17 @@ fn bgetd(
     }
 }
 
+/// Indel totals of all reads aligned to a candidate consensus (see
+/// [`Poa::fit`]). Both candidates are scored against the same reads, so raw
+/// totals compare directly.
+#[derive(Clone, Copy)]
+struct Fit {
+    /// Sum over indel events of `|gap_open|` plus `|gap_extend|` per base.
+    affine: u64,
+    /// Indel bases (inserted plus deleted).
+    indel_bases: u64,
+}
+
 /// An out-edge and how many reads traversed it (Match/Insert founding traffic).
 #[derive(Clone, Copy)]
 struct Edge {
@@ -268,7 +280,8 @@ impl Poa {
         (topo, rank_of)
     }
 
-    /// Full partial-order affine-gap GLOBAL alignment of `read` to the graph.
+    /// Full partial-order affine-gap alignment of `read` to the graph, global
+    /// or semi-global per `alignment_mode`, banded per the band settings.
     /// Standard Gotoh with three states, generalized to a DAG: node `t`'s M/D
     /// relax over all predecessors. Returns ops in forward read order.
     pub(crate) fn align(&self, read: &[u8], topo: &[usize], rank_of: &[usize]) -> Vec<Op> {
@@ -897,24 +910,18 @@ impl Poa {
             .collect()
     }
 
-    /// Fit score for a candidate consensus: build a throwaway graph seeded on
-    /// `candidate`, align every read to it, and return the mean per-base affine
-    /// indel penalty: each Insert/Delete event pays `|gap_open|`, each indel
-    /// base `|gap_extend|` (content the candidate doesn't explain / doesn't
-    /// confirm). Mismatches are not counted: on noisy reads they are mostly
-    /// read error, and counting them let a frame-broken majority candidate win
-    /// on ONT CAG50. Lower = better fit; 0.0 = no read needs an indel. Used to
-    /// pick between heaviest-path and majority-frequency candidates.
-    ///
-    /// Counting indel *bases* alone (the earlier metric) rewards a candidate
-    /// halfway between two repeat lengths: in a (CA)n locus where reads say 19
-    /// and 20 units, a frame-broken `(CA)19 C` is one base from every read, so
-    /// it beat both real lengths. Charging an open per event makes a one-base
-    /// frame break cost the same per read as a whole-unit difference, so the
-    /// in-frame candidate wins.
-    fn fit_score(candidate: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> f64 {
+    /// Fit of a candidate consensus to the reads: build a throwaway graph
+    /// seeded on `candidate`, align every read to it, and total the indels.
+    /// Mismatches are not counted: on noisy reads they are mostly read error,
+    /// and counting them let a frame-broken majority candidate win on ONT
+    /// CAG50. Used to pick between heaviest-path and majority-frequency
+    /// candidates (see [`Poa::mf_beats_hp`]).
+    fn fit(candidate: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> Fit {
         if candidate.is_empty() {
-            return f64::MAX;
+            return Fit {
+                affine: u64::MAX,
+                indel_bases: u64::MAX,
+            };
         }
         let g = Poa::new(candidate, cfg.clone());
         let (topo, rank) = g.topo_order();
@@ -922,8 +929,10 @@ impl Poa {
             cfg.gap_open.unsigned_abs() as u64,
             cfg.gap_extend.unsigned_abs() as u64,
         );
-        let mut penalty = 0u64;
-        let mut bases = 0usize;
+        let mut fit = Fit {
+            affine: 0,
+            indel_bases: 0,
+        };
         for r in reads {
             let mut prev = 0u8; // 0 = match, 1 = insert, 2 = delete
             for op in g.align(r, &topo, &rank) {
@@ -933,48 +942,63 @@ impl Poa {
                     Op::Del(_) => 2,
                 };
                 if kind != 0 {
-                    penalty += extend + if kind != prev { open } else { 0 };
+                    fit.indel_bases += 1;
+                    fit.affine += extend + if kind != prev { open } else { 0 };
                 }
                 prev = kind;
             }
-            bases += r.len();
         }
-        penalty as f64 / bases.max(1) as f64
+        fit
     }
 
-    /// Best of heaviest-path and majority-frequency, chosen by `fit_score`
-    /// against the reads. The two consensus modes win different cases (heaviest
-    /// on clean/short, majority on high-error length-variable repeats); scoring
-    /// both against the actual reads and keeping the better fit gets the best of
-    /// each without an oracle.
+    /// Whether the majority-frequency candidate should replace the heaviest
+    /// path: only when it fits the reads strictly better on BOTH measures,
+    /// fewer indel bases and a lower affine indel penalty. The heaviest path is
+    /// the graph-supported default; MF overrides it only on unambiguous
+    /// evidence. Each measure alone fails on (CA)n ladders:
+    /// - Indel bases alone reward a candidate halfway between two repeat
+    ///   lengths: with reads at 19 and 20 units, a frame-broken `(CA)19 C` is
+    ///   one base from every read, so it beat both real lengths.
+    /// - The affine penalty alone breaks exact base-count ties toward the
+    ///   shorter candidate: a read longer than the candidate can absorb several
+    ///   differences into one insertion run (one open), so a one-unit-short MF
+    ///   won on the open charge alone (and a 6-C homopolymer became 5 C on
+    ///   HG002 HiFi DM1).
+    fn mf_beats_hp(hp: &[u8], mf: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> bool {
+        let fh = Self::fit(hp, reads, cfg);
+        let fm = Self::fit(mf, reads, cfg);
+        fm.affine < fh.affine && fm.indel_bases < fh.indel_bases
+    }
+
+    /// Best of heaviest-path and majority-frequency, chosen by
+    /// [`Poa::mf_beats_hp`]. The two consensus modes win different cases
+    /// (heaviest on clean/short, majority on high-error length-variable
+    /// repeats); scoring both against the actual reads gets the better of each
+    /// without an oracle.
     pub fn consensus_best_fit(&self, reads: &[&[u8]]) -> Vec<u8> {
         let hp = self.consensus();
         let mf = self.consensus_majority();
-        if hp == mf {
-            return hp;
+        if hp != mf && Self::mf_beats_hp(&hp, &mf, reads, &self.cfg) {
+            mf
+        } else {
+            hp
         }
-        let fh = Self::fit_score(&hp, reads, &self.cfg);
-        let fm = Self::fit_score(&mf, reads, &self.cfg);
-        if fm < fh { mf } else { hp }
     }
 
     /// Rich `Consensus` output using the best-fit sequence (heaviest-path vs
-    /// majority-frequency, chosen by `fit_score`). When heaviest-path wins (the
-    /// common case) this is exactly `consensus_full()`. When majority-frequency
-    /// wins, the emitted sequence is the MF one and the per-position fields
-    /// (coverage, path_weights, gaps) are recomputed from the MF columns so the
-    /// output stays self-consistent; graph-structural fields (graph_stats,
-    /// bubble_sites) are unchanged since they describe the graph, not the path.
+    /// majority-frequency, chosen by [`Poa::mf_beats_hp`]). When heaviest-path
+    /// wins (the common case) this is exactly `consensus_full()`. When
+    /// majority-frequency wins, the emitted sequence is the MF one and the
+    /// per-position fields (coverage, path_weights, gaps) are recomputed from
+    /// the MF columns so the output stays self-consistent; graph-structural
+    /// fields (graph_stats, bubble_sites) are unchanged since they describe the
+    /// graph, not the path.
     pub fn consensus_full_best_fit(&self, reads: &[&[u8]]) -> crate::types::Consensus {
         let base = self.consensus_full();
         let (mf_seq, mf_cov) = self.consensus_majority_cov();
-        if base.sequence == mf_seq {
+        if base.sequence == mf_seq || !Self::mf_beats_hp(&base.sequence, &mf_seq, reads, &self.cfg)
+        {
             return base;
-        }
-        let fh = Self::fit_score(&base.sequence, reads, &self.cfg);
-        let fm = Self::fit_score(&mf_seq, reads, &self.cfg);
-        if fh <= fm {
-            return base; // heaviest-path wins (ties keep the path-based output)
         }
         Self::mf_full(base, mf_seq, mf_cov)
     }
@@ -1993,6 +2017,61 @@ mod tests_best_fit_frame {
                 String::from_utf8_lossy(&c.sequence)
             );
         }
+    }
+
+    /// ONT (CA)22 reads from bladerunner / str-replicant (synthetic), split
+    /// 4 x 21 units against 3 x 22 plus noise. Both candidates have the same
+    /// indel *bases*; the one-unit-short majority candidate needs one fewer
+    /// indel *event* (a longer read absorbs its differences into one insert
+    /// run), so an affine-only fit picked it. MF must not win on a tie in
+    /// indel bases.
+    #[test]
+    fn best_fit_keeps_heaviest_path_on_indel_base_tie() {
+        let reads: [&[u8]; 10] = [
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAG",
+            b"CGGGTCGGTCTTTGCGTTTTCACACGCACACACACACACACACTCACACGCACACACACACAGTTGGGAGTAGTGTTCTATT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACAGACACACACACACACACACACAAGCACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+        ];
+        let truth: &[u8] =
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT";
+        let c = crate::consensus(&reads, 0, &PoaConfig::default()).unwrap();
+        assert_eq!(
+            c.sequence,
+            truth,
+            "got {}",
+            String::from_utf8_lossy(&c.sequence)
+        );
+    }
+
+    /// Synthetic analogue of HG002 HiFi DM1 (homozygous `C6 (CAG)11`): two
+    /// reads one C short, one exact, and one exact plus an extra CAG. Against
+    /// a 5-C candidate the long read takes its extra C and CAG as one adjacent
+    /// 4-base insertion, so the 5-C candidate saves an indel open at the same
+    /// indel-base count. The heaviest path (6 C) must be kept.
+    #[test]
+    fn best_fit_keeps_longer_homopolymer_on_indel_base_tie() {
+        let reads: [&[u8]; 4] = [
+            b"GCTAAAGACAATTACATAATCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT",
+            b"GCTAAAGACAATTACATAATCCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT",
+            b"GCTAAAGACAATTACATAATCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT",
+            b"GCTAAAGACAATTACATAATCCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT",
+        ];
+        let truth: &[u8] =
+            b"GCTAAAGACAATTACATAATCCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT";
+        let c = crate::consensus(&reads, 0, &PoaConfig::default()).unwrap();
+        assert_eq!(
+            c.sequence,
+            truth,
+            "got {}",
+            String::from_utf8_lossy(&c.sequence)
+        );
     }
 }
 

@@ -134,16 +134,23 @@ struct Args {
     #[arg(long, default_value_t = 10, help_heading = "Multi-allele")]
     phasing_bubble_min_span: usize,
 
-    /// Experimental homopolymer compression: align runs of >= N identical bases
-    /// as one symbol and re-estimate their lengths after consensus (0 = off;
-    /// 1 = pure HPC; 2 = A,C,G,T,polyA..polyT). Single-allele only.
-    #[arg(long, default_value_t = 0, help_heading = "Coverage / consensus")]
+    /// Homopolymer compression: align runs of >= N identical bases as one
+    /// symbol and re-estimate their lengths after consensus; the result is
+    /// spliced in only inside runs and kept only if it fits the reads better
+    /// (0 = off; 1 = pure HPC; 2 = A,C,G,T,polyA..polyT). Single-allele only.
+    #[arg(long, default_value_t = 2, help_heading = "Coverage / consensus")]
     homopolymer_min_run: usize,
 
-    /// Experimental homopolymer-aware gap costs, as OPEN,EXTEND (e.g. -2,-1):
-    /// used instead of --gap-open/--gap-extend for indels inside a homopolymer.
-    #[arg(long, value_name = "OPEN,EXTEND", value_parser = parse_gap_pair, allow_hyphen_values = true, help_heading = "Scoring")]
-    homopolymer_gap: Option<(i32, i32)>,
+    /// Homopolymer-aware gap costs, as OPEN,EXTEND, used instead of
+    /// --gap-open/--gap-extend for indels inside a homopolymer ("off" to
+    /// disable). Guarded like --homopolymer-min-run. Single-allele only.
+    #[arg(long, value_name = "OPEN,EXTEND", default_value = "-2,-1", value_parser = parse_hp_gap, allow_hyphen_values = true, help_heading = "Scoring")]
+    homopolymer_gap: HpGap,
+
+    /// Disable homopolymer handling entirely (same as --homopolymer-min-run 0
+    /// --homopolymer-gap off): the plain engine consensus only.
+    #[arg(long, help_heading = "Coverage / consensus")]
+    no_homopolymer: bool,
 
     // ── Flanking ────────────────────────────────────────────────────────────────
     /// Left flank sequence anchoring the repeat region (use with --right-flank).
@@ -297,8 +304,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         consensus_mode: args.consensus_mode.into(),
         warn_on_long_unbanded: !args.no_long_unbanded_warning,
         phasing_bubble_min_span: args.phasing_bubble_min_span,
-        homopolymer_min_run: args.homopolymer_min_run,
-        homopolymer_gap: args.homopolymer_gap,
+        homopolymer_min_run: if args.no_homopolymer {
+            0
+        } else {
+            args.homopolymer_min_run
+        },
+        homopolymer_gap: if args.no_homopolymer {
+            None
+        } else {
+            args.homopolymer_gap.0
+        },
     };
 
     // Diagnostic thresholds shared by both the single- and multi-allele paths.
@@ -309,7 +324,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         depth_allele_threshold: args.depth_allele_threshold,
         interior_support_threshold: args.interior_support_threshold,
         boundary_margin: args.boundary_margin,
-        truncation_ratio_threshold: args.truncation_ratio_threshold,
+        // With flanks the output is sliced to the repeat, so it is expected to
+        // be much shorter than the (flank-carrying) reads: the length-ratio
+        // truncation check would fire spuriously.
+        truncation_ratio_threshold: if args.left_flank.is_some() || args.right_flank.is_some() {
+            0.0
+        } else {
+            args.truncation_ratio_threshold
+        },
         is_allele_partition: false,
     };
 
@@ -503,8 +525,15 @@ fn first_byte<R: BufRead>(reader: &mut R) -> Result<Option<u8>, Box<dyn std::err
     }
 }
 
-fn parse_gap_pair(s: &str) -> Result<(i32, i32), String> {
-    let (o, e) = s.split_once(',').ok_or("expected OPEN,EXTEND")?;
+/// `--homopolymer-gap` value: `OPEN,EXTEND`, or `off`.
+#[derive(Clone, Copy, Debug)]
+struct HpGap(Option<(i32, i32)>);
+
+fn parse_hp_gap(s: &str) -> Result<HpGap, String> {
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(HpGap(None));
+    }
+    let (o, e) = s.split_once(',').ok_or("expected OPEN,EXTEND or off")?;
     let p = |x: &str| x.trim().parse::<i32>().map_err(|e| e.to_string());
-    Ok((p(o)?, p(e)?))
+    Ok(HpGap(Some((p(o)?, p(e)?))))
 }
