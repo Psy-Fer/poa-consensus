@@ -246,6 +246,9 @@ fn expand(mut c: Consensus, runs: &[u32], raw_reads: &[&[u8]]) -> Consensus {
         .collect();
     c.coverage = repeat_runs(&c.coverage, runs);
     c.path_weights = repeat_runs(&c.path_weights, runs);
+    // Compressed-space support does not carry over to raw bases; a chosen
+    // splice is rescored on the raw reads (`consensus_homopolymer`).
+    c.support_quality = Vec::new();
     c.sequence = seq;
     let map = |p: usize| starts[p.min(n)];
     for gap in &mut c.gaps {
@@ -420,6 +423,7 @@ fn splice(raw: &Consensus, hpc: &Consensus, min_run: usize, config: &PoaConfig) 
     flush(&mut block, i, j, &mut src);
 
     let mut out = raw.clone();
+    out.support_quality = Vec::new(); // rescored by the caller if chosen
     out.sequence = src
         .iter()
         .map(|&(fh, x)| if fh { h[x] } else { r[x] })
@@ -519,7 +523,10 @@ pub(crate) fn consensus_homopolymer(
             best = Some((fm, merged));
         }
     }
-    best.map_or(raw, |(_, c)| c)
+    best.map_or(raw, |(_, mut c)| {
+        c.support_quality = crate::poa2::support_quality_by_realignment(&c.sequence, reads, base);
+        c
+    })
 }
 
 #[cfg(test)]

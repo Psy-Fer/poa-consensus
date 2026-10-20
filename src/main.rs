@@ -58,6 +58,13 @@ struct Args {
     #[arg(short = 'q', long)]
     quiet: bool,
 
+    /// Write FASTQ instead of FASTA, with the per-base support quality as the
+    /// quality string: how decisively the reads back each base over its
+    /// strongest alternative (Phred, capped at 60). Below ~Q10 the reads
+    /// disagree there, e.g. on a repeat length.
+    #[arg(long)]
+    fastq: bool,
+
     // ── Band ──────────────────────────────────────────────────────────────────
     /// Fixed band width floor for banded DP (0 = unbanded).  Combined with
     /// adaptive band (default on), effective width is max(band_width, adaptive
@@ -235,9 +242,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if reads.len() == 1 && args.min_reads <= 1 {
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        writeln!(out, ">consensus reads=1 seed=0 band=unbanded")?;
-        out.write_all(&reads[0])?;
-        writeln!(out)?;
+        // A lone read has no consensus support: Q0 throughout.
+        let qual = vec![0u8; reads[0].len()];
+        write_record(
+            &mut out,
+            args.fastq,
+            "consensus reads=1 seed=0 band=unbanded",
+            &reads[0],
+            &qual,
+        )?;
         return Ok(());
     }
 
@@ -376,16 +389,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             // allele.n_reads is the per-partition read count, not the total.
             // Callers use this to assess whether a minority allele has adequate depth.
-            writeln!(
-                out,
-                ">allele_{} reads={} total_reads={n} seed={seed_idx} band={band_desc} allele={}/{}",
+            let header = format!(
+                "allele_{} reads={} total_reads={n} seed={seed_idx} band={band_desc} allele={}/{}",
                 i + 1,
                 allele.n_reads,
                 i + 1,
                 total
+            );
+            write_record(
+                &mut out,
+                args.fastq,
+                &header,
+                &allele.sequence,
+                &allele.support_quality,
             )?;
-            out.write_all(&allele.sequence)?;
-            writeln!(out)?;
         }
     } else {
         // Single-allele: the clean poa2 engine (via `consensus()`). It seeds on
@@ -409,12 +426,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if !args.quiet {
             emit_warnings(&diagnose(&result, &diag_cfg), "consensus");
         }
-        writeln!(out, ">consensus reads={n} seed={med} band={band_desc}")?;
-        out.write_all(&result.sequence)?;
-        writeln!(out)?;
+        write_record(
+            &mut out,
+            args.fastq,
+            &format!("consensus reads={n} seed={med} band={band_desc}"),
+            &result.sequence,
+            &result.support_quality,
+        )?;
     }
 
     Ok(())
+}
+
+/// Write one output record: FASTA, or FASTQ with `qual` (Phred) as the
+/// quality string.
+fn write_record(
+    out: &mut impl Write,
+    fastq: bool,
+    header: &str,
+    seq: &[u8],
+    qual: &[u8],
+) -> io::Result<()> {
+    if !fastq {
+        writeln!(out, ">{header}")?;
+        out.write_all(seq)?;
+        return writeln!(out);
+    }
+    writeln!(out, "@{header}")?;
+    out.write_all(seq)?;
+    writeln!(out, "\n+")?;
+    // Every record should carry one quality per base; pad defensively with Q0.
+    let chars: Vec<u8> = (0..seq.len())
+        .map(|i| b'!' + qual.get(i).copied().unwrap_or(0).min(93))
+        .collect();
+    out.write_all(&chars)?;
+    writeln!(out)
 }
 
 // ── Diagnostic helpers ────────────────────────────────────────────────────────

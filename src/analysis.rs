@@ -120,6 +120,7 @@ pub fn min_coverage(consensus: &Consensus) -> u32 {
 ///     gaps: vec![],
 ///     bubble_sites: vec![],
 ///     read_indices: vec![],
+///     support_quality: vec![33; n],
 /// };
 ///
 /// let low = low_coverage_regions(&result, 3);
@@ -137,6 +138,59 @@ pub fn low_coverage_regions(consensus: &Consensus, threshold: u32) -> Vec<Range<
     }
     if let Some(s) = run_start {
         result.push(s..consensus.coverage.len());
+    }
+    result
+}
+
+/// Contiguous runs of positions whose support quality
+/// ([`Consensus::support_quality`]) is below `min_quality`.
+///
+/// These are the stretches where the reads do not decisively back the call:
+/// typically a split between two repeat lengths, a substitution supported by a
+/// large minority, or the edge of a homopolymer run the reads disagree on.
+/// Q10 is a good cut for "not solid": on simulated ONT and HiFi GC-rich repeat
+/// ladders at 10 reads per haplotype, a minimum below Q10 inside the repeat
+/// marked 98-99% of wrong repeat calls and 3-6% of right ones (Q20 marked no
+/// more wrong calls but 18-34% of right ones). At 10 reads Q10 is about a 7-3
+/// split; the same split at higher depth scores higher, as the majority is
+/// then more certain. The returned ranges are in
+/// ascending order and never overlap. A consensus without support quality
+/// (an empty vector) has no low-support regions.
+///
+/// # Examples
+/// ```
+/// use poa_consensus::analysis::low_support_regions;
+/// use poa_consensus::{Consensus, GraphStats};
+///
+/// let result = Consensus {
+///     sequence: b"CACACACA".to_vec(),
+///     coverage: vec![10; 8],
+///     path_weights: vec![10; 8],
+///     n_reads: 10,
+///     graph_stats: GraphStats::default(),
+///     gaps: vec![],
+///     bubble_sites: vec![],
+///     read_indices: vec![],
+///     // a 6-4 split on the last unit
+///     support_quality: vec![33, 33, 33, 33, 33, 33, 6, 6],
+/// };
+///
+/// assert_eq!(low_support_regions(&result, 10), vec![6..8]);
+/// ```
+///
+/// [`Consensus::support_quality`]: crate::Consensus::support_quality
+pub fn low_support_regions(consensus: &Consensus, min_quality: u8) -> Vec<Range<usize>> {
+    let mut result = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (i, &q) in consensus.support_quality.iter().enumerate() {
+        if q < min_quality {
+            run_start.get_or_insert(i);
+        } else if let Some(s) = run_start.take() {
+            result.push(s..i);
+        }
+    }
+    if let Some(s) = run_start {
+        result.push(s..consensus.support_quality.len());
     }
     result
 }
@@ -316,6 +370,7 @@ pub fn max_achievable_accuracy(n: usize, sigma_per_obs: f64) -> f64 {
 ///     gaps: vec![],
 ///     bubble_sites: vec![site],
 ///     read_indices: vec![],
+///     support_quality: vec![12; 4],
 /// };
 ///
 /// // 30% > 25%: a competing allele is present.
@@ -362,6 +417,7 @@ pub fn has_competing_allele(consensus: &Consensus, min_freq: f64) -> Option<&Bub
 ///     gaps: vec![],
 ///     bubble_sites: vec![],        // no bubbles
 ///     read_indices: vec![],
+///     support_quality: vec![33; 4],
 /// };
 /// assert!(!should_call_multiallele(&result, 0.25));
 /// ```
@@ -920,6 +976,7 @@ mod tests {
             gaps: vec![],
             bubble_sites,
             read_indices: vec![],
+            support_quality: vec![33; n],
         }
     }
 
@@ -1220,6 +1277,7 @@ mod tests {
             gaps: vec![],
             bubble_sites: vec![],
             read_indices: vec![],
+            support_quality: vec![33; seq_len],
         }
     }
 

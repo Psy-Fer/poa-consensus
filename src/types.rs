@@ -186,6 +186,26 @@ pub struct Consensus {
     /// enabling the caller to assign per-read rows, pull reads for visualisation,
     /// or compute per-allele statistics without re-running alignment.
     pub read_indices: Vec<usize>,
+    /// Per-base support quality, Phred-scaled and capped at 60: how decisively
+    /// the reads back each consensus base over its strongest alternative.
+    ///
+    /// Each read votes from its route through the graph: following the
+    /// consensus into a base agrees with it; any other route (a substitution,
+    /// a skip, an extra insertion) counts against the bases it bypasses. Reads
+    /// taking the same alternative route are pooled, and each base is scored
+    /// only against its strongest alternative, so scattered sequencing errors
+    /// do not add up but a competing call does. With `a` reads for the base and
+    /// `m` for its strongest alternative, the value is
+    /// `-10 log10 P(Binomial(a + m + 1, 1/2) > a)`: about Q33 for 10 agreeing
+    /// reads with no alternative, Q60 (the cap) from about 20, Q6 for a 6-4
+    /// split and Q3 for a tie or no spanning reads.
+    ///
+    /// It measures agreement, not truth: an error every read shares (such as
+    /// a systematic homopolymer undercall) still scores high. Use it to mark
+    /// solid and weak stretches of a call, e.g. with
+    /// [`low_support_regions`](crate::analysis::low_support_regions) (Q10 is
+    /// a good cut).
+    pub support_quality: Vec<u8>,
 }
 
 impl Consensus {

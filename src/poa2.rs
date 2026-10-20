@@ -119,6 +119,60 @@ fn coverage_threshold(population: usize, min_coverage_fraction: f64) -> u32 {
     }
 }
 
+/// Highest support quality reported (Phred). Beyond this the binomial tail
+/// says nothing useful: reads agreeing does not make them right.
+pub(crate) const MAX_SUPPORT_QUALITY: u8 = 60;
+
+/// Phred-scaled probability that a base's strongest alternative, not the
+/// called base, is what the reads favour: with `agree` reads for the call and
+/// `alt` for the alternative, each read a vote under a flat prior,
+/// `P = P(Binomial(agree + alt + 1, 1/2) > agree)`. 10 agreeing reads and no
+/// alternative give Q33; a 6-4 split gives Q6; a tie gives Q3.
+fn support_phred(agree: u32, alt: u32) -> u8 {
+    let n = (agree + alt + 1) as usize;
+    let k_min = agree as usize + 1;
+    let ln_2n = n as f64 * std::f64::consts::LN_2;
+    // Sum C(n, k) / 2^n for k = n down to k_min, with ln C(n, k) updated by
+    // C(n, k - 1) = C(n, k) * k / (n - k + 1).
+    let (mut ln_c, mut p) = (0.0f64, 0.0f64);
+    let mut k = n;
+    loop {
+        p += (ln_c - ln_2n).exp();
+        if k == k_min {
+            break;
+        }
+        ln_c += (k as f64).ln() - ((n - k + 1) as f64).ln();
+        k -= 1;
+    }
+    let q = -10.0 * p.log10();
+    q.clamp(0.0, MAX_SUPPORT_QUALITY as f64).round() as u8
+}
+
+/// Support quality for a consensus `seq` that is not a node path of the
+/// graph it came from (a majority-frequency call, or a homopolymer splice):
+/// build a support graph seeded with `seq`, add every read, and score the seed
+/// path (the seed itself does not vote).
+pub(crate) fn support_quality_by_realignment(
+    seq: &[u8],
+    reads: &[&[u8]],
+    cfg: &PoaConfig,
+) -> Vec<u8> {
+    if seq.is_empty() {
+        return Vec::new();
+    }
+    let cfg = PoaConfig {
+        homopolymer_min_run: 0,
+        homopolymer_gap: None,
+        ..cfg.clone()
+    };
+    let mut g = Poa::new(seq, cfg);
+    for r in reads {
+        g.add_read(r);
+    }
+    let path: Vec<usize> = (0..seq.len()).collect();
+    g.path_support_quality(&path, true)
+}
+
 /// Read a banded matrix cell (M or I). Returns NEG_INF for j=0 or out-of-band.
 #[inline]
 fn bget(flat: &[i32], off: &[usize], lo: &[usize], hi: &[usize], r: usize, j: usize) -> i32 {
@@ -1069,6 +1123,9 @@ impl Poa {
             gaps,
             bubble_sites: base.bubble_sites,
             read_indices: vec![],
+            // Not a node path in this graph: the caller scores it against the
+            // reads (`support_quality_by_realignment`).
+            support_quality: Vec::new(),
         }
     }
 
@@ -1455,6 +1512,72 @@ impl Poa {
     }
 
     /// Full consensus output (rich `Consensus`) for the public API.
+    /// Per-base support quality of a consensus that is the node path `path`
+    /// in this graph (see [`Consensus::support_quality`]). Each read votes from
+    /// its recorded path: between two consecutive consensus nodes it visits
+    /// (`a`, then `b`), stepping straight from `a` to `a + 1` agrees with base
+    /// `a + 1`; any other route is an alternative, against the skipped bases
+    /// `a + 1 .. b` or, for an insertion (`b == a + 1` via other nodes), against
+    /// `b`. Reads taking the same route (same anchors and intermediate nodes)
+    /// form one alternative, and each base is scored against its strongest
+    /// alternative only: sequencing errors scatter over many one-read routes,
+    /// while a competing call concentrates on one. Bases outside a read's first
+    /// and last consensus node get no vote from it. `skip_seed` drops read 0
+    /// (a support graph seeded with the consensus itself).
+    ///
+    /// [`Consensus::support_quality`]: crate::types::Consensus::support_quality
+    pub(crate) fn path_support_quality(&self, path: &[usize], skip_seed: bool) -> Vec<u8> {
+        let n = path.len();
+        let mut idx = vec![usize::MAX; self.nodes.len()];
+        for (i, &nd) in path.iter().enumerate() {
+            idx[nd] = i;
+        }
+        let mut agree = vec![0u32; n];
+        let mut routes: HashMap<(usize, usize, Vec<usize>), u32> = HashMap::new();
+        for (r, rp) in self.read_paths.iter().enumerate() {
+            if skip_seed && r == 0 {
+                continue;
+            }
+            // (consensus index, position in the read's path) of the last anchor
+            let mut prev: Option<(usize, usize)> = None;
+            for (k, &nd) in rp.iter().enumerate() {
+                let ci = idx[nd];
+                if ci == usize::MAX {
+                    continue;
+                }
+                match prev {
+                    None => agree[ci] += 1,
+                    Some((a, _)) if ci <= a => continue, // not forward along the path
+                    Some((a, ka)) => {
+                        if ci == a + 1 && k == ka + 1 {
+                            agree[ci] += 1;
+                        } else {
+                            *routes.entry((a, ci, rp[ka + 1..k].to_vec())).or_insert(0) += 1;
+                            if ci > a + 1 {
+                                // skipped or substituted bases are the alternative;
+                                // the read still carries base `ci` itself
+                                agree[ci] += 1;
+                            }
+                        }
+                    }
+                }
+                prev = Some((ci, k));
+            }
+        }
+        let mut alt = vec![0u32; n];
+        for ((a, b, _), &count) in &routes {
+            let span = if *b > a + 1 { a + 1..*b } else { *b..b + 1 };
+            for x in &mut alt[span] {
+                *x = (*x).max(count);
+            }
+        }
+        agree
+            .iter()
+            .zip(&alt)
+            .map(|(&a, &m)| support_phred(a, m))
+            .collect()
+    }
+
     pub fn consensus_full(&self) -> crate::types::Consensus {
         use crate::types::{BubbleSite, Consensus, CoverageGap, GapKind};
         let path = self.heaviest_path_nodes();
@@ -1544,6 +1667,7 @@ impl Poa {
             gaps,
             bubble_sites,
             read_indices: vec![],
+            support_quality: self.path_support_quality(&path, false),
         }
     }
 
@@ -2642,6 +2766,37 @@ mod tests_hp_methods {
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_support_quality {
+    use super::*;
+
+    #[test]
+    fn support_phred_values() {
+        // 10 reads agree, no alternative: P = 2^-11.
+        assert_eq!(support_phred(10, 0), 33);
+        // 6-4 split: P(Bin(11, 1/2) > 6) = 562 / 2048.
+        assert_eq!(support_phred(6, 4), 6);
+        // tie, and no spanning reads at all: P = 1/2.
+        assert_eq!(support_phred(5, 5), 3);
+        assert_eq!(support_phred(0, 0), 3);
+        // the alternative outvotes the call
+        assert_eq!(support_phred(2, 8), 0);
+        // deep agreement is capped
+        assert_eq!(support_phred(200, 0), MAX_SUPPORT_QUALITY);
+        assert_eq!(support_phred(10_000, 3), MAX_SUPPORT_QUALITY);
+    }
+
+    #[test]
+    fn support_phred_is_monotone() {
+        for a in 0..40 {
+            for m in 0..10 {
+                assert!(support_phred(a + 1, m) >= support_phred(a, m));
+                assert!(support_phred(a, m + 1) <= support_phred(a, m));
             }
         }
     }

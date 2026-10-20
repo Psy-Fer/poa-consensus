@@ -483,10 +483,17 @@ pub(crate) fn engine_consensus(reads: &[&[u8]], config: &PoaConfig) -> Consensus
     //  - MajorityFrequency: force the MSA-column majority consensus (useful for
     //    high-depth amplicons where column majority is trusted outright).
     // Per-position output fields are made consistent with the chosen sequence.
-    match config.consensus_mode {
+    let mut c = match config.consensus_mode {
         crate::config::ConsensusMode::MajorityFrequency => g.consensus_full_majority(),
         crate::config::ConsensusMode::BestFit => g.consensus_full_best_fit(reads),
+    };
+    // A heaviest-path call is scored from the reads' recorded paths; a
+    // majority-frequency call is not a node path here, so score it on a
+    // support graph seeded with it.
+    if c.support_quality.len() != c.sequence.len() {
+        c.support_quality = crate::poa2::support_quality_by_realignment(&c.sequence, reads, config);
     }
+    c
 }
 
 /// Build a multi-allele consensus from `reads`.
@@ -579,6 +586,11 @@ fn slice_to_repeat(c: Consensus, left: &[u8], right: &[u8]) -> Consensus {
             .path_weights
             .get(s..e)
             .map(<[i32]>::to_vec)
+            .unwrap_or_default(),
+        support_quality: c
+            .support_quality
+            .get(s..e)
+            .map(<[u8]>::to_vec)
             .unwrap_or_default(),
         n_reads: c.n_reads,
         graph_stats: c.graph_stats,
@@ -725,6 +737,9 @@ pub fn bridged_consensus(
     let mut path_weights = left.path_weights.clone();
     path_weights.extend_from_slice(&right.path_weights);
 
+    let mut support_quality = left.support_quality.clone();
+    support_quality.extend_from_slice(&right.support_quality);
+
     // Carry forward any spanning gaps from each segment (offset right gaps by join).
     let mut gaps = left.gaps.clone();
     for gap in &right.gaps {
@@ -751,5 +766,6 @@ pub fn bridged_consensus(
         gaps,
         bubble_sites: vec![],
         read_indices: vec![],
+        support_quality,
     })
 }

@@ -170,6 +170,7 @@ pub struct Consensus {
     pub gaps:         Vec<CoverageGap>,
     pub bubble_sites: Vec<BubbleSite>,
     pub read_indices: Vec<usize>,    // populated by consensus_multi; empty otherwise
+    pub support_quality: Vec<u8>,    // per-base support quality (Phred, capped at 60)
 }
 ```
 
@@ -177,6 +178,16 @@ pub struct Consensus {
 agreed (`path_weights` high) and coverage is at full depth is reliable. A position where
 coverage drops (e.g. at a gap) is suspect. For the first base, and for MF output,
 `path_weights` is derived from coverage because there is no single incoming path edge.
+
+`support_quality` is the per-base summary of that confidence. For a heaviest-path call it
+comes straight from the recorded read paths: each read's route into a base either follows
+the consensus (agreement) or takes an alternative route, reads on the same route are
+pooled, and each base is scored against its strongest alternative. When the emitted
+sequence is not a path in the build graph (a majority-frequency call, or a homopolymer
+splice), the reads are aligned into a fresh graph seeded with that sequence and scored
+the same way. See
+[Per-base support quality](../library/diagnostics.md#per-base-support-quality) for the
+scale and how to use it.
 
 ## GraphStats
 

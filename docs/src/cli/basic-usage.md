@@ -33,6 +33,21 @@ With `--multi`, one record is written per allele:
 `reads` is the allele's own read count; use it to judge whether a minority allele has
 enough depth.
 
+With `--fastq`, each record is written as FASTQ instead, with the per-base **support
+quality** as the quality string: how decisively the reads back each base over its
+strongest alternative (Phred, capped at 60). Below about Q10 the reads disagree there,
+for example on a repeat length; see
+[Per-base support quality](../library/diagnostics.md#per-base-support-quality).
+
+```
+@consensus reads=10 seed=3 band=adaptive
+CGGTCGGGCTTCTCTCTCTCCACACACACACACACACACACACACACACACACACACACACAGCGGATAATGCCTGCACTAT
++
+BBBBBBBBBB..7B7BBB77..BBBBBBBBBBBBBBBBB77BBBBB7BBBBB'%B77B7BBBBBBBBBBBBBBBBBBBBBBB
+```
+
+Here the `'%` (Q6, Q4) mark a CA unit the reads split on.
+
 ## Flags
 
 Run `poa-consensus --help` for the full list with descriptions. The main ones:
@@ -40,6 +55,7 @@ Run `poa-consensus --help` for the full list with descriptions. The main ones:
 | Flag | Default | Description |
 |---|---|---|
 | `-m`, `--multi` | off | Multi-allele mode; one record per detected allele |
+| `--fastq` | off | Write FASTQ, with per-base support quality as the quality string |
 | `--left-flank SEQ`, `--right-flank SEQ` | off | Return only the region between two flank sequences, excluding partial reads automatically (both required together; use ≥ ~20 bp of unique flank) |
 | `-b`, `--band-width N` | 50 | Band half-width floor. The half-width used is `max(N, b + f × read_len)` |
 | `--no-adaptive-band` | off | Together with `--band-width 0`, turns banding off entirely (fully unbanded DP) |

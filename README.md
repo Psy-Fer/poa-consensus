@@ -135,6 +135,8 @@ if !warnings.is_clean() {
 
 `diagnose` checks five independent signals: read depth, coverage gaps, near-zero interior support, structural competing alleles, and suspected truncation (consensus much shorter than the median read). All signals are also available as structured fields on `ConsensusWarnings` for programmatic handling.
 
+Every `Consensus` also carries `support_quality`, a per-base Phred score (capped at 60) for how decisively the reads back each base over its strongest alternative. Below about Q10 the reads disagree there, typically on a repeat length; `analysis::low_support_regions(&result, 10)` returns those stretches, and the CLI writes the scores as the FASTQ quality string with `--fastq`.
+
 ## CLI
 
 ```

@@ -11,6 +11,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Breaking
 
+- **`Consensus` has a new public field, `support_quality: Vec<u8>`** (see Added). Code
+  that builds a `Consensus` with a struct literal must add it.
 - **Homopolymer handling is on by default** (`homopolymer_min_run: 2`,
   `homopolymer_gap: Some((-2, -1))`). Single-allele `consensus` output (and
   `consensus_flanked` / `bridged_consensus`, which call it) can change at homopolymer runs
@@ -19,6 +21,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   is unaffected.
 
 ### Added
+
+- **Per-base support quality: `Consensus::support_quality`** (CLI `--fastq`), and
+  `analysis::low_support_regions`. One Phred-scaled value per consensus base, capped at
+  60, saying how decisively the reads back that base over its strongest alternative.
+  Each read votes from its route through the graph; reads taking the same alternative
+  route (a substitution, a skip, an extra insertion) are pooled, and each base is scored
+  against its strongest alternative, so scattered sequencing errors do not add up but a
+  competing call does. With `a` reads for and `m` against, the value is
+  `-10 log10 P(Binomial(a + m + 1, 1/2) > a)`: Q33 for 10 agreeing reads, Q6 for a 6-4
+  split. On simulated ONT and HiFi GC-rich repeat ladders at 10 reads per haplotype, a
+  minimum below Q10 inside the repeat marked 98-99% of wrong repeat calls and 3-6% of
+  right ones, so Q10 is the suggested "not solid" cut. Computed from the reads' recorded
+  graph paths, so it adds no measurable CPU for heaviest-path calls; majority-frequency
+  calls and homopolymer splices are scored on a support graph seeded with the call.
+  Breaking for code that builds a `Consensus` with a struct literal: add the field.
 
 - **Homopolymer handling: `PoaConfig::homopolymer_min_run` and
   `PoaConfig::homopolymer_gap`** (CLI `--homopolymer-min-run K`,
