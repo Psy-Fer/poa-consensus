@@ -1210,8 +1210,8 @@ impl Poa {
             }
             x
         }
-        for i in 0..n {
-            for &a in &self.nodes[i].aligned {
+        for (i, nd) in self.nodes.iter().enumerate() {
+            for &a in &nd.aligned {
                 let (ri, ra) = (find(&mut parent, i), find(&mut parent, a));
                 if ri != ra {
                     parent[ri] = ra;
@@ -1222,9 +1222,9 @@ impl Poa {
         let mut group_out: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut indeg = vec![0usize; n];
         let mut seen = std::collections::HashSet::new();
-        for i in 0..n {
+        for (i, nd) in self.nodes.iter().enumerate() {
             let gi = find(&mut parent, i);
-            for e in &self.nodes[i].out {
+            for e in &nd.out {
                 let gj = find(&mut parent, e.to);
                 if gi != gj && seen.insert((gi, gj)) {
                     group_out[gi].push(gj);
@@ -1793,8 +1793,8 @@ impl Poa {
         }
         // Fork sites: nodes with ≥2 matched out-edges each ≥ floor.
         let mut sites: Vec<Site> = Vec::new();
-        for node in 0..self.nodes.len() {
-            let mut branches: Vec<(usize, u32)> = self.nodes[node]
+        for (node, nd) in self.nodes.iter().enumerate() {
+            let mut branches: Vec<(usize, u32)> = nd
                 .out
                 .iter()
                 .filter_map(|e| {

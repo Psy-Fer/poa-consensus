@@ -4,7 +4,7 @@
 
 ```toml
 [dependencies]
-poa-consensus = "0.6"
+poa-consensus = "0.7"
 ```
 
 ## Minimal example

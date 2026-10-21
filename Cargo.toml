@@ -1,12 +1,11 @@
 [package]
 name = "poa-consensus"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Banded Partial Order Alignment (POA) consensus for short tandem repeat and amplicon reads"
 license = "MIT"
 repository = "https://github.com/Psy-Fer/poa-consensus"
-homepage = "https://github.com/Psy-Fer/poa-consensus"
 documentation = "https://docs.rs/poa-consensus"
 readme = "README.md"
 authors = ["James Ferguson <j.ferguson@garvan.org.au>"]

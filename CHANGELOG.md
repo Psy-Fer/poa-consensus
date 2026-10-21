@@ -7,9 +7,32 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [0.7.0] - 2026-10-21
+
+Accuracy on noisy repeat reads, per-base confidence, and speed. Homopolymer handling and
+tandem gap costs are new and on by default: on a run-length-noise benchmark of
+homopolymer-rich and A/T-rich repeats the default calls about twice as many alleles
+exactly as abPOA, the best external caller tested, and on bladerunner's hard ONT `(CA)n`
+cases it ties for best. Every consensus now carries a per-base support quality, so calls
+the reads cannot settle are marked. The alignment DP is 2.5-4x faster with byte-identical
+output. Known limits are collected in the new Limitations page of the book.
+`validate.py` 20/20, `compare_callers.py` 16/16 and `--comprehensive` are unchanged.
 
 ### Breaking
+
+- **`PoaConfig` has three new public fields**, `homopolymer_min_run`, `homopolymer_gap`
+  and `tandem_gap` (see Added). Code that builds a `PoaConfig` with a struct literal must
+  add them, or use `..PoaConfig::default()`.
+- **Default single-allele output changes.** Homopolymer handling and tandem gap costs are
+  on, and the best-fit selector uses a new rule (see Fixed). Set `homopolymer_min_run: 0,
+  homopolymer_gap: None, tandem_gap: None` (CLI `--no-homopolymer --tandem-gap off`) for
+  the plain engine; the best-fit change cannot be switched off.
+- **`adaptive_band: false` now gives a fixed band** of half-width `band_width` (see
+  Fixed). Previously the length term still widened it on reads over ~4 kb, so calls with
+  the adaptive band off can change on long reads.
+- **`bubble_sites`, `GraphStats::bubble_count` / `max_bubble_depth` and the structural
+  competing-allele note can report fewer sites**: arms now need
+  `ceil(n_reads * min_allele_freq)` reads (see Fixed).
 
 - **Tandem gap costs are on by default** (`tandem_gap: Some((-2, -1))`). Single-allele
   calls in tandem repeats can change where the reads support a different unit count than
