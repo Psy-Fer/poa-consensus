@@ -50,7 +50,8 @@ pub enum ConsensusMode {
 ///
 /// Banding is on when `band_width > 0 || adaptive_band`. The band half-width
 /// (columns each side of the band centre) is
-/// `max(band_width, adaptive_band_b + ceil(adaptive_band_f * read_len), 4)`.
+/// `max(band_width, adaptive_band_b + ceil(adaptive_band_f * read_len), 4)`
+/// with `adaptive_band` on, and `max(band_width, 4)` with it off.
 /// Fully unbanded alignment needs `band_width = 0` **and**
 /// `adaptive_band = false`. Reads shorter than 0.8x the graph span (partial
 /// reads) are always aligned unbanded.
@@ -60,8 +61,10 @@ pub struct PoaConfig {
     /// `adaptive_band` is set; `0` together with `adaptive_band = false` means
     /// fully unbanded (warns on reads > ~1 kb, see `warn_on_long_unbanded`).
     pub band_width: usize,
-    /// Enable banding even when `band_width == 0` (abPOA-style adaptive band,
-    /// half-width term `adaptive_band_b + ceil(adaptive_band_f * L)`). Default `true`.
+    /// abPOA-style adaptive band: widen the half-width to
+    /// `adaptive_band_b + ceil(adaptive_band_f * L)` when that exceeds
+    /// `band_width` (reads over ~4 kb at the defaults), and band even when
+    /// `band_width == 0`. Off: a fixed `band_width` half-width. Default `true`.
     pub adaptive_band: bool,
     /// Base component of the adaptive half-width term (abPOA default: 10).
     pub adaptive_band_b: usize,

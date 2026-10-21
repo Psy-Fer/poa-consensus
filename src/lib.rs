@@ -98,7 +98,8 @@
 //!
 //! Banding is on when `band_width > 0 || adaptive_band` (the default).  Each
 //! row keeps a window of about `2 × half + 1` columns, where the half-width is
-//! `max(band_width, adaptive_band_b + ceil(adaptive_band_f × read_len), 4)`.
+//! `max(band_width, adaptive_band_b + ceil(adaptive_band_f × read_len), 4)`
+//! (just `max(band_width, 4)` with `adaptive_band = false`).
 //! Fully unbanded alignment needs `band_width = 0` **and**
 //! `adaptive_band = false`.  Partial reads (shorter than 0.8x the graph span)
 //! are always aligned unbanded.
@@ -155,6 +156,17 @@
 //! 5/5, each group must independently satisfy `min_reads`.
 //!
 //! ## Known limitations
+//!
+//! The full list, with numbers and what to do about each, is the "Limitations"
+//! page of the project book (`docs/src/limitations.md`). The most important:
+//!
+//! **Repeat lengths at the edge of the read evidence.** When noisy reads split
+//! on a repeat length by a unit, no method calls the exact length every time:
+//! [`analysis::max_achievable_accuracy`] gives the ceiling, and
+//! [`analysis::count_credible_interval`] the interval the reads support. ONT
+//! deletion bias can put the true length outside that interval. Treat an exact
+//! count as uncertain where [`Consensus::support_quality`] is below about Q10
+//! inside the repeat. Some sensitivity to read order also remains.
 //!
 //! **Phase-shift majority trim.** When the majority of reads are phase-shifted
 //! relative to the seed (e.g. most reads start one repeat unit later), boundary

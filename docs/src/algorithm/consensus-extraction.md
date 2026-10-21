@@ -219,7 +219,7 @@ scale and how to use it.
 
 | Field | Meaning |
 |---|---|
-| `bubble_count` | Fork nodes with 2+ out-edges each carrying at least `max(floor(n_reads * min_allele_freq), 1)` reads (matched adjacencies only) |
+| `bubble_count` | Fork nodes with 2+ out-edges each carrying at least `max(ceil(n_reads * min_allele_freq), 1)` reads (matched adjacencies only) |
 | `max_bubble_depth` | Read count on the strongest minority arm |
 | `longest_bubble_span` | Longest bubble arm, in bases |
 | `coverage_mean` / `coverage_variance` | Node coverage distribution |

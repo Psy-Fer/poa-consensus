@@ -27,8 +27,8 @@ Two floors are used, both derived from `min_allele_freq` (default 0.2) and the r
 With 20 reads both are 4: an arm or allele needs at least 4 reads. Arms below the floor
 are treated as noise. Bubble counting only uses *matched* adjacencies, so the edge a short
 allele takes to bypass a longer allele's extra sequence does not look like a competing arm.
-(The `GraphStats` / `bubble_sites` reporting on a single consensus uses a slightly looser
-`max(floor(n * min_allele_freq), 1)`.)
+(The `GraphStats` / `bubble_sites` reporting on a single consensus uses the same
+`max(ceil(n * min_allele_freq), 1)` floor.)
 
 `min_allele_freq` is a hard sensitivity boundary: an allele below it is merged into the
 majority and does not appear in the output. Lower it to look for mosaics; raise it (~0.4)

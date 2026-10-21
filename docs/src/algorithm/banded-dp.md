@@ -25,14 +25,14 @@ pub struct PoaConfig {
 Banding is **on** when `band_width > 0 || adaptive_band`. To run unbanded you must set
 **both** `band_width = 0` and `adaptive_band = false`; `band_width = 0` alone still bands.
 
-When banding is on, the half-width for a read of length `L` is always:
+When banding is on, the half-width for a read of length `L` is:
 
 ```
-half = max(band_width, adaptive_band_b + ceil(adaptive_band_f * L), 4)
+half = max(band_width, adaptive_band_b + ceil(adaptive_band_f * L), 4)   // adaptive_band
+half = max(band_width, 4)                                                // fixed band
 ```
 
-The length term is applied whether or not `adaptive_band` is set; `adaptive_band` only
-matters for switching banding on when `band_width` is 0.
+`adaptive_band` both adds the length term and turns banding on when `band_width` is 0.
 
 **Default:** `band_width = 50`, `adaptive_band = true`. The 50 bp floor prevents silent
 repeat-unit loss in long repetitive alleles where the length term alone (16 for a 600 bp

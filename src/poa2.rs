@@ -453,9 +453,15 @@ impl Poa {
         // arrays with per-row offsets, so memory is O(nodes × band) not
         // O(nodes × readlen).
         let banded0 = self.cfg.band_width > 0 || self.cfg.adaptive_band;
+        // Half-width: `band_width`, widened to the abPOA length term
+        // `b + ceil(f * L)` when `adaptive_band` is on. With it off the band is
+        // the fixed `band_width`.
         let half = {
-            let adaptive =
-                self.cfg.adaptive_band_b + (self.cfg.adaptive_band_f * l as f32).ceil() as usize;
+            let adaptive = if self.cfg.adaptive_band {
+                self.cfg.adaptive_band_b + (self.cfg.adaptive_band_f * l as f32).ceil() as usize
+            } else {
+                0
+            };
             adaptive.max(self.cfg.band_width).max(4)
         };
         let mut remain = vec![0usize; n]; // heaviest-out-edge node-distance to sink
@@ -1434,6 +1440,15 @@ impl Poa {
     }
 
     /// GraphStats over the whole graph (O(V+E)).
+    /// Minimum matched-read count for a bubble arm to be reported (bubble
+    /// sites, bubble statistics): `ceil(n_reads * min_allele_freq)`, at least
+    /// 1, so a reported arm carries at least `min_allele_freq` of the reads.
+    /// Multi-allele discovery uses the same rule; acting on a split
+    /// additionally needs 2 reads (`multi::phasing_floor`).
+    fn allele_arm_floor(&self) -> i32 {
+        (((self.n_reads as f64) * self.cfg.min_allele_freq).ceil() as i32).max(1)
+    }
+
     fn compute_stats(&self, er: &HashMap<(usize, usize), Vec<u32>>) -> crate::types::GraphStats {
         use crate::types::GraphStats;
         let n = self.nodes.len();
@@ -1487,8 +1502,7 @@ impl Poa {
         // MATCHED edge view (`er`), not `Edge.weight`, so a length variant's
         // delete-bypass resume edge does not inflate bubble_count/max_bubble_depth
         // (see the matched-edge invariant and the bubble scan in `consensus_full`).
-        let floor = ((self.n_reads as f64) * self.cfg.min_allele_freq).floor() as i32;
-        let floor = floor.max(1);
+        let floor = self.allele_arm_floor();
         let mut bubble_count = 0usize;
         let mut max_bubble_depth = 0usize;
         let mut longest_span = 0usize;
@@ -1689,7 +1703,7 @@ impl Poa {
         // bypass-inclusive `read_paths` separately. See the `read_matched_edges`
         // invariant.
         let er = self.edge_reads();
-        let floor = (((self.n_reads as f64) * self.cfg.min_allele_freq).floor() as i32).max(1);
+        let floor = self.allele_arm_floor();
         let mut bubble_sites = Vec::new();
         for (pos, &nd) in path.iter().enumerate() {
             let mw = |to: usize| er.get(&(nd, to)).map_or(0, |v| v.len()) as i32;

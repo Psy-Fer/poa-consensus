@@ -64,7 +64,7 @@ impl CoverageGap {
 
 /// One bubble site in the POA graph: a node on the heaviest path that has two
 /// or more outgoing arms each confirmed by at least
-/// `max(1, floor(n_reads * min_allele_freq))` reads.
+/// `max(1, ceil(n_reads * min_allele_freq))` reads.
 ///
 /// Arms with fewer reads (but above the frequency threshold) are competing
 /// alleles or sequencing artefacts; callers use `arm_read_counts` and
@@ -119,7 +119,7 @@ pub struct GraphStats {
     /// Number of edges in the graph.
     pub edge_count: usize,
     /// Number of fork nodes anywhere in the graph with 2+ outgoing arms each
-    /// confirmed by at least `max(1, floor(n_reads * min_allele_freq))` reads.
+    /// confirmed by at least `max(1, ceil(n_reads * min_allele_freq))` reads.
     pub bubble_count: usize,
     /// Largest minority-arm read count over those forks (the read count of the
     /// second-best arm at the most balanced bubble), not a nesting depth.

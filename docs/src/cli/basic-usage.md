@@ -57,7 +57,7 @@ Run `poa-consensus --help` for the full list with descriptions. The main ones:
 | `-m`, `--multi` | off | Multi-allele mode; one record per detected allele |
 | `--fastq` | off | Write FASTQ, with per-base support quality as the quality string |
 | `--left-flank SEQ`, `--right-flank SEQ` | off | Return only the region between two flank sequences, excluding partial reads automatically (both required together; use ≥ ~20 bp of unique flank) |
-| `-b`, `--band-width N` | 50 | Band half-width floor. The half-width used is `max(N, b + f × read_len)` |
+| `-b`, `--band-width N` | 50 | Band half-width floor. The half-width used is `max(N, b + f × read_len)`, or `N` with `--no-adaptive-band` |
 | `--no-adaptive-band` | off | Together with `--band-width 0`, turns banding off entirely (fully unbanded DP) |
 | `--adaptive-band-b`, `--adaptive-band-f` | 10, 0.01 | Adaptive band `w = b + f × read_len` |
 | `--global` | off | Global alignment (semi-global, with free terminal gaps, is the default) |

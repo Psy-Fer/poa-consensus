@@ -148,6 +148,25 @@ if !warnings.is_clean() {
 
 Every `Consensus` also carries `support_quality`, a per-base Phred score (capped at 60) for how decisively the reads back each base over its strongest alternative. Below about Q10 the reads disagree there, typically on a repeat length; `analysis::low_support_regions(&result, 10)` returns those stretches, and the CLI writes the scores as the FASTQ quality string with `--fastq`.
 
+## Limitations
+
+- **Repeat lengths at the edge of the read evidence.** With ~10 noisy reads that split
+  by a unit, no method can call the exact length every time, and ONT deletion bias can put
+  the true length outside what the reads support. Where support quality is below ~Q10
+  inside a repeat, treat the exact count as uncertain.
+- **Some sensitivity to read order** remains, e.g. a repeat next to a variable-length
+  homopolymer.
+- **Support quality measures agreement, not truth:** an error every read shares scores high.
+- **GC-rich repeats with two-base runs** (`GGC`, `CCG`): homopolymer compression
+  occasionally calls one unit short on clean ONT expansions.
+- **Very low depth over multi-kb loci** can mis-align within the band; cross-check unbanded.
+- **Repeats without flanks** need flank anchoring (`consensus_flanked`).
+- **Multi-allele** calls use the plain heaviest path, and phasing inside periodic repeats
+  remains hard.
+- **It is not a repeat genotyper:** no stutter or length-bias model, and no repeat counts.
+
+Details and what to do about each: [docs/src/limitations.md](docs/src/limitations.md).
+
 ## CLI
 
 ```

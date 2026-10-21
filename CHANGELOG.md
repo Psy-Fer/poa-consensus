@@ -88,6 +88,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   correct `(CA)n` calls one unit short and a homozygous 6-C HiFi DM1 call into 5 C.
   Behaviour change: `consensus` output can differ wherever the two candidates disagreed.
 
+- **`adaptive_band: false` now gives a fixed band.** The half-width was
+  `max(band_width, adaptive_band_b + ceil(adaptive_band_f * L))` whether or not the adaptive
+  band was on, so `--no-adaptive-band` still widened the band on reads over ~4 kb. It is
+  now `band_width`, as documented. Default (adaptive) output is unchanged; on 10-20 kb
+  reads a fixed band of 50 is narrower than before, and less accurate than the default.
+- **Bubble sites and bubble statistics now use the allele-frequency floor as stated.**
+  An arm was reported at `floor(n_reads * min_allele_freq)` reads (e.g. 2 of 12 at 0.2,
+  below 20%); it is now `ceil(...)`, matching multi-allele bubble discovery. Consensus
+  sequences are unchanged; `bubble_sites`, `bubble_count`, `max_bubble_depth` and the
+  structural competing-allele note can report fewer sites (86 instead of 99 notes on 655
+  phased HG002 and simulated read sets, all of them single haplotypes).
 - **CLI: no spurious truncation warning with `--left-flank` / `--right-flank`.** The
   output is sliced to the repeat, so it is naturally much shorter than the reads; the
   length-ratio truncation check is now skipped in flank mode.

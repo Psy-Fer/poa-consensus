@@ -90,7 +90,7 @@ let config = PoaConfig { min_reads: 5, ..PoaConfig::default() };
 ```
 
 **Banding.** The band half-width is `max(band_width, adaptive_band_b + adaptive_band_f ×
-read_len, 4)`, recomputed per read. Fully unbanded alignment needs both `band_width: 0` and
+read_len, 4)`, recomputed per read (`max(band_width, 4)` with `adaptive_band: false`). Fully unbanded alignment needs both `band_width: 0` and
 `adaptive_band: false`; `band_width: 0` alone still uses the adaptive band. Reads much
 shorter than the graph (partial reads) are aligned unbanded automatically.
 
