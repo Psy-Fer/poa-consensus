@@ -83,8 +83,8 @@ impl PhasingMatrix {
         // Contingency table counts[branch_a][branch_b].
         let mut counts = vec![vec![0u32; nb]; na];
         let mut co = 0u32;
-        for r in 0..self.n_reads {
-            let (ca, cb) = (self.calls[r][a], self.calls[r][b]);
+        for row in self.calls.iter().take(self.n_reads) {
+            let (ca, cb) = (row[a], row[b]);
             if ca != MISSING && cb != MISSING {
                 counts[ca as usize][cb as usize] += 1;
                 co += 1;

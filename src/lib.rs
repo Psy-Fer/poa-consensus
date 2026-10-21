@@ -5,10 +5,12 @@
 //!
 //! POA builds a directed acyclic graph (DAG) from the reads, aligns each
 //! subsequent read into the graph using affine-gap dynamic programming, and
-//! extracts a consensus by following the heaviest (most-supported) path through
-//! the graph.  It handles length variation between reads naturally: inserts and
-//! deletions create separate branches in the graph, and the heaviest-path
-//! extraction resolves them by read support rather than by fixed rules.
+//! extracts a consensus from the graph: by default both the heaviest
+//! (most-supported) path and a column-majority sequence are built and the one
+//! the reads fit better is kept ([`ConsensusMode::BestFit`]).  It handles length
+//! variation between reads naturally: inserts and deletions create separate
+//! branches in the graph, and consensus extraction resolves them by read
+//! support rather than by fixed rules.
 //!
 //! ## When to use this crate
 //!
@@ -75,8 +77,11 @@
 //! internally** — `seed_idx` is validated for bounds but does not bias the
 //! result.  You do not need to pick a seed for the common case.
 //!
-//! For lower-level or multi-allele use, the [`select_seed`] helper implements
-//! the same median/terminal-anchor heuristics if you want to choose explicitly.
+//! [`consensus_multi`] also self-seeds on the median-length read.  The
+//! [`select_seed`] helper (terminal-anchor `Auto`, `Shortest`, `Explicit`) is
+//! mainly useful for its partial-read diagnosis: `Auto` returns
+//! [`PoaError::NoSpanningReads`] when the reads form non-overlapping left-only
+//! and right-only groups, the cue to use [`bridged_consensus`].
 //!
 //! **Orient reads first, either way.**  Mixed-strand input produces a garbage
 //! graph silently.  Call [`auto_orient`] before POA construction; it uses k-mer
@@ -85,25 +90,44 @@
 //!
 //! ## Band width and scale
 //!
-//! The DP matrix has one row per read base and one column per graph node.
-//! Unbanded alignment is O(read_len × graph_nodes) memory and time — manageable
-//! for reads up to ~1 kb but prohibitive above that.
+//! The DP matrix has one row per graph node (in topological order) and one
+//! column per read position.  Each cell stores three `i32` scores (M, I, D:
+//! 12 bytes); no backpointers are stored, the traceback replays the
+//! comparisons.  Unbanded alignment is O(graph_nodes × read_len) memory and
+//! time: manageable for reads up to ~1 kb but prohibitive above that.
 //!
-//! | Read length | Band width | Memory per read (3 matrices, i32) |
+//! Banding is on when `band_width > 0 || adaptive_band` (the default).  Each
+//! row keeps a window of about `2 × half + 1` columns, where the half-width is
+//! `max(band_width, adaptive_band_b + ceil(adaptive_band_f × read_len), 4)`
+//! (just `max(band_width, 4)` with `adaptive_band = false`).
+//! Fully unbanded alignment needs `band_width = 0` **and**
+//! `adaptive_band = false`.  Partial reads (shorter than 0.8x the graph span)
+//! are always aligned unbanded.
+//!
+//! DP memory for one read alignment, assuming a graph of about one node per
+//! read base (noisy reads grow the graph, and memory with it):
+//!
+//! | Read length | Band | DP memory (12 B/cell) |
 //! |---|---|---|
-//! | 600 bp | unbanded | ~1.4 MB |
-//! | 600 bp | 100 | ~2.4 KB |
-//! | 20 kb | unbanded | ~9.6 GB |
-//! | 20 kb | adaptive (w≈210) | ~200 MB |
+//! | 600 bp | unbanded | ~4.3 MB |
+//! | 600 bp | half-width 100 (window ~201) | ~1.4 MB |
+//! | 20 kb | unbanded | ≥ ~4.8 GB |
+//! | 20 kb | default (half-width 210, window ~421) | ~100 MB |
+//!
+//! Measured peak RSS for a whole `consensus()` call with the defaults
+//! (homopolymer handling on): ~65 MB (~5 kb MUC1 haplotype), ~174 MB (5 kb
+//! random-sequence ONT reads), ~272 MB (20 kb random-sequence ONT reads).
+//! With homopolymer handling off: ~55 / ~174 / ~265 MB.
 //!
 //! **Rules of thumb:**
 //!
-//! - Reads ≤ 1 kb: unbanded (`band_width = 0`) is fine.
-//! - Reads 1 kb–20 kb: set `band_width` to at least twice the expected
-//!   length difference between reads, or enable `adaptive_band = true` (abPOA
-//!   formula: `w = adaptive_band_b + adaptive_band_f × read_len`).
-//! - Reads > 20 kb: adaptive banding is required; consider `poasta` for graphs
-//!   that approach bacterial-gene size.
+//! - Reads ≤ 1 kb: fully unbanded (`band_width = 0`, `adaptive_band = false`)
+//!   is affordable.
+//! - Longer reads: keep the default band, and raise `band_width` to at least
+//!   the expected length difference between reads if it exceeds the default
+//!   half-width.
+//! - Very long reads: consider `poasta` for graphs that approach
+//!   bacterial-gene size.
 //!
 //! The banded DP uses a static-diagonal-union corridor (abPOA-style anti-fold):
 //! the graph-geometry diagonal is always kept in-band, so the terminal column is
@@ -111,7 +135,8 @@
 //! empty/all-gap alignment — at worst it yields a *suboptimal* alignment. On
 //! pure-repetitive sequence several diagonals score equally and the DP may pick
 //! one that differs by a repeat unit; `diagnose()` surfaces gross truncation so
-//! the caller can rebuild unbanded and compare.
+//! the caller can retry unbanded (`band_width = 0` and `adaptive_band = false`)
+//! and compare.
 //!
 //! ## Coverage and depth
 //!
@@ -126,32 +151,44 @@
 //! `min_coverage_fraction × n` if set explicitly).  This corrects for seed
 //! reads that happen to be longer or shorter than the true consensus length.
 //!
-//! **In multi-allele mode**, `min_reads` is applied per allele group, not to
-//! the total read count.  With 10 reads split 5/5, each group must independently
-//! satisfy `min_reads`.
+//! **In multi-allele mode**, `min_reads` is checked against the total number
+//! of non-empty reads and again for every allele group.  With 10 reads split
+//! 5/5, each group must independently satisfy `min_reads`.
 //!
 //! ## Known limitations
 //!
+//! The full list, with numbers and what to do about each, is the "Limitations"
+//! page of the project book (`docs/src/limitations.md`). The most important:
+//!
+//! **Repeat lengths at the edge of the read evidence.** When noisy reads split
+//! on a repeat length by a unit, no method calls the exact length every time:
+//! [`analysis::max_achievable_accuracy`] gives the ceiling, and
+//! [`analysis::count_credible_interval`] the interval the reads support. ONT
+//! deletion bias can put the true length outside that interval. Treat an exact
+//! count as uncertain where [`Consensus::support_quality`] is below about Q10
+//! inside the repeat. Some sensitivity to read order also remains.
+//!
 //! **Phase-shift majority trim.** When the majority of reads are phase-shifted
 //! relative to the seed (e.g. most reads start one repeat unit later), boundary
-//! trim may incorrectly remove the seed's first node because its Match coverage
-//! is low.  The long-term fix is to use [`extract_flanked_region`] to anchor
-//! reads to a common reference point before POA; this eliminates phase ambiguity
-//! entirely.
+//! trim may incorrectly remove the seed's first node because its coverage is
+//! low.  The fix is to anchor reads to a common reference point with flanks
+//! ([`consensus_flanked`] or [`extract_flanked_region`]); this eliminates phase
+//! ambiguity.
 //!
 //! **Rotation-ambiguous repeats without flanking sequence.** Trinucleotide
 //! repeats like GAA can appear as GAA, AAG, or AGA depending on where the read
 //! starts relative to the period.  Without flanking anchors, POA on a mixed
 //! rotational-phase read set produces unreliable output.  The fix is the same:
-//! run [`extract_flanked_region`] first so that every read enters POA already
-//! anchored at the same phase.
+//! use [`consensus_flanked`] (or run [`extract_flanked_region`] first) so that
+//! every read enters POA anchored at the same phase.
 //!
 //! **Long expansions and partial reads.** When the repeat is longer than most
-//! reads, reads that do not span the full locus create artifactual terminal
-//! deletions that do not increment node coverage, making boundary nodes appear
-//! low-coverage and vulnerable to trim.  Use `AlignmentMode::SemiGlobal` (free
-//! terminal gaps) to prevent partial reads from distorting the boundary, or
-//! apply [`extract_flanked_region`] to exclude non-spanning reads before POA.
+//! reads, reads that do not span the full locus leave boundary nodes
+//! low-coverage and vulnerable to trim.  The default
+//! [`AlignmentMode::SemiGlobal`] gives partial reads free terminal gaps;
+//! [`consensus_flanked`] additionally builds from spanning reads only when many
+//! reads are partial, and [`bridged_consensus`] handles the case where no read
+//! spans the locus.
 //!
 //! ---
 //!
@@ -258,12 +295,12 @@
 //!
 //! If a gap in one read reflects a real deletion, most other reads will carry
 //! the same gap. The corresponding graph edges accumulate high weight, and the
-//! heaviest-path consensus will include the deletion. If the gap is a
+//! consensus will include the deletion. If the gap is a
 //! sequencing error, other reads will traverse the same graph node as a match,
 //! and the consensus will correct it.
 //!
 //! This means parameter choices affect alignment quality at the margins, but
-//! the coverage threshold and heaviest-path extraction together resolve most
+//! the coverage threshold and consensus extraction together resolve most
 //! of the ambiguity that would be fatal to a single pairwise alignment. The
 //! defaults (`match = +2`, `mismatch = -4`, `gap_open = -4`, `gap_extend = -3`)
 //! are calibrated for Oxford Nanopore and PacBio HiFi reads at tandem-repeat
@@ -272,25 +309,27 @@
 //! ### How affine scoring changes the dynamic programming
 //!
 //! Standard Needleman-Wunsch uses a single DP table. Affine scoring requires
-//! three tables, one per "state" the aligner can be in at any position:
+//! three tables, one per "state" the aligner can be in at any position. Rows
+//! are graph nodes `v` (in topological order), columns are read positions `j`:
 //!
-//! - **`M[i][j]`**: best score where query position `i` aligns to graph node
-//!   `j` as a match or mismatch.
-//! - **`I[i][j]`**: best score where query position `i` is an insertion (a
-//!   base in the read with no corresponding node in the graph).
-//! - **`D[i][j]`**: best score where graph node `j` is a deletion (a node in
-//!   the graph skipped by the read).
+//! - **`M[v][j]`**: best score where read base `j` aligns to graph node `v`
+//!   as a match or mismatch.
+//! - **`I[v][j]`**: best score where read base `j` is an insertion (a base in
+//!   the read with no corresponding node in the graph), after node `v`.
+//! - **`D[v][j]`**: best score where graph node `v` is a deletion (a node in
+//!   the graph skipped by the read), after read base `j`.
 //!
-//! The recurrences are:
+//! The recurrences, with `u` ranging over the predecessors of `v`:
 //!
 //! ```text
-//! M[i][j] = max(M[i-1][j-1], I[i-1][j-1], D[i-1][j-1]) + score(query[i], node[j])
+//! M[v][j] = max over u of max(M[u][j-1], I[u][j-1], D[u][j-1]) + score(read[j], node[v])
 //!
-//! I[i][j] = max(M[i][j-1] + gap_open + gap_extend,
-//!               I[i][j-1] + gap_extend)
+//! I[v][j] = max(M[v][j-1] + gap_open + gap_extend,
+//!               I[v][j-1] + gap_extend)
 //!
-//! D[i][j] = max(M[i-1][j] + gap_open + gap_extend,
-//!               D[i-1][j] + gap_extend)
+//! D[v][j] = max over u of max(M[u][j] + gap_open + gap_extend,
+//!                             I[u][j] + gap_open + gap_extend,
+//!                             D[u][j] + gap_extend)
 //! ```
 //!
 //! The key insight in `I` and `D`: transitioning from `M` to a gap state pays
@@ -302,9 +341,9 @@
 //! Traceback follows whichever state and predecessor gave the maximum score at
 //! each cell, producing a sequence of Match, Insert, and Delete operations.
 //!
-//! For POA over a graph rather than a linear reference, `j` indexes a graph
-//! node in topological order rather than a column in a matrix, but the
-//! recurrence is identical.
+//! Against a linear reference each node has exactly one predecessor and this
+//! reduces to the standard Gotoh recurrence; over a graph the only change is
+//! the max over all predecessors `u`.
 //!
 //! ### Choosing parameter values
 //!
@@ -323,6 +362,7 @@ pub mod analysis;
 pub mod config;
 pub mod error;
 pub mod flank;
+mod hpc;
 pub mod orient;
 pub mod seed;
 pub mod types;
@@ -394,8 +434,11 @@ fn warn_long_unbanded(reads: &[&[u8]], config: &PoaConfig) {
 
 /// Build a single-allele consensus from `reads`.
 ///
-/// `seed_idx` is the index of the read used to initialise the graph; choose a
-/// median-length read for best results.
+/// `seed_idx` is validated for bounds only: the graph is always seeded on the
+/// median-length read.  Returns `Err(InsufficientDepth)` with fewer than
+/// [`PoaConfig::min_reads`] reads.  Honours [`PoaConfig::consensus_mode`] and
+/// the homopolymer options ([`PoaConfig::homopolymer_min_run`],
+/// [`PoaConfig::homopolymer_gap`]).
 pub fn consensus(
     reads: &[&[u8]],
     seed_idx: usize,
@@ -416,10 +459,44 @@ pub fn consensus(
     // outlier's length; median avoids it). `seed_idx` is still validated for
     // bounds above, preserving the error contract.
     let _ = seed_idx;
+    // Homopolymer handling (compression and/or homopolymer-aware gap costs)
+    // and tandem gap costs each build a candidate; the plain engine call `raw`
+    // is built with all of them off and is the fallback and judge.
+    let cands_on = config.homopolymer_min_run > 0
+        || config.homopolymer_gap.is_some()
+        || config.tandem_gap.is_some();
+    if !cands_on {
+        return Ok(engine_consensus(reads, config));
+    }
+    let base = PoaConfig {
+        homopolymer_min_run: 0,
+        homopolymer_gap: None,
+        tandem_gap: None,
+        ..config.clone()
+    };
+    let raw = engine_consensus(reads, &base);
+    Ok(crate::hpc::consensus_homopolymer(reads, config, &base, raw))
+}
+
+/// The engine path of [`consensus`]: build on the median-length read, then
+/// extract per `consensus_mode`.
+pub(crate) fn engine_consensus(reads: &[&[u8]], config: &PoaConfig) -> Consensus {
+    engine_consensus_with(reads, config, None)
+}
+
+/// [`engine_consensus`] with optional tandem-context gap costs on the build.
+pub(crate) fn engine_consensus_with(
+    reads: &[&[u8]],
+    config: &PoaConfig,
+    tandem_gap: Option<(i32, i32)>,
+) -> Consensus {
     let mut order: Vec<usize> = (0..reads.len()).collect();
     order.sort_by_key(|&i| reads[i].len());
     let med = order[order.len() / 2];
     let mut g = crate::poa2::Poa::new(reads[med], config.clone());
+    if let Some(c) = tandem_gap {
+        g = g.with_tandem_gap(c);
+    }
     for (i, r) in reads.iter().enumerate() {
         if i != med {
             g.add_read(r);
@@ -433,16 +510,28 @@ pub fn consensus(
     //  - MajorityFrequency: force the MSA-column majority consensus (useful for
     //    high-depth amplicons where column majority is trusted outright).
     // Per-position output fields are made consistent with the chosen sequence.
-    Ok(match config.consensus_mode {
+    let mut c = match config.consensus_mode {
         crate::config::ConsensusMode::MajorityFrequency => g.consensus_full_majority(),
         crate::config::ConsensusMode::BestFit => g.consensus_full_best_fit(reads),
-    })
+    };
+    // A heaviest-path call is scored from the reads' recorded paths; a
+    // majority-frequency call is not a node path here, so score it on a
+    // support graph seeded with it.
+    if c.support_quality.len() != c.sequence.len() {
+        c.support_quality = crate::poa2::support_quality_by_realignment(&c.sequence, reads, config);
+    }
+    c
 }
 
 /// Build a multi-allele consensus from `reads`.
 ///
-/// Returns one [`Consensus`] per detected allele.  If no heterozygous bubble is
-/// found the result is a single-element `Vec` equivalent to calling [`consensus`].
+/// Returns one [`Consensus`] per detected allele, each with `read_indices`
+/// set.  If no second allele is confirmed the result is a single-element `Vec`
+/// built from all non-empty reads.  It is not identical to [`consensus`]: each
+/// allele is always the heaviest path ([`PoaConfig::consensus_mode`] and the
+/// homopolymer options are ignored here).  `seed_idx` is validated for bounds
+/// only.  `min_reads` is checked against the total non-empty read count and
+/// every allele group.
 ///
 /// An allele below [`PoaConfig::min_allele_freq`] is merged into the majority and
 /// does not appear in the output; to detect a low-frequency / mosaic allele, lower
@@ -462,6 +551,14 @@ pub fn consensus_multi(
     // robustness matrix it beats the legacy engine on read-assignment cleanliness
     // and single-allele safety at near-equal split sensitivity. (Same-length
     // substitution haplotypes are the one weaker case; tracked separately.)
+    // The homopolymer and tandem options are single-allele only (their
+    // splice/fit guard lives in `consensus`); run multi-allele without them.
+    let config = &PoaConfig {
+        homopolymer_min_run: 0,
+        homopolymer_gap: None,
+        tandem_gap: None,
+        ..config.clone()
+    };
     crate::multi::hybrid_consensus_multi(reads, config)
 }
 
@@ -518,6 +615,11 @@ fn slice_to_repeat(c: Consensus, left: &[u8], right: &[u8]) -> Consensus {
             .get(s..e)
             .map(<[i32]>::to_vec)
             .unwrap_or_default(),
+        support_quality: c
+            .support_quality
+            .get(s..e)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default(),
         n_reads: c.n_reads,
         graph_stats: c.graph_stats,
         gaps: c
@@ -552,8 +654,10 @@ fn slice_to_repeat(c: Consensus, left: &[u8], right: &[u8]) -> Consensus {
 /// alignment); otherwise it builds from all reads. Either way the result is sliced
 /// so the returned [`Consensus`] describes the sequence **between** the flanks
 /// (flanks excluded). Falls back to the raw all-reads consensus when too few reads
-/// span to anchor safely. Flanks of at least ~20 bp of unique sequence are
-/// recommended.
+/// span to anchor safely. If the flanks cannot be located in the consensus
+/// itself (rare), the whole-region consensus is returned unsliced, flanks
+/// included; compare its length against the flanks if that matters. Flanks of
+/// at least ~20 bp of unique sequence are recommended.
 pub fn consensus_flanked(
     reads: &[&[u8]],
     left_flank: &[u8],
@@ -577,6 +681,8 @@ pub fn consensus_flanked(
 /// detected allele, each describing the repeat region between the flanks. Uses
 /// the same partial-heavy auto-anchoring; `read_indices` are always reported as
 /// indices into the input `reads` slice (remapped from the anchored subset).
+/// As with [`consensus_flanked`], an allele whose flanks cannot be located in
+/// its own consensus is returned unsliced.
 pub fn consensus_multi_flanked(
     reads: &[&[u8]],
     left_flank: &[u8],
@@ -659,6 +765,9 @@ pub fn bridged_consensus(
     let mut path_weights = left.path_weights.clone();
     path_weights.extend_from_slice(&right.path_weights);
 
+    let mut support_quality = left.support_quality.clone();
+    support_quality.extend_from_slice(&right.support_quality);
+
     // Carry forward any spanning gaps from each segment (offset right gaps by join).
     let mut gaps = left.gaps.clone();
     for gap in &right.gaps {
@@ -685,5 +794,6 @@ pub fn bridged_consensus(
         gaps,
         bubble_sites: vec![],
         read_indices: vec![],
+        support_quality,
     })
 }

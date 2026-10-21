@@ -51,6 +51,8 @@ fn cfg() -> PoaConfig {
         min_reads: 3,
         min_allele_freq: 0.2,
         phasing_bubble_min_span: 10,
+        homopolymer_min_run: 0,
+        homopolymer_gap: None,
         ..PoaConfig::default()
     }
 }

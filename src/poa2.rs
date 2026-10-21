@@ -1,29 +1,31 @@
-//! Clean partial-order alignment consensus engine (abPOA-style rebuild).
+//! Partial-order alignment consensus engine (abPOA-style).
 //!
-//! Deliberately mirrors abPOA's proven-clean core — full partial-order DP (one
-//! DP row per graph node, every node relaxes ALL its in-edges), heaviest
-//! bundling for consensus — with none of the accumulated machinery from
-//! `graph.rs` (spine-guided band, diagonal-skip, slide-lock, bypass edges,
-//! interior filter). The value the crate adds lives ABOVE this engine (analysis,
-//! CI, diagnostics); the engine itself just aims to match abPOA quality.
+//! Full partial-order affine-gap DP (one DP row per graph node in topological
+//! order, every node relaxes ALL its in-edges; columns are read positions),
+//! with an adaptive static-diagonal-union band and semi-global free ends by
+//! default. Banded rows store only their window, 12 bytes per cell (M/I/D
+//! `i32`); no backpointers are kept, the traceback replays the comparisons.
 //!
-//! Increment 1 (this file): data model, seed, full-PO affine **global** DP,
-//! read integration with SPOA/abPOA-style **node fusion** (match → reuse node;
+//! Read integration uses SPOA/abPOA-style **node fusion** (match → reuse node;
 //! mismatch → reuse an aligned sibling carrying that base, else create a new
 //! substitution node and cross-link it into the alignment column; insert → new
-//! node; delete → skip), heaviest-bundling consensus. Node fusion is in the core
-//! deliberately: full DP does NOT obviate it (DP decides the alignment; the
-//! graph-update must still represent a mismatch as a substitution node, or the
-//! read's base is dropped and the seed's minority base is wrongly kept — see
-//! `tests_mismatch::majority_substitution_over_seed_base`). abPOA/SPOA both do
-//! this via aligned-node columns.
+//! node; delete → skip the node and count it in its `del`). Node fusion is in
+//! the core deliberately: full DP does NOT obviate it (DP decides the
+//! alignment; the graph update must still represent a mismatch as a
+//! substitution node, or the read's base is dropped and the seed's minority
+//! base is wrongly kept; see
+//! `tests_mismatch::majority_substitution_over_seed_base`).
 //!
-//! Not yet (later increments, for scale/real data): adaptive static-diagonal-
-//! union band + semi-global free ends (full global DP is O(nodes×readlen) and
-//! fixed-end — fine for unit tests, too heavy/rigid for multi-kb partial reads);
-//! then real-data validation vs abPOA; then two-piece convex gaps and SIMD.
+//! Consensus: heaviest path, majority-frequency (MSA column plurality), or
+//! best-fit between the two (`ConsensusMode`). Per-read `read_paths` /
+//! `read_matched_edges` provenance feeds multi-allele phasing. The value the
+//! crate adds lives ABOVE this engine (analysis, diagnostics, multi-allele);
+//! the engine itself aims to match abPOA quality.
+//!
+//! Deferred: two-piece convex gaps and SIMD row scoring.
 
 use crate::config::{AlignmentMode, PoaConfig};
+use std::cell::Cell;
 use std::collections::HashMap;
 
 /// Internal per-phase profiling (topo / align / integrate), gated behind the
@@ -117,6 +119,60 @@ fn coverage_threshold(population: usize, min_coverage_fraction: f64) -> u32 {
     }
 }
 
+/// Highest support quality reported (Phred). Beyond this the binomial tail
+/// says nothing useful: reads agreeing does not make them right.
+pub(crate) const MAX_SUPPORT_QUALITY: u8 = 60;
+
+/// Phred-scaled probability that a base's strongest alternative, not the
+/// called base, is what the reads favour: with `agree` reads for the call and
+/// `alt` for the alternative, each read a vote under a flat prior,
+/// `P = P(Binomial(agree + alt + 1, 1/2) > agree)`. 10 agreeing reads and no
+/// alternative give Q33; a 6-4 split gives Q6; a tie gives Q3.
+fn support_phred(agree: u32, alt: u32) -> u8 {
+    let n = (agree + alt + 1) as usize;
+    let k_min = agree as usize + 1;
+    let ln_2n = n as f64 * std::f64::consts::LN_2;
+    // Sum C(n, k) / 2^n for k = n down to k_min, with ln C(n, k) updated by
+    // C(n, k - 1) = C(n, k) * k / (n - k + 1).
+    let (mut ln_c, mut p) = (0.0f64, 0.0f64);
+    let mut k = n;
+    loop {
+        p += (ln_c - ln_2n).exp();
+        if k == k_min {
+            break;
+        }
+        ln_c += (k as f64).ln() - ((n - k + 1) as f64).ln();
+        k -= 1;
+    }
+    let q = -10.0 * p.log10();
+    q.clamp(0.0, MAX_SUPPORT_QUALITY as f64).round() as u8
+}
+
+/// Support quality for a consensus `seq` that is not a node path of the
+/// graph it came from (a majority-frequency call, or a homopolymer splice):
+/// build a support graph seeded with `seq`, add every read, and score the seed
+/// path (the seed itself does not vote).
+pub(crate) fn support_quality_by_realignment(
+    seq: &[u8],
+    reads: &[&[u8]],
+    cfg: &PoaConfig,
+) -> Vec<u8> {
+    if seq.is_empty() {
+        return Vec::new();
+    }
+    let cfg = PoaConfig {
+        homopolymer_min_run: 0,
+        homopolymer_gap: None,
+        ..cfg.clone()
+    };
+    let mut g = Poa::new(seq, cfg);
+    for r in reads {
+        g.add_read(r);
+    }
+    let path: Vec<usize> = (0..seq.len()).collect();
+    g.path_support_quality(&path, true)
+}
+
 /// Read a banded matrix cell (M or I). Returns NEG_INF for j=0 or out-of-band.
 #[inline]
 fn bget(flat: &[i32], off: &[usize], lo: &[usize], hi: &[usize], r: usize, j: usize) -> i32 {
@@ -145,6 +201,17 @@ fn bgetd(
     } else {
         flat[off[r] + (j - lo[r])]
     }
+}
+
+/// Indel totals of all reads aligned to a candidate consensus (see
+/// [`Poa::fit`]). Both candidates are scored against the same reads, so raw
+/// totals compare directly.
+#[derive(Clone, Copy)]
+struct Fit {
+    /// Sum over indel events of `|gap_open|` plus `|gap_extend|` per base.
+    affine: u64,
+    /// Indel bases (inserted plus deleted).
+    indel_bases: u64,
 }
 
 /// An out-edge and how many reads traversed it (Match/Insert founding traffic).
@@ -190,6 +257,21 @@ pub struct Poa {
     /// `Edge.weight` (which folds in delete-bypass traffic and would make a
     /// length variant's short-allele bypass look like a competing arm).
     read_matched_edges: Vec<Vec<(usize, usize)>>,
+    /// `align`'s banded M/I/D matrices, kept between calls so their capacity
+    /// is reused: the band is wider than its estimate wherever the adaptive
+    /// and static diagonals diverge, and regrowing per read was ~9% of runtime.
+    align_bufs: Cell<AlignBufs>,
+    /// Gap costs `(open, extend)` for an indel that copies its neighbouring
+    /// unit in a locally periodic stretch of the read (periods 2-6), or `None`.
+    /// Set only on candidate builds (`with_tandem_gap`).
+    tandem_gap: Option<(i32, i32)>,
+}
+
+#[derive(Default)]
+struct AlignBufs {
+    m: Vec<i32>,
+    i: Vec<i32>,
+    d: Vec<i32>,
 }
 
 impl Poa {
@@ -225,7 +307,16 @@ impl Poa {
             read_lens: vec![seed.len()],
             read_paths: vec![seed_path],
             read_matched_edges: vec![seed_medges],
+            align_bufs: Cell::default(),
+            tandem_gap: None,
         }
+    }
+
+    /// Price indels that copy a neighbouring repeat unit at `(open, extend)`
+    /// (see the tandem context in `align`).
+    pub(crate) fn with_tandem_gap(mut self, costs: (i32, i32)) -> Self {
+        self.tandem_gap = Some(costs);
+        self
     }
 
     /// Kahn's topological order over the current DAG. Returns (topo, rank_of).
@@ -255,7 +346,8 @@ impl Poa {
         (topo, rank_of)
     }
 
-    /// Full partial-order affine-gap GLOBAL alignment of `read` to the graph.
+    /// Full partial-order affine-gap alignment of `read` to the graph, global
+    /// or semi-global per `alignment_mode`, banded per the band settings.
     /// Standard Gotoh with three states, generalized to a DAG: node `t`'s M/D
     /// relax over all predecessors. Returns ops in forward read order.
     pub(crate) fn align(&self, read: &[u8], topo: &[usize], rank_of: &[usize]) -> Vec<Op> {
@@ -269,6 +361,87 @@ impl Poa {
             self.cfg.gap_extend,
         );
         let semi = self.cfg.alignment_mode == AlignmentMode::SemiGlobal;
+        // Homopolymer-aware gap costs (`PoaConfig::homopolymer_gap`): an indel
+        // inside a homopolymer pays (hgo, hge) instead of (go, ge). Both sides
+        // must really be a run, or a periodic repeat's unit indel (CAG|CAG, the
+        // deleted C next to the read's next C) would count and get cheap.
+        // Insertion of read[j-1]: that base is part of a run in the read.
+        // Deletion of node t at read column j: t has a same-base graph
+        // neighbour, and the read has that base adjacent (read[j-1] or read[j]).
+        let hp = self.cfg.homopolymer_gap;
+        let ins_run: Vec<bool> = (0..=l)
+            .map(|j| {
+                hp.is_some()
+                    && j >= 1
+                    && ((j >= 2 && read[j - 1] == read[j - 2]) || (j < l && read[j - 1] == read[j]))
+            })
+            .collect();
+        let node_run: Vec<bool> = if hp.is_some() {
+            self.nodes
+                .iter()
+                .map(|nd| {
+                    nd.inc.iter().any(|&p| self.nodes[p].base == nd.base)
+                        || nd.out.iter().any(|e| self.nodes[e.to].base == nd.base)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Per-column insert costs, and the read padded by one sentinel on each
+        // side (`rpad[j] = read[j-1]`, outside 1..=l a value no u8 base equals)
+        // so the fill's delete-cost test needs no bounds checks.
+        let tg = self.tandem_gap;
+        // Periodic stretches of the read for periods 2..=6: wherever a unit is
+        // immediately followed by a copy of itself, both copies are flagged, and
+        // each read column inside such a stretch records which bases its unit
+        // contains (bit per A/C/G/T). Purely local: no tract or unit is
+        // identified, only "an indel here would copy its neighbour".
+        let base_bit = |b: u8| match b {
+            b'A' | b'a' => 1u8,
+            b'C' | b'c' => 2,
+            b'G' | b'g' => 4,
+            b'T' | b't' => 8,
+            _ => 0,
+        };
+        let mut tpos = vec![false; l];
+        let mut tmask = vec![0u8; l + 1]; // per column j (between read[j-1] and read[j])
+        if tg.is_some() {
+            for per in 2..=6usize {
+                if l < 2 * per {
+                    break;
+                }
+                for st in 0..=l - 2 * per {
+                    if read[st..st + per] == read[st + per..st + 2 * per] {
+                        let m = read[st..st + per].iter().fold(0u8, |m, &b| m | base_bit(b));
+                        tpos[st..st + 2 * per].fill(true);
+                        // interior columns of the stretch
+                        for x in &mut tmask[st + 1..st + 2 * per] {
+                            *x |= m;
+                        }
+                    }
+                }
+            }
+        }
+        let icost: Vec<(i32, i32)> = ins_run
+            .iter()
+            .enumerate()
+            .map(|(j, &run)| match (hp, tg) {
+                (Some(c), _) if run => c,
+                (_, Some(c)) if j >= 1 && tpos[j - 1] => c,
+                _ => (go, ge),
+            })
+            .collect();
+        let ins_cost = |j: usize| icost[j];
+        const NO_BASE: u16 = 0x100;
+        let rpad: Vec<u16> = std::iter::once(NO_BASE)
+            .chain(read.iter().map(|&b| b as u16))
+            .chain(std::iter::once(NO_BASE))
+            .collect();
+        let del_cost = |t: usize, j: usize, b: u8| match (hp, tg) {
+            (Some(c), _) if node_run[t] && (rpad[j] == b as u16 || rpad[j + 1] == b as u16) => c,
+            (_, Some(c)) if tmask[j] & base_bit(b) != 0 => c,
+            _ => (go, ge),
+        };
 
         // ---- Adaptive static-diagonal-union band (abPOA-style anti-fold) ----
         // Per row we score only query columns [lo, hi] = union of the
@@ -280,9 +453,15 @@ impl Poa {
         // arrays with per-row offsets, so memory is O(nodes × band) not
         // O(nodes × readlen).
         let banded0 = self.cfg.band_width > 0 || self.cfg.adaptive_band;
+        // Half-width: `band_width`, widened to the abPOA length term
+        // `b + ceil(f * L)` when `adaptive_band` is on. With it off the band is
+        // the fixed `band_width`.
         let half = {
-            let adaptive =
-                self.cfg.adaptive_band_b + (self.cfg.adaptive_band_f * l as f32).ceil() as usize;
+            let adaptive = if self.cfg.adaptive_band {
+                self.cfg.adaptive_band_b + (self.cfg.adaptive_band_f * l as f32).ceil() as usize
+            } else {
+                0
+            };
             adaptive.max(self.cfg.band_width).max(4)
         };
         let mut remain = vec![0usize; n]; // heaviest-out-edge node-distance to sink
@@ -313,24 +492,30 @@ impl Poa {
         } else {
             n * (l + 1)
         };
-        let mut mflat: Vec<i32> = Vec::with_capacity(cap);
-        let mut iflat: Vec<i32> = Vec::with_capacity(cap);
-        let mut dflat: Vec<i32> = Vec::with_capacity(cap);
-        let mut mbk: Vec<(u8, u32)> = Vec::with_capacity(cap);
-        let mut dbk: Vec<(u8, u32)> = Vec::with_capacity(cap);
+        let AlignBufs {
+            m: mut mflat,
+            i: mut iflat,
+            d: mut dflat,
+        } = self.align_bufs.take();
+        for v in [&mut mflat, &mut iflat, &mut dflat] {
+            v.clear();
+            v.reserve(cap);
+        }
         let mut d0 = vec![NEG_INF; n];
         let mut d0bk = vec![(0u8, VSTART); n];
         let mut best_j = vec![1usize; n]; // per-rank winning column (adaptive center)
 
-        // Per-row DP scratch, reused across nodes (cleared + resized to each row's
-        // `width` below). Hoisted out of the loop so the hot path does not allocate
-        // 5 Vecs per node — the dominant allocation churn (see the `profile` phase
-        // attribution: `align` is ~96% of build time).
-        let mut mrow: Vec<i32> = Vec::new();
-        let mut irow: Vec<i32> = Vec::new();
-        let mut drow: Vec<i32> = Vec::new();
-        let mut mbrow: Vec<(u8, u32)> = Vec::new();
-        let mut dbrow: Vec<(u8, u32)> = Vec::new();
+        // Per-row accumulators over the predecessors, reused across nodes:
+        // `macc[k]` = max of a predecessor's M/I/D at column j-1 (feeds M[j]),
+        // `oacc[k]` = max of its M/I at j (D gap-open), `eacc[k]` = max of its
+        // D at j (D extend). Every stored cell is exactly NEG_INF or a real
+        // score, so a raw max is NEG_INF iff no predecessor reaches the cell,
+        // and adding the cell's (shared) cost afterwards gives the same value
+        // as the per-candidate comparison. Predecessor-outer / column-inner
+        // keeps these loops branch-free over contiguous slices.
+        let mut macc: Vec<i32> = Vec::new();
+        let mut oacc: Vec<i32> = Vec::new();
+        let mut eacc: Vec<i32> = Vec::new();
 
         for &t in topo.iter() {
             let r = rank_of[t];
@@ -365,18 +550,19 @@ impl Poa {
             {
                 let mut best = NEG_INF;
                 let mut bk = (0u8, VSTART);
+                let (dgo, dge) = del_cost(t, 0, base);
                 if is_source {
                     // leading deletion from the virtual start
-                    if go + ge > best {
-                        best = go + ge;
+                    if dgo + dge > best {
+                        best = dgo + dge;
                         bk = (0, VSTART);
                     }
                 }
                 for &p in &self.nodes[t].inc {
                     let pr = rank_of[p] as u32;
                     let de = d0[rank_of[p]];
-                    if de != NEG_INF && de + ge > best {
-                        best = de + ge;
+                    if de != NEG_INF && de + dge > best {
+                        best = de + dge;
                         bk = (2, pr);
                     }
                 }
@@ -384,98 +570,183 @@ impl Poa {
                 d0bk[r] = bk;
             }
 
-            mrow.clear();
-            mrow.resize(width, NEG_INF);
-            irow.clear();
-            irow.resize(width, NEG_INF);
-            drow.clear();
-            drow.resize(width, NEG_INF);
-            mbrow.clear();
-            mbrow.resize(width, (0u8, VSTART));
-            dbrow.clear();
-            dbrow.resize(width, (0u8, VSTART));
-            let mut row_best = NEG_INF;
-            let mut row_best_j = best_j[r];
-
-            for j in lo..=hi {
-                let k = j - lo;
-                // ---- M[t][j] ----
-                let sc = if base == read[j - 1] { mm } else { mis };
-                let mut best = NEG_INF;
-                let mut bk = (0u8, VSTART);
-                if (is_source || semi) && j == 1 && sc > best {
-                    // free start: read[0] begins the alignment here
-                    best = sc;
-                    bk = (0, VSTART);
+            macc.clear();
+            macc.resize(width, NEG_INF);
+            oacc.clear();
+            oacc.resize(width, NEG_INF);
+            eacc.clear();
+            eacc.resize(width, NEG_INF);
+            for &p in &self.nodes[t].inc {
+                let pr = rank_of[p];
+                let (plo, phi, po) = (lo_[pr], hi_[pr], off[pr]);
+                let pw = phi + 1 - plo;
+                let (pm, pi, pd) = (
+                    &mflat[po..po + pw],
+                    &iflat[po..po + pw],
+                    &dflat[po..po + pw],
+                );
+                // M[j] reads the predecessor at j-1; j-1 = 0 is the D0 column.
+                if lo == 1 {
+                    macc[0] = macc[0].max(d0[pr]);
                 }
-                for &p in &self.nodes[t].inc {
-                    let pr = rank_of[p];
-                    let vm = bget(&mflat, &off, &lo_, &hi_, pr, j - 1);
-                    let vi = bget(&iflat, &off, &lo_, &hi_, pr, j - 1);
-                    let vd = bgetd(&dflat, &d0, &off, &lo_, &hi_, pr, j - 1);
-                    for (st, v) in [(0u8, vm), (1u8, vi), (2u8, vd)] {
-                        if v != NEG_INF && v + sc > best {
-                            best = v + sc;
-                            bk = (st, pr as u32);
-                        }
+                let (a, b) = (lo.max(plo + 1), hi.min(phi + 1));
+                if a <= b {
+                    let (k0, p0, len) = (a - lo, a - 1 - plo, b + 1 - a);
+                    let acc = &mut macc[k0..k0 + len];
+                    let src = pm[p0..p0 + len]
+                        .iter()
+                        .zip(&pi[p0..p0 + len])
+                        .zip(&pd[p0..p0 + len]);
+                    for (x, ((&m, &i), &d)) in acc.iter_mut().zip(src) {
+                        *x = (*x).max(m.max(i).max(d));
                     }
                 }
-                mrow[k] = best;
-                mbrow[k] = bk;
-                // ---- I[t][j] ---- (read base inserted; same row, j-1) ----
-                {
-                    let (mo, io) = if j > lo {
-                        (mrow[k - 1], irow[k - 1])
-                    } else {
-                        (NEG_INF, NEG_INF)
-                    };
-                    let mut best = NEG_INF;
-                    if mo != NEG_INF {
-                        best = mo + go + ge;
+                // D[j] reads the predecessor at the same j.
+                let (a, b) = (lo.max(plo), hi.min(phi));
+                if a <= b {
+                    let (k0, p0, len) = (a - lo, a - plo, b + 1 - a);
+                    let open = oacc[k0..k0 + len]
+                        .iter_mut()
+                        .zip(pm[p0..p0 + len].iter().zip(&pi[p0..p0 + len]));
+                    for (x, (&m, &i)) in open {
+                        *x = (*x).max(m.max(i));
                     }
-                    if io != NEG_INF && io + ge > best {
-                        best = io + ge;
+                    for (x, &d) in eacc[k0..k0 + len].iter_mut().zip(&pd[p0..p0 + len]) {
+                        *x = (*x).max(d);
                     }
-                    irow[k] = best;
-                }
-                // ---- D[t][j] ---- (node t skipped; predecessors at same j) ----
-                {
-                    let mut best = NEG_INF;
-                    let mut bk = (0u8, VSTART);
-                    for &p in &self.nodes[t].inc {
-                        let pr = rank_of[p];
-                        let mo = bget(&mflat, &off, &lo_, &hi_, pr, j);
-                        let io = bget(&iflat, &off, &lo_, &hi_, pr, j);
-                        let de = bgetd(&dflat, &d0, &off, &lo_, &hi_, pr, j);
-                        if mo != NEG_INF && mo + go + ge > best {
-                            best = mo + go + ge;
-                            bk = (0, pr as u32);
-                        }
-                        if io != NEG_INF && io + go + ge > best {
-                            best = io + go + ge;
-                            bk = (1, pr as u32);
-                        }
-                        if de != NEG_INF && de + ge > best {
-                            best = de + ge;
-                            bk = (2, pr as u32);
-                        }
-                    }
-                    drow[k] = best;
-                    dbrow[k] = bk;
-                }
-                let cell = mrow[k].max(irow[k]).max(drow[k]);
-                if cell != NEG_INF && cell > row_best {
-                    row_best = cell;
-                    row_best_j = j;
                 }
             }
+
+            // ---- M[t][j] and D[t][j] ---- No dependency along the row, so this
+            // pass is branch-free (selects only) and vectorises.
+            let o = mflat.len();
+            mflat.resize(o + width, NEG_INF);
+            iflat.resize(o + width, NEG_INF);
+            dflat.resize(o + width, NEG_INF);
+            let (mrow, irow, drow) = (&mut mflat[o..], &mut iflat[o..], &mut dflat[o..]);
+            // Delete costs: homopolymer-priced where t is in a graph run and the
+            // read has t's base adjacent to column j (see `del_cost`).
+            let hp_row = hp.filter(|_| node_run[t]);
+            let (hgo, hge) = hp_row.unwrap_or((go, ge));
+            let bb = base as u16;
+            let tmask_row = &tmask[lo..=hi];
+            let tbit = if tg.is_some() { base_bit(base) } else { 0 };
+            let (tgo, tge) = tg.unwrap_or((go, ge));
+            let cols = rpad[lo..=hi]
+                .iter()
+                .zip(&rpad[lo + 1..=hi + 1])
+                .zip(tmask_row);
+            let accs = macc.iter().zip(oacc.iter().zip(&eacc));
+            let outs = mrow.iter_mut().zip(drow.iter_mut());
+            for (((m, d), (&ma, (&oa, &ea))), ((&rb, &rn), &tm)) in outs.zip(accs).zip(cols) {
+                let sc = if rb == bb { mm } else { mis };
+                *m = if ma == NEG_INF { NEG_INF } else { ma + sc };
+                let in_run = hp_row.is_some() && (rb == bb || rn == bb);
+                let in_tandem = tm & tbit != 0;
+                let (dgo, dge) = if in_run {
+                    (hgo, hge)
+                } else if in_tandem {
+                    (tgo, tge)
+                } else {
+                    (go, ge)
+                };
+                let d_open = if oa == NEG_INF {
+                    NEG_INF
+                } else {
+                    oa + dgo + dge
+                };
+                let d_ext = if ea == NEG_INF { NEG_INF } else { ea + dge };
+                *d = d_open.max(d_ext);
+            }
+            if (is_source || semi) && lo == 1 {
+                // free start: read[0] begins the alignment here
+                let sc = if base == read[0] { mm } else { mis };
+                mrow[0] = mrow[0].max(sc);
+            }
+
+            // ---- I[t][j] ---- (read base inserted; same row, j-1) and the
+            // row's best column. Sequential along the row.
+            let mut row_best = NEG_INF;
+            let mut row_best_j = best_j[r];
+            let (mut m_prev, mut i_prev) = (NEG_INF, NEG_INF);
+            for (k, (&(igo, ige), (&m, (ins_out, &d)))) in icost[lo..=hi]
+                .iter()
+                .zip(mrow.iter().zip(irow.iter_mut().zip(drow.iter())))
+                .enumerate()
+            {
+                let i_open = if m_prev == NEG_INF {
+                    NEG_INF
+                } else {
+                    m_prev + igo + ige
+                };
+                let i_ext = if i_prev == NEG_INF {
+                    NEG_INF
+                } else {
+                    i_prev + ige
+                };
+                let ins = i_open.max(i_ext);
+                *ins_out = ins;
+                let cell = m.max(ins).max(d);
+                if cell != NEG_INF && cell > row_best {
+                    row_best = cell;
+                    row_best_j = lo + k;
+                }
+                (m_prev, i_prev) = (m, ins);
+            }
             best_j[r] = row_best_j;
-            mflat.extend_from_slice(&mrow);
-            iflat.extend_from_slice(&irow);
-            dflat.extend_from_slice(&drow);
-            mbk.extend_from_slice(&mbrow);
-            dbk.extend_from_slice(&dbrow);
         }
+
+        // Backpointers are not stored during the fill: traceback re-derives the
+        // winning predecessor of an M / D cell by replaying the fill's
+        // comparisons in the same order (free start, then each predecessor's
+        // M, I, D, strict `>`), so ties resolve exactly as a per-cell record
+        // would. This is O(in-degree) per traceback step instead of 16 bytes
+        // written per DP cell.
+        let m_back = |r: usize, j: usize| -> (u8, u32) {
+            let t = topo[r];
+            let sc = if self.nodes[t].base == read[j - 1] {
+                mm
+            } else {
+                mis
+            };
+            let mut best = NEG_INF;
+            let mut bk = (0u8, VSTART);
+            if (self.nodes[t].inc.is_empty() || semi) && j == 1 {
+                best = sc;
+            }
+            for &p in &self.nodes[t].inc {
+                let pr = rank_of[p];
+                let vm = bget(&mflat, &off, &lo_, &hi_, pr, j - 1);
+                let vi = bget(&iflat, &off, &lo_, &hi_, pr, j - 1);
+                let vd = bgetd(&dflat, &d0, &off, &lo_, &hi_, pr, j - 1);
+                for (st, v) in [(0u8, vm), (1u8, vi), (2u8, vd)] {
+                    if v != NEG_INF && v + sc > best {
+                        best = v + sc;
+                        bk = (st, pr as u32);
+                    }
+                }
+            }
+            bk
+        };
+        let d_back = |r: usize, j: usize| -> (u8, u32) {
+            let t = topo[r];
+            let (dgo, dge) = del_cost(t, j, self.nodes[t].base);
+            let mut best = NEG_INF;
+            let mut bk = (0u8, VSTART);
+            for &p in &self.nodes[t].inc {
+                let pr = rank_of[p];
+                let mo = bget(&mflat, &off, &lo_, &hi_, pr, j);
+                let io = bget(&iflat, &off, &lo_, &hi_, pr, j);
+                let de = bgetd(&dflat, &d0, &off, &lo_, &hi_, pr, j);
+                for (st, v, c) in [(0u8, mo, dgo + dge), (1u8, io, dgo + dge), (2u8, de, dge)] {
+                    if v != NEG_INF && v + c > best {
+                        best = v + c;
+                        bk = (st, pr as u32);
+                    }
+                }
+            }
+            bk
+        };
 
         // Terminal (read fully consumed at j=l). Global: end at a sink; semi:
         // end at ANY node (free trailing graph gap).
@@ -507,13 +778,15 @@ impl Poa {
             match state {
                 0 => {
                     ops.push(Op::Match(t));
-                    let (pst, pr) = mbk[off[r] + (j - lo_[r])];
+                    let (pst, pr) = m_back(r, j);
                     j -= 1;
                     state = pst;
                     rr = pr;
                 }
                 1 => {
                     ops.push(Op::Ins(read[j - 1]));
+                    // Open cost of THIS insert cell (must match the fill).
+                    let igo = ins_cost(j).0;
                     j -= 1;
                     if j == 0 {
                         rr = VSTART;
@@ -527,16 +800,12 @@ impl Poa {
                         // multi-base insert run one base short, mis-emitting an
                         // inserted base as a Match. Guard the NEG_INF M cell so an
                         // unreachable M can never win the comparison.
-                        state = if o != NEG_INF && o + go >= e { 0 } else { 1 };
+                        state = if o != NEG_INF && o + igo >= e { 0 } else { 1 };
                     }
                 }
                 _ => {
                     ops.push(Op::Del(t));
-                    let (pst, pr) = if j == 0 {
-                        d0bk[r]
-                    } else {
-                        dbk[off[r] + (j - lo_[r])]
-                    };
+                    let (pst, pr) = if j == 0 { d0bk[r] } else { d_back(r, j) };
                     state = pst;
                     rr = pr;
                 }
@@ -549,6 +818,11 @@ impl Poa {
                 break;
             }
         }
+        self.align_bufs.set(AlignBufs {
+            m: mflat,
+            i: iflat,
+            d: dflat,
+        });
         ops.reverse();
         ops
     }
@@ -756,63 +1030,95 @@ impl Poa {
             .collect()
     }
 
-    /// Fit score for a candidate consensus: build a throwaway graph seeded on
-    /// `candidate`, align every read to it, and return the mean per-base total of
-    /// Insert + Delete ops (content the candidate doesn't explain / doesn't
-    /// confirm). Lower = better fit; 0.0 = every read matches exactly. Used to
-    /// pick between heaviest-path and majority-frequency candidates per call.
-    fn fit_score(candidate: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> f64 {
+    /// Fit of a candidate consensus to the reads: build a throwaway graph
+    /// seeded on `candidate`, align every read to it, and total the indels.
+    /// Mismatches are not counted: on noisy reads they are mostly read error,
+    /// and counting them let a frame-broken majority candidate win on ONT
+    /// CAG50. Used to pick between heaviest-path and majority-frequency
+    /// candidates (see [`Poa::mf_beats_hp`]).
+    fn fit(candidate: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> Fit {
         if candidate.is_empty() {
-            return f64::MAX;
+            return Fit {
+                affine: u64::MAX,
+                indel_bases: u64::MAX,
+            };
         }
         let g = Poa::new(candidate, cfg.clone());
         let (topo, rank) = g.topo_order();
-        let mut indel = 0usize;
-        let mut bases = 0usize;
+        let (open, extend) = (
+            cfg.gap_open.unsigned_abs() as u64,
+            cfg.gap_extend.unsigned_abs() as u64,
+        );
+        let mut fit = Fit {
+            affine: 0,
+            indel_bases: 0,
+        };
         for r in reads {
+            let mut prev = 0u8; // 0 = match, 1 = insert, 2 = delete
             for op in g.align(r, &topo, &rank) {
-                if matches!(op, Op::Ins(_) | Op::Del(_)) {
-                    indel += 1;
+                let kind = match op {
+                    Op::Match(_) => 0,
+                    Op::Ins(_) => 1,
+                    Op::Del(_) => 2,
+                };
+                if kind != 0 {
+                    fit.indel_bases += 1;
+                    fit.affine += extend + if kind != prev { open } else { 0 };
                 }
+                prev = kind;
             }
-            bases += r.len();
         }
-        indel as f64 / bases.max(1) as f64
+        fit
     }
 
-    /// Best of heaviest-path and majority-frequency, chosen by `fit_score`
-    /// against the reads. The two consensus modes win different cases (heaviest
-    /// on clean/short, majority on high-error length-variable repeats); scoring
-    /// both against the actual reads and keeping the better fit gets the best of
-    /// each without an oracle.
+    /// Whether the majority-frequency candidate should replace the heaviest
+    /// path: only when it fits the reads strictly better on BOTH measures,
+    /// fewer indel bases and a lower affine indel penalty. The heaviest path is
+    /// the graph-supported default; MF overrides it only on unambiguous
+    /// evidence. Each measure alone fails on (CA)n ladders:
+    /// - Indel bases alone reward a candidate halfway between two repeat
+    ///   lengths: with reads at 19 and 20 units, a frame-broken `(CA)19 C` is
+    ///   one base from every read, so it beat both real lengths.
+    /// - The affine penalty alone breaks exact base-count ties toward the
+    ///   shorter candidate: a read longer than the candidate can absorb several
+    ///   differences into one insertion run (one open), so a one-unit-short MF
+    ///   won on the open charge alone (and a 6-C homopolymer became 5 C on
+    ///   HG002 HiFi DM1).
+    fn mf_beats_hp(hp: &[u8], mf: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> bool {
+        let fh = Self::fit(hp, reads, cfg);
+        let fm = Self::fit(mf, reads, cfg);
+        fm.affine < fh.affine && fm.indel_bases < fh.indel_bases
+    }
+
+    /// Best of heaviest-path and majority-frequency, chosen by
+    /// [`Poa::mf_beats_hp`]. The two consensus modes win different cases
+    /// (heaviest on clean/short, majority on high-error length-variable
+    /// repeats); scoring both against the actual reads gets the better of each
+    /// without an oracle.
     pub fn consensus_best_fit(&self, reads: &[&[u8]]) -> Vec<u8> {
         let hp = self.consensus();
         let mf = self.consensus_majority();
-        if hp == mf {
-            return hp;
+        if hp != mf && Self::mf_beats_hp(&hp, &mf, reads, &self.cfg) {
+            mf
+        } else {
+            hp
         }
-        let fh = Self::fit_score(&hp, reads, &self.cfg);
-        let fm = Self::fit_score(&mf, reads, &self.cfg);
-        if fm < fh { mf } else { hp }
     }
 
     /// Rich `Consensus` output using the best-fit sequence (heaviest-path vs
-    /// majority-frequency, chosen by `fit_score`). When heaviest-path wins (the
-    /// common case) this is exactly `consensus_full()`. When majority-frequency
-    /// wins, the emitted sequence is the MF one and the per-position fields
-    /// (coverage, path_weights, gaps) are recomputed from the MF columns so the
-    /// output stays self-consistent; graph-structural fields (graph_stats,
-    /// bubble_sites) are unchanged since they describe the graph, not the path.
+    /// majority-frequency, chosen by [`Poa::mf_beats_hp`]). When heaviest-path
+    /// wins (the common case) this is exactly `consensus_full()`. When
+    /// majority-frequency wins, the emitted sequence is the MF one and the
+    /// per-position fields (coverage, path_weights, gaps) are recomputed from
+    /// the MF columns so the output stays self-consistent; graph-structural
+    /// fields (graph_stats, bubble_sites) are unchanged since they describe the
+    /// graph, not the path.
     pub fn consensus_full_best_fit(&self, reads: &[&[u8]]) -> crate::types::Consensus {
         let base = self.consensus_full();
         let (mf_seq, mf_cov) = self.consensus_majority_cov();
-        if base.sequence == mf_seq {
+        if base.sequence == mf_seq || !Self::mf_beats_hp(&base.sequence, &mf_seq, reads, &self.cfg)
+        {
             return base;
-        }
-        let fh = Self::fit_score(&base.sequence, reads, &self.cfg);
-        let fm = Self::fit_score(&mf_seq, reads, &self.cfg);
-        if fh <= fm {
-            return base; // heaviest-path wins (ties keep the path-based output)
         }
         Self::mf_full(base, mf_seq, mf_cov)
     }
@@ -883,6 +1189,9 @@ impl Poa {
             gaps,
             bubble_sites: base.bubble_sites,
             read_indices: vec![],
+            // Not a node path in this graph: the caller scores it against the
+            // reads (`support_quality_by_realignment`).
+            support_quality: Vec::new(),
         }
     }
 
@@ -901,8 +1210,8 @@ impl Poa {
             }
             x
         }
-        for i in 0..n {
-            for &a in &self.nodes[i].aligned {
+        for (i, nd) in self.nodes.iter().enumerate() {
+            for &a in &nd.aligned {
                 let (ri, ra) = (find(&mut parent, i), find(&mut parent, a));
                 if ri != ra {
                     parent[ri] = ra;
@@ -913,9 +1222,9 @@ impl Poa {
         let mut group_out: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut indeg = vec![0usize; n];
         let mut seen = std::collections::HashSet::new();
-        for i in 0..n {
+        for (i, nd) in self.nodes.iter().enumerate() {
             let gi = find(&mut parent, i);
-            for e in &self.nodes[i].out {
+            for e in &nd.out {
                 let gj = find(&mut parent, e.to);
                 if gi != gj && seen.insert((gi, gj)) {
                     group_out[gi].push(gj);
@@ -966,26 +1275,39 @@ impl Poa {
     /// of reads present at that column). Falls back to heaviest-path (with its
     /// path coverage) if the column DAG is unusable.
     fn consensus_majority_cov(&self) -> (Vec<u8>, Vec<u32>) {
+        let (seq, cov, _) = self.consensus_majority_cols();
+        (seq, cov)
+    }
+
+    /// `consensus_majority_cov` plus the MSA column of each emitted base
+    /// (`None` when it fell back to the heaviest path).
+    fn consensus_majority_cols(&self) -> (Vec<u8>, Vec<u32>, Option<Vec<usize>>) {
         let (node_col, ncol) = match self.msa_columns() {
             Some(x) => x,
             None => {
                 let path = self.heaviest_path_nodes();
                 let seq = path.iter().map(|&nd| self.nodes[nd].base).collect();
                 let cov = path.iter().map(|&nd| self.nodes[nd].cov).collect();
-                return (seq, cov);
+                return (seq, cov, None);
             }
         };
-        // Per-column base tallies (A,C,G,T) plus present-read count.
-        let mut tally = vec![[0u32; 4]; ncol];
+        // Per-column symbol tallies (A,C,G,T, then the homopolymer-compressed
+        // poly-A..poly-T symbols, which set the high bit; see `crate::hpc`)
+        // plus present-read count.
+        let mut tally = vec![[0u32; 8]; ncol];
         let mut present = vec![0u32; ncol];
-        // ACGT → bucket index; any other base (N / IUPAC) → None so it is NOT
-        // folded into the T tally (it still counts as column occupancy below).
-        let code = |b: u8| match b {
-            b'A' => Some(0usize),
-            b'C' => Some(1),
-            b'G' => Some(2),
-            b'T' => Some(3),
-            _ => None,
+        // ACGT (± poly bit) → bucket index; any other base (N / IUPAC) → None
+        // so it is NOT folded into a real tally (it still counts as column
+        // occupancy below).
+        let code = |b: u8| {
+            let i = match b & 0x7f {
+                b'A' => 0usize,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                _ => return None,
+            };
+            Some(if b & 0x80 != 0 { i + 4 } else { i })
         };
         // `covering[c]` = reads whose occupied column *range* brackets column `c`
         // (via a difference array over each read's [min,max] column). A read that
@@ -1008,7 +1330,7 @@ impl Poa {
                 last_col = c;
                 present[c] += 1; // column occupancy (any base, incl. N)
                 if let Some(ci) = code(self.nodes[nd].base) {
-                    tally[c][ci] += 1; // base plurality: ACGT only
+                    tally[c][ci] += 1; // base plurality: ACGT (+ poly) only
                 }
             }
             if lo != usize::MAX {
@@ -1022,9 +1344,19 @@ impl Poa {
             acc += cover_delta[c];
             covering[c] = acc.max(0) as u32;
         }
-        let bases = *b"ACGT";
+        let bases = [
+            b'A',
+            b'C',
+            b'G',
+            b'T',
+            b'A' | 0x80,
+            b'C' | 0x80,
+            b'G' | 0x80,
+            b'T' | 0x80,
+        ];
         let mut out = Vec::with_capacity(ncol);
         let mut cov = Vec::with_capacity(ncol);
+        let mut cols = Vec::with_capacity(ncol);
         // A column is emitted only if a majority of the whole read set REACHES it
         // (`covering >= floor`) AND its plurality base beats genuine deletions
         // among the reads that span it (`bc > gap`). The `covering` floor keeps
@@ -1043,9 +1375,42 @@ impl Poa {
             if bc > gap && covering[c] >= floor {
                 out.push(bases[bi]);
                 cov.push(bc); // reads supporting the emitted base at this column
+                cols.push(c);
             }
         }
-        (out, cov)
+        (out, cov, Some(cols))
+    }
+
+    /// For a consensus `cons` of this graph (its heaviest path or its
+    /// majority-frequency sequence): the MSA column of every node, and the
+    /// column of every consensus position. `None` if `cons` is neither or the
+    /// column DAG is unusable.
+    pub(crate) fn consensus_columns(&self, cons: &[u8]) -> Option<(Vec<usize>, Vec<usize>)> {
+        let (node_col, _) = self.msa_columns()?;
+        let path = self.heaviest_path_nodes();
+        if path.len() == cons.len()
+            && path
+                .iter()
+                .zip(cons)
+                .all(|(&n, &b)| self.nodes[n].base == b)
+        {
+            let pos_col = path.iter().map(|&n| node_col[n]).collect();
+            return Some((node_col, pos_col));
+        }
+        let (mf, _, cols) = self.consensus_majority_cols();
+        if mf == cons {
+            return Some((node_col, cols?));
+        }
+        None
+    }
+
+    /// Occupied nodes per read, in insertion order (seed first).
+    pub(crate) fn read_paths(&self) -> &[Vec<usize>] {
+        &self.read_paths
+    }
+
+    pub(crate) fn node_base(&self, n: usize) -> u8 {
+        self.nodes[n].base
     }
 
     /// Materialise an arm from `start` until the first reconvergence (2+ in-edges)
@@ -1075,6 +1440,15 @@ impl Poa {
     }
 
     /// GraphStats over the whole graph (O(V+E)).
+    /// Minimum matched-read count for a bubble arm to be reported (bubble
+    /// sites, bubble statistics): `ceil(n_reads * min_allele_freq)`, at least
+    /// 1, so a reported arm carries at least `min_allele_freq` of the reads.
+    /// Multi-allele discovery uses the same rule; acting on a split
+    /// additionally needs 2 reads (`multi::phasing_floor`).
+    fn allele_arm_floor(&self) -> i32 {
+        (((self.n_reads as f64) * self.cfg.min_allele_freq).ceil() as i32).max(1)
+    }
+
     fn compute_stats(&self, er: &HashMap<(usize, usize), Vec<u32>>) -> crate::types::GraphStats {
         use crate::types::GraphStats;
         let n = self.nodes.len();
@@ -1128,8 +1502,7 @@ impl Poa {
         // MATCHED edge view (`er`), not `Edge.weight`, so a length variant's
         // delete-bypass resume edge does not inflate bubble_count/max_bubble_depth
         // (see the matched-edge invariant and the bubble scan in `consensus_full`).
-        let floor = ((self.n_reads as f64) * self.cfg.min_allele_freq).floor() as i32;
-        let floor = floor.max(1);
+        let floor = self.allele_arm_floor();
         let mut bubble_count = 0usize;
         let mut max_bubble_depth = 0usize;
         let mut longest_span = 0usize;
@@ -1213,6 +1586,72 @@ impl Poa {
     }
 
     /// Full consensus output (rich `Consensus`) for the public API.
+    /// Per-base support quality of a consensus that is the node path `path`
+    /// in this graph (see [`Consensus::support_quality`]). Each read votes from
+    /// its recorded path: between two consecutive consensus nodes it visits
+    /// (`a`, then `b`), stepping straight from `a` to `a + 1` agrees with base
+    /// `a + 1`; any other route is an alternative, against the skipped bases
+    /// `a + 1 .. b` or, for an insertion (`b == a + 1` via other nodes), against
+    /// `b`. Reads taking the same route (same anchors and intermediate nodes)
+    /// form one alternative, and each base is scored against its strongest
+    /// alternative only: sequencing errors scatter over many one-read routes,
+    /// while a competing call concentrates on one. Bases outside a read's first
+    /// and last consensus node get no vote from it. `skip_seed` drops read 0
+    /// (a support graph seeded with the consensus itself).
+    ///
+    /// [`Consensus::support_quality`]: crate::types::Consensus::support_quality
+    pub(crate) fn path_support_quality(&self, path: &[usize], skip_seed: bool) -> Vec<u8> {
+        let n = path.len();
+        let mut idx = vec![usize::MAX; self.nodes.len()];
+        for (i, &nd) in path.iter().enumerate() {
+            idx[nd] = i;
+        }
+        let mut agree = vec![0u32; n];
+        let mut routes: HashMap<(usize, usize, Vec<usize>), u32> = HashMap::new();
+        for (r, rp) in self.read_paths.iter().enumerate() {
+            if skip_seed && r == 0 {
+                continue;
+            }
+            // (consensus index, position in the read's path) of the last anchor
+            let mut prev: Option<(usize, usize)> = None;
+            for (k, &nd) in rp.iter().enumerate() {
+                let ci = idx[nd];
+                if ci == usize::MAX {
+                    continue;
+                }
+                match prev {
+                    None => agree[ci] += 1,
+                    Some((a, _)) if ci <= a => continue, // not forward along the path
+                    Some((a, ka)) => {
+                        if ci == a + 1 && k == ka + 1 {
+                            agree[ci] += 1;
+                        } else {
+                            *routes.entry((a, ci, rp[ka + 1..k].to_vec())).or_insert(0) += 1;
+                            if ci > a + 1 {
+                                // skipped or substituted bases are the alternative;
+                                // the read still carries base `ci` itself
+                                agree[ci] += 1;
+                            }
+                        }
+                    }
+                }
+                prev = Some((ci, k));
+            }
+        }
+        let mut alt = vec![0u32; n];
+        for ((a, b, _), &count) in &routes {
+            let span = if *b > a + 1 { a + 1..*b } else { *b..b + 1 };
+            for x in &mut alt[span] {
+                *x = (*x).max(count);
+            }
+        }
+        agree
+            .iter()
+            .zip(&alt)
+            .map(|(&a, &m)| support_phred(a, m))
+            .collect()
+    }
+
     pub fn consensus_full(&self) -> crate::types::Consensus {
         use crate::types::{BubbleSite, Consensus, CoverageGap, GapKind};
         let path = self.heaviest_path_nodes();
@@ -1264,7 +1703,7 @@ impl Poa {
         // bypass-inclusive `read_paths` separately. See the `read_matched_edges`
         // invariant.
         let er = self.edge_reads();
-        let floor = (((self.n_reads as f64) * self.cfg.min_allele_freq).floor() as i32).max(1);
+        let floor = self.allele_arm_floor();
         let mut bubble_sites = Vec::new();
         for (pos, &nd) in path.iter().enumerate() {
             let mw = |to: usize| er.get(&(nd, to)).map_or(0, |v| v.len()) as i32;
@@ -1302,6 +1741,7 @@ impl Poa {
             gaps,
             bubble_sites,
             read_indices: vec![],
+            support_quality: self.path_support_quality(&path, false),
         }
     }
 
@@ -1353,8 +1793,8 @@ impl Poa {
         }
         // Fork sites: nodes with ≥2 matched out-edges each ≥ floor.
         let mut sites: Vec<Site> = Vec::new();
-        for node in 0..self.nodes.len() {
-            let mut branches: Vec<(usize, u32)> = self.nodes[node]
+        for (node, nd) in self.nodes.iter().enumerate() {
+            let mut branches: Vec<(usize, u32)> = nd
                 .out
                 .iter()
                 .filter_map(|e| {
@@ -1731,6 +2171,109 @@ mod tests_mismatch {
 }
 
 #[cfg(test)]
+mod tests_best_fit_frame {
+    use super::*;
+
+    /// ONT (CA)20 reads from bladerunner / str-replicant (synthetic): four
+    /// exact, three one CA short, the median-length seed (r4) missing one A.
+    /// Majority-frequency splits the column vote where the short reads place
+    /// their deletion and emits a frame-broken `(CA)19 C`; an indel-*bases*
+    /// fit score preferred it (one base from every read). The heaviest path is
+    /// right, and BestFit must keep it in every read order.
+    const READS: [&[u8]; 10] = [
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACCACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACCACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTCACACACACACACACACAACACACACACACACACACACAGGATCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCAGG",
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG",
+    ];
+    const TRUTH: &[u8] =
+        b"GGGAAACTATTGTGCAATTTCACACACACACACACACACACACACACACACACACACACAGGATCCCATGACTCATCACG";
+
+    #[test]
+    fn best_fit_rejects_frame_broken_majority_in_every_order() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for trial in 0..50 {
+            let mut order: Vec<usize> = (0..READS.len()).collect();
+            for i in (1..order.len()).rev() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                order.swap(i, (state % (i as u64 + 1)) as usize);
+            }
+            let reads: Vec<&[u8]> = order.iter().map(|&i| READS[i]).collect();
+            let c = crate::consensus(&reads, 0, &PoaConfig::default()).unwrap();
+            assert_eq!(
+                c.sequence,
+                TRUTH,
+                "trial {trial} order {order:?}: got {}",
+                String::from_utf8_lossy(&c.sequence)
+            );
+        }
+    }
+
+    /// ONT (CA)22 reads from bladerunner / str-replicant (synthetic), split
+    /// 4 x 21 units against 3 x 22 plus noise. Both candidates have the same
+    /// indel *bases*; the one-unit-short majority candidate needs one fewer
+    /// indel *event* (a longer read absorbs its differences into one insert
+    /// run), so an affine-only fit picked it. MF must not win on a tie in
+    /// indel bases.
+    #[test]
+    fn best_fit_keeps_heaviest_path_on_indel_base_tie() {
+        let reads: [&[u8]; 10] = [
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAG",
+            b"CGGGTCGGTCTTTGCGTTTTCACACGCACACACACACACACACTCACACGCACACACACACAGTTGGGAGTAGTGTTCTATT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACAGACACACACACACACACACACAAGCACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT",
+        ];
+        let truth: &[u8] =
+            b"CGGGTCGGTCTTTGCGTTTTCACACACACACACACACACACACACACACACACACACACACACAGTTGGGAGTAGTGTTCTAGT";
+        let c = crate::consensus(&reads, 0, &PoaConfig::default()).unwrap();
+        assert_eq!(
+            c.sequence,
+            truth,
+            "got {}",
+            String::from_utf8_lossy(&c.sequence)
+        );
+    }
+
+    /// Synthetic analogue of HG002 HiFi DM1 (homozygous `C6 (CAG)11`): two
+    /// reads one C short, one exact, and one exact plus an extra CAG. Against
+    /// a 5-C candidate the long read takes its extra C and CAG as one adjacent
+    /// 4-base insertion, so the 5-C candidate saves an indel open at the same
+    /// indel-base count. The heaviest path (6 C) must be kept.
+    #[test]
+    fn best_fit_keeps_longer_homopolymer_on_indel_base_tie() {
+        let reads: [&[u8]; 4] = [
+            b"GCTAAAGACAATTACATAATCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT",
+            b"GCTAAAGACAATTACATAATCCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT",
+            b"GCTAAAGACAATTACATAATCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT",
+            b"GCTAAAGACAATTACATAATCCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT",
+        ];
+        let truth: &[u8] =
+            b"GCTAAAGACAATTACATAATCCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTACACGTCAGCACGAAACT";
+        let c = crate::consensus(&reads, 0, &PoaConfig::default()).unwrap();
+        assert_eq!(
+            c.sequence,
+            truth,
+            "got {}",
+            String::from_utf8_lossy(&c.sequence)
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests_semiglobal {
     use super::*;
     fn cfg() -> PoaConfig {
@@ -1756,5 +2299,699 @@ mod tests_semiglobal {
             "partial reads must not truncate the consensus; got {}",
             String::from_utf8_lossy(&g.consensus())
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_homopolymer_probe {
+    use super::*;
+
+    fn read_fasta(path: &str) -> Vec<Vec<u8>> {
+        let fa = std::fs::read_to_string(path).expect("fasta");
+        let mut reads = Vec::new();
+        let mut cur = Vec::new();
+        for line in fa.lines() {
+            if line.starts_with('>') {
+                if !cur.is_empty() {
+                    reads.push(std::mem::take(&mut cur));
+                }
+            } else {
+                cur.extend_from_slice(line.trim().as_bytes());
+            }
+        }
+        if !cur.is_empty() {
+            reads.push(cur);
+        }
+        reads
+    }
+
+    /// Dump MSA columns of a real/handmade read set to see whether a single
+    /// interrupting base between two variable homopolymers lands in one column
+    /// or is split across several. PROBE_FA overrides the input.
+    #[test]
+    #[ignore = "probe; run with --ignored --nocapture"]
+    fn probe_split_interrupt_column() {
+        let path = std::env::var("PROBE_FA").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/homopolymers/msa.fasta").into()
+        });
+        let reads = read_fasta(&path);
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        let mut order: Vec<usize> = (0..reads.len()).collect();
+        order.sort_by_key(|&i| reads[i].len());
+        let med = order[order.len() / 2];
+        let mut g = Poa::new(&reads[med], PoaConfig::default());
+        for (i, r) in reads.iter().enumerate() {
+            if i != med {
+                g.add_read(r);
+            }
+        }
+        let (node_col, ncol) = g.msa_columns().expect("acyclic columns");
+        let mut cols: Vec<Vec<usize>> = vec![Vec::new(); ncol];
+        for (nd, &c) in node_col.iter().enumerate() {
+            cols[c].push(nd);
+        }
+        for (c, nodes) in cols.iter().enumerate() {
+            let s: Vec<String> = nodes
+                .iter()
+                .map(|&n| {
+                    format!(
+                        "n{}:{} cov{} del{}",
+                        n, g.nodes[n].base as char, g.nodes[n].cov, g.nodes[n].del
+                    )
+                })
+                .collect();
+            eprintln!("col {c:4}: {}", s.join(" | "));
+        }
+        eprintln!("heaviest : {}", String::from_utf8_lossy(&g.consensus()));
+        eprintln!(
+            "majority : {}",
+            String::from_utf8_lossy(&g.consensus_majority())
+        );
+        eprintln!(
+            "best-fit : {}",
+            String::from_utf8_lossy(&g.consensus_best_fit(&refs))
+        );
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn unit(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 31) as f64
+        }
+    }
+
+    /// Run-length jitter: 0 with p0, else +/-1 (mostly) or +/-2.
+    fn jitter(rng: &mut Lcg, p0: f64) -> i32 {
+        let u = rng.unit();
+        if u < p0 {
+            return 0;
+        }
+        let mag = if rng.unit() < 0.8 { 1 } else { 2 };
+        if rng.unit() < 0.5 { -mag } else { mag }
+    }
+
+    fn rand_flank(rng: &mut Lcg, n: usize) -> Vec<u8> {
+        // No A at the junctions so the runs are unambiguous.
+        let mut v: Vec<u8> = (0..n).map(|_| b"ACGT"[(rng.next() % 4) as usize]).collect();
+        let k = v.len();
+        v[k - 1] = b'C';
+        v[0] = b'T';
+        v
+    }
+
+    /// Sweep: flankL + A^a G A^b + flankR, each read jitters a and b
+    /// independently. Count how often the interrupt G is split across MSA
+    /// columns, and how often the public `consensus()` output is wrong
+    /// (G lost/duplicated, or run lengths off).
+    #[test]
+    #[ignore = "probe; run with --ignored --nocapture"]
+    fn probe_interrupt_sweep() {
+        for &(a0, b0) in &[(12usize, 11usize), (8, 8), (20, 20)] {
+            for &p0 in &[0.7, 0.5, 0.3] {
+                for &depth in &[10usize, 20, 40] {
+                    let trials = 200;
+                    let (mut split, mut g_wrong, mut len_wrong) = (0, 0, 0);
+                    for t in 0..trials {
+                        let mut rng = Lcg(1 + t as u64 * 7919 + depth as u64 * 31);
+                        let lf = rand_flank(&mut rng, 30);
+                        let mut rf = rand_flank(&mut rng, 30);
+                        rf[0] = b'C';
+                        let mk = |a: usize, b: usize| {
+                            let mut r = lf.clone();
+                            r.extend(std::iter::repeat_n(b'A', a));
+                            r.push(b'G');
+                            r.extend(std::iter::repeat_n(b'A', b));
+                            r.extend_from_slice(&rf);
+                            r
+                        };
+                        let reads: Vec<Vec<u8>> = (0..depth)
+                            .map(|_| {
+                                let a = (a0 as i32 + jitter(&mut rng, p0)).max(1) as usize;
+                                let b = (b0 as i32 + jitter(&mut rng, p0)).max(1) as usize;
+                                mk(a, b)
+                            })
+                            .collect();
+                        let truth = mk(a0, b0);
+                        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+                        // Column split check on the same graph the library builds.
+                        let mut order: Vec<usize> = (0..reads.len()).collect();
+                        order.sort_by_key(|&i| reads[i].len());
+                        let med = order[order.len() / 2];
+                        let mut g = Poa::new(&reads[med], PoaConfig::default());
+                        for (i, r) in reads.iter().enumerate() {
+                            if i != med {
+                                g.add_read(r);
+                            }
+                        }
+                        let (node_col, _) = g.msa_columns().expect("acyclic");
+                        let mut gcols: Vec<usize> = (0..g.nodes.len())
+                            .filter(|&n| g.nodes[n].base == b'G' && g.nodes[n].cov >= 2)
+                            .map(|n| node_col[n])
+                            .collect();
+                        // Only the interrupt region: columns past the left flank.
+                        gcols.retain(|&c| c >= lf.len() && c < lf.len() + a0 + b0 + 6);
+                        gcols.sort_unstable();
+                        gcols.dedup();
+                        if gcols.len() > 1 {
+                            split += 1;
+                        }
+                        let cons = crate::consensus(&refs, 0, &PoaConfig::default())
+                            .unwrap()
+                            .sequence;
+                        let mid =
+                            &cons[lf.len().min(cons.len())..cons.len().saturating_sub(rf.len())];
+                        let ng = mid.iter().filter(|&&c| c == b'G').count();
+                        if ng != 1 {
+                            g_wrong += 1;
+                        } else if cons != truth {
+                            len_wrong += 1;
+                        }
+                    }
+                    eprintln!(
+                        "A{a0}GA{b0} p0={p0} depth={depth:2}: G split across columns {split:3}/{trials} | consensus G lost/dup {g_wrong:3} | runs wrong {len_wrong:3}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_homopolymer_compare {
+    use crate::config::PoaConfig;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn unit(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 31) as f64
+        }
+    }
+
+    fn jitter(rng: &mut Lcg, p0: f64) -> i32 {
+        if rng.unit() < p0 {
+            return 0;
+        }
+        let mag = if rng.unit() < 0.8 { 1 } else { 2 };
+        if rng.unit() < 0.5 { -mag } else { mag }
+    }
+
+    /// Raw vs homopolymer-compressed consensus on flankL + A^12 G A^11 + flankR,
+    /// with per-read run-length jitter and random substitutions (rate `e`).
+    /// Reports exact-match rate and G-lost/duplicated rate per mode.
+    #[test]
+    #[ignore = "probe; run with --ignored --nocapture"]
+    fn probe_hpc_vs_raw() {
+        let (a0, b0) = (12usize, 11usize);
+        for &e in &[0.0, 0.01, 0.03] {
+            for &p0 in &[0.7, 0.5, 0.3] {
+                for &depth in &[10usize, 20, 40] {
+                    let trials = 200;
+                    let modes = [
+                        (0usize, false),
+                        (2, false),
+                        (4, false),
+                        (2, true),
+                        (4, true),
+                    ];
+                    let mut exact = [0usize; 5];
+                    let mut gbad = [0usize; 5];
+                    for t in 0..trials {
+                        let mut rng = Lcg(1 + t as u64 * 7919 + depth as u64 * 31);
+                        let flank = |rng: &mut Lcg| -> Vec<u8> {
+                            (0..30).map(|_| b"CGT"[(rng.next() % 3) as usize]).collect()
+                        };
+                        let lf = flank(&mut rng);
+                        let rf = flank(&mut rng);
+                        let mk = |a: usize, b: usize| {
+                            let mut r = lf.clone();
+                            r.extend(std::iter::repeat_n(b'A', a));
+                            r.push(b'G');
+                            r.extend(std::iter::repeat_n(b'A', b));
+                            r.extend_from_slice(&rf);
+                            r
+                        };
+                        let truth = mk(a0, b0);
+                        let reads: Vec<Vec<u8>> = (0..depth)
+                            .map(|_| {
+                                let a = (a0 as i32 + jitter(&mut rng, p0)).max(1) as usize;
+                                let b = (b0 as i32 + jitter(&mut rng, p0)).max(1) as usize;
+                                let mut r = mk(a, b);
+                                for x in r.iter_mut() {
+                                    if rng.unit() < e {
+                                        let alts: Vec<u8> =
+                                            b"ACGT".iter().copied().filter(|&c| c != *x).collect();
+                                        *x = alts[(rng.next() % 3) as usize];
+                                    }
+                                }
+                                r
+                            })
+                            .collect();
+                        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+                        for (mi, &(m, best)) in modes.iter().enumerate() {
+                            let mut cfg = PoaConfig {
+                                homopolymer_min_run: m,
+                                ..PoaConfig::default()
+                            };
+                            if std::env::var("MF").is_ok() {
+                                cfg.consensus_mode =
+                                    crate::config::ConsensusMode::MajorityFrequency;
+                            }
+                            let cons = if m == 0 || best {
+                                crate::consensus(&refs, 0, &cfg).unwrap().sequence
+                            } else {
+                                crate::hpc::consensus_compressed(&refs, &cfg).sequence
+                            };
+                            if cons == truth {
+                                exact[mi] += 1;
+                            } else if std::env::var("SHOW").is_ok()
+                                && m == 4
+                                && best
+                                && e > 0.02
+                                && p0 > 0.6
+                                && depth == 20
+                                && t < 15
+                            {
+                                let f = |s: &[u8]| {
+                                    String::from_utf8_lossy(&s[25..s.len().saturating_sub(25)])
+                                        .into_owned()
+                                };
+                                eprintln!("  truth {}\n  k2    {}", f(&truth), f(&cons));
+                            }
+                            // The interrupt region is the only place with A's (flanks are C/G/T).
+                            let first = cons.iter().position(|&c| c == b'A');
+                            let last = cons.iter().rposition(|&c| c == b'A');
+                            let ng = match (first, last) {
+                                (Some(f), Some(l)) => {
+                                    cons[f..=l].iter().filter(|&&c| c == b'G').count()
+                                }
+                                _ => 0,
+                            };
+                            if ng != 1 {
+                                gbad[mi] += 1;
+                            }
+                        }
+                    }
+                    let fmt = |v: &[usize; 5]| {
+                        v.iter()
+                            .map(|x| format!("{x:3}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    eprintln!(
+                        "e={e:.2} p0={p0} d={depth:2} | exact raw/k2/k4/k2best/k4best: {} | G bad: {}",
+                        fmt(&exact),
+                        fmt(&gbad)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_hp_methods {
+    use crate::config::PoaConfig;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn unit(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 31) as f64
+        }
+    }
+
+    fn jitter(rng: &mut Lcg, p0: f64) -> i32 {
+        if rng.unit() < p0 {
+            return 0;
+        }
+        let mag = if rng.unit() < 0.8 { 1 } else { 2 };
+        if rng.unit() < 0.5 { -mag } else { mag }
+    }
+
+    fn flank(rng: &mut Lcg) -> Vec<u8> {
+        let mut v: Vec<u8> = (0..30).map(|_| b"CGT"[(rng.next() % 3) as usize]).collect();
+        v[0] = b'C';
+        v[29] = b'C';
+        v
+    }
+
+    fn methods() -> Vec<(&'static str, PoaConfig)> {
+        let d = PoaConfig::default();
+        vec![
+            ("raw", d.clone()),
+            // "!" = engine with gap costs directly, no splice/fit guard.
+            (
+                "gap!",
+                PoaConfig {
+                    homopolymer_gap: Some((-2, -1)),
+                    ..d.clone()
+                },
+            ),
+            (
+                "gap",
+                PoaConfig {
+                    homopolymer_gap: Some((-2, -1)),
+                    ..d.clone()
+                },
+            ),
+            (
+                "hpc2",
+                PoaConfig {
+                    homopolymer_min_run: 2,
+                    ..d.clone()
+                },
+            ),
+            (
+                "hpc4",
+                PoaConfig {
+                    homopolymer_min_run: 4,
+                    ..d.clone()
+                },
+            ),
+            (
+                "hpc2+gap",
+                PoaConfig {
+                    homopolymer_min_run: 2,
+                    homopolymer_gap: Some((-2, -1)),
+                    ..d.clone()
+                },
+            ),
+        ]
+    }
+
+    /// `make(rng) -> (truth, reads)`; prints exact-match count and mean edit
+    /// distance per method.
+    /// (truth, reads)
+    type Case = (Vec<u8>, Vec<Vec<u8>>);
+
+    fn run(label: &str, trials: usize, make: &dyn Fn(&mut Lcg) -> Case) {
+        let ms = methods();
+        let mut exact = vec![0usize; ms.len()];
+        let mut edits = vec![0usize; ms.len()];
+        let mut units = vec![0usize; ms.len()];
+        for t in 0..trials {
+            let mut rng = Lcg(17 + t as u64 * 104729);
+            let (truth, reads) = make(&mut rng);
+            let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            for (mi, (_, cfg)) in ms.iter().enumerate() {
+                let cons = if ms[mi].0.ends_with('!') {
+                    crate::engine_consensus(&refs, cfg).sequence
+                } else {
+                    crate::consensus(&refs, 0, cfg).unwrap().sequence
+                };
+                let ed = crate::poa2::tests::lev(&cons, &truth);
+                edits[mi] += ed;
+                let nt = |s: &[u8]| s.iter().filter(|&&c| c == b'T').count();
+                if nt(&cons) == nt(&truth) {
+                    units[mi] += 1;
+                }
+                if ed == 0 {
+                    exact[mi] += 1;
+                }
+            }
+        }
+        let cells: Vec<String> = ms
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| {
+                format!(
+                    "{n} {:3}/{:3} ({:.2})",
+                    exact[i],
+                    units[i],
+                    edits[i] as f64 / trials as f64
+                )
+            })
+            .collect();
+        eprintln!("{label} | {}", cells.join(" | "));
+    }
+
+    fn subs(rng: &mut Lcg, r: &mut [u8], e: f64) {
+        for x in r.iter_mut() {
+            if rng.unit() < e {
+                let alts: Vec<u8> = b"ACGT".iter().copied().filter(|&c| c != *x).collect();
+                *x = alts[(rng.next() % 3) as usize];
+            }
+        }
+    }
+
+    /// Per method: exact matches / T-count matches (unit count for the AT
+    /// repeat) out of N, and mean edit distance.
+    #[test]
+    #[ignore = "probe; run with --ignored --nocapture"]
+    fn probe_hp_methods() {
+        let trials: usize = std::env::var("TRIALS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let only = std::env::var("ONLY").unwrap_or_default();
+        for &e in &[0.0, 0.01, 0.03] {
+            for &p0 in &[0.7, 0.4] {
+                for &depth in &[10usize, 20, 40] {
+                    if only.is_empty() || only == "g" {
+                        run(
+                            &format!("G   e={e:.2} p0={p0} d={depth:2}"),
+                            trials,
+                            &|rng| {
+                                let (lf, rf) = (flank(rng), flank(rng));
+                                let mk = |a: usize, b: usize| {
+                                    let mut r = lf.clone();
+                                    r.extend(std::iter::repeat_n(b'A', a));
+                                    r.push(b'G');
+                                    r.extend(std::iter::repeat_n(b'A', b));
+                                    r.extend_from_slice(&rf);
+                                    r
+                                };
+                                let reads = (0..depth)
+                                    .map(|_| {
+                                        let a = (12 + jitter(rng, p0)).max(1) as usize;
+                                        let b = (11 + jitter(rng, p0)).max(1) as usize;
+                                        let mut r = mk(a, b);
+                                        subs(rng, &mut r, e);
+                                        r
+                                    })
+                                    .collect();
+                                (mk(12, 11), reads)
+                            },
+                        );
+                    }
+                    if only.is_empty() || only == "r" {
+                        run(
+                            &format!("AT  e={e:.2} p0={p0} d={depth:2}"),
+                            trials,
+                            &|rng| {
+                                let (lf, rf) = (flank(rng), flank(rng));
+                                // 15 units of A{n}T; ~30% of units are genuinely A3/A5
+                                // in every read (shared), the rest A4.
+                                let units: Vec<usize> = (0..15)
+                                    .map(|_| {
+                                        let u = rng.unit();
+                                        if u < 0.15 {
+                                            3
+                                        } else if u < 0.3 {
+                                            5
+                                        } else {
+                                            4
+                                        }
+                                    })
+                                    .collect();
+                                let mk = |ns: &[usize]| {
+                                    let mut r = lf.clone();
+                                    for &n in ns {
+                                        r.extend(std::iter::repeat_n(b'A', n));
+                                        r.push(b'T');
+                                    }
+                                    r.extend_from_slice(&rf);
+                                    r
+                                };
+                                let reads = (0..depth)
+                                    .map(|_| {
+                                        // Per-read unique noise on every A run.
+                                        let ns: Vec<usize> = units
+                                            .iter()
+                                            .map(|&n| (n as i32 + jitter(rng, p0)).max(1) as usize)
+                                            .collect();
+                                        let mut r = mk(&ns);
+                                        subs(rng, &mut r, e);
+                                        r
+                                    })
+                                    .collect();
+                                (mk(&units), reads)
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_support_quality {
+    use super::*;
+
+    #[test]
+    fn support_phred_values() {
+        // 10 reads agree, no alternative: P = 2^-11.
+        assert_eq!(support_phred(10, 0), 33);
+        // 6-4 split: P(Bin(11, 1/2) > 6) = 562 / 2048.
+        assert_eq!(support_phred(6, 4), 6);
+        // tie, and no spanning reads at all: P = 1/2.
+        assert_eq!(support_phred(5, 5), 3);
+        assert_eq!(support_phred(0, 0), 3);
+        // the alternative outvotes the call
+        assert_eq!(support_phred(2, 8), 0);
+        // deep agreement is capped
+        assert_eq!(support_phred(200, 0), MAX_SUPPORT_QUALITY);
+        assert_eq!(support_phred(10_000, 3), MAX_SUPPORT_QUALITY);
+    }
+
+    #[test]
+    fn support_phred_is_monotone() {
+        for a in 0..40 {
+            for m in 0..10 {
+                assert!(support_phred(a + 1, m) >= support_phred(a, m));
+                assert!(support_phred(a, m + 1) <= support_phred(a, m));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_left_aligned_gaps {
+    //! The traceback runs right to left and prefers to keep matching, so a gap
+    //! opens only when forced: at the LEFTMOST of its equivalent positions
+    //! inside a run or tandem repeat. Every read therefore places the same
+    //! event at the same graph position, which is what lines reads up in the
+    //! graph (and what an explicit left-normalisation pass would do; one was
+    //! tried and moved nothing on the plain engine). These tests guard that
+    //! property against changes to the traceback order.
+    use super::*;
+
+    /// True if no indel run in `ops` can slide one base left: the op before a
+    /// run is not an exact match whose base equals the run's last base.
+    fn left_aligned(g: &Poa, read: &[u8], ops: &[Op]) -> bool {
+        let mut rp = 0usize;
+        let mut prev_match: Option<(usize, u8)> = None; // (node, read base)
+        let mut i = 0;
+        while i < ops.len() {
+            match ops[i] {
+                Op::Match(t) => {
+                    prev_match = Some((t, read[rp]));
+                    rp += 1;
+                    i += 1;
+                }
+                Op::Ins(_) | Op::Del(_) => {
+                    let is_del = matches!(ops[i], Op::Del(_));
+                    let mut e = i;
+                    while e < ops.len() && matches!(ops[e], Op::Del(_)) == is_del {
+                        if !is_del && !matches!(ops[e], Op::Ins(_)) {
+                            break;
+                        }
+                        if !is_del {
+                            rp += 1;
+                        }
+                        e += 1;
+                    }
+                    if let Some((p, rb)) = prev_match {
+                        let pb = g.nodes[p].base;
+                        let last = match ops[e - 1] {
+                            Op::Del(d) => g.nodes[d].base,
+                            Op::Ins(b) => b,
+                            Op::Match(_) => unreachable!(),
+                        };
+                        if pb == rb && last == pb {
+                            return false;
+                        }
+                    }
+                    prev_match = None;
+                    i = e;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn checker_rejects_a_right_placed_gap() {
+        use Op::{Del as D, Match as M};
+        let g = Poa::new(b"GCAAAAT", PoaConfig::default());
+        // GCAAAT with the deleted A on the last A of the run, then on the first
+        assert!(!left_aligned(
+            &g,
+            b"GCAAAT",
+            &[M(0), M(1), M(2), M(3), M(4), D(5), M(6)]
+        ));
+        assert!(left_aligned(
+            &g,
+            b"GCAAAT",
+            &[M(0), M(1), D(2), M(3), M(4), M(5), M(6)]
+        ));
+    }
+
+    #[test]
+    fn gaps_in_runs_and_repeats_are_left_aligned() {
+        let cfg = PoaConfig {
+            homopolymer_min_run: 0,
+            homopolymer_gap: None,
+            ..PoaConfig::default()
+        };
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let flank_l = b"GATCGTACGTTAGCATGCTG";
+        let flank_r = b"TTGCAGTCAGGATCCATGCA";
+        for trial in 0..200 {
+            // a homopolymer or dinucleotide tract, then one indel inside it
+            let tract: Vec<u8> = if trial % 2 == 0 {
+                vec![b"ACGT"[rnd(4)]; 6 + rnd(10)]
+            } else {
+                b"CA".repeat(5 + rnd(10))
+            };
+            let mut seed = flank_l.to_vec();
+            seed.extend(&tract);
+            seed.extend(flank_r);
+            let unit = if trial % 2 == 0 { 1 } else { 2 };
+            let at = flank_l.len() + unit * rnd(tract.len() / unit - 1);
+            let mut read = seed.clone();
+            if rnd(2) == 0 {
+                read.drain(at..at + unit);
+            } else {
+                let ins = read[at..at + unit].to_vec();
+                read.splice(at..at, ins);
+            }
+            let g = Poa::new(&seed, cfg.clone());
+            let (topo, rank) = g.topo_order();
+            let ops = g.align(&read, &topo, &rank);
+            assert!(
+                left_aligned(&g, &read, &ops),
+                "trial {trial}: gap not left-aligned\nseed {}\nread {}\nops {ops:?}",
+                String::from_utf8_lossy(&seed),
+                String::from_utf8_lossy(&read)
+            );
+        }
     }
 }

@@ -7,6 +7,146 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.7.0] - 2026-10-21
+
+Accuracy on noisy repeat reads, per-base confidence, and speed. Homopolymer handling and
+tandem gap costs are new and on by default: on a run-length-noise benchmark of
+homopolymer-rich and A/T-rich repeats the default calls about twice as many alleles
+exactly as abPOA, the best external caller tested, and on bladerunner's hard ONT `(CA)n`
+cases it ties for best. Every consensus now carries a per-base support quality, so calls
+the reads cannot settle are marked. The alignment DP is 2.5-4x faster with byte-identical
+output. Known limits are collected in the new Limitations page of the book.
+`validate.py` 20/20, `compare_callers.py` 16/16 and `--comprehensive` are unchanged.
+
+### Breaking
+
+- **`PoaConfig` has three new public fields**, `homopolymer_min_run`, `homopolymer_gap`
+  and `tandem_gap` (see Added). Code that builds a `PoaConfig` with a struct literal must
+  add them, or use `..PoaConfig::default()`.
+- **Default single-allele output changes.** Homopolymer handling and tandem gap costs are
+  on, and the best-fit selector uses a new rule (see Fixed). Set `homopolymer_min_run: 0,
+  homopolymer_gap: None, tandem_gap: None` (CLI `--no-homopolymer --tandem-gap off`) for
+  the plain engine; the best-fit change cannot be switched off.
+- **`adaptive_band: false` now gives a fixed band** of half-width `band_width` (see
+  Fixed). Previously the length term still widened it on reads over ~4 kb, so calls with
+  the adaptive band off can change on long reads.
+- **`bubble_sites`, `GraphStats::bubble_count` / `max_bubble_depth` and the structural
+  competing-allele note can report fewer sites**: arms now need
+  `ceil(n_reads * min_allele_freq)` reads (see Fixed).
+
+- **Tandem gap costs are on by default** (`tandem_gap: Some((-2, -1))`). Single-allele
+  calls in tandem repeats can change where the reads support a different unit count than
+  the plain engine called. `tandem_gap: None` (CLI `--tandem-gap off`) restores the
+  previous behaviour.
+- **`Consensus` has a new public field, `support_quality: Vec<u8>`** (see Added). Code
+  that builds a `Consensus` with a struct literal must add it.
+- **Homopolymer handling is on by default** (`homopolymer_min_run: 2`,
+  `homopolymer_gap: Some((-2, -1))`). Single-allele `consensus` output (and
+  `consensus_flanked` / `bridged_consensus`, which call it) can change at homopolymer runs
+  where the reads support a different call. Set `homopolymer_min_run: 0,
+  homopolymer_gap: None` (CLI `--no-homopolymer`) for the plain engine. `consensus_multi`
+  is unaffected.
+
+### Added
+
+- **Tandem gap costs: `PoaConfig::tandem_gap`** (default `Some((-2, -1))`; CLI
+  `--tandem-gap OPEN,EXTEND|off`). Fixes an order-dependent heaviest-path error in tandem
+  repeats: a read whose extra length belongs elsewhere (e.g. a `CT` unit in a `(CT)n`
+  flank) aligned more cheaply by sliding across the repeat boundary with mismatches and
+  reusing an extra node another read inserted, so a wrong extra `CA` unit could win.
+  With this set, an indel that copies its neighbouring 2-6 base unit in a locally periodic
+  stretch of the read pays the tandem costs, so a read's own unit slip is the cheaper
+  alignment. No repeat tract or count is identified; the test only prices one gap. It
+  builds a guarded candidate (kept only if it fits the reads strictly better), and only
+  when the plain call has a base below support quality 10, so clean loci pay nothing.
+  On bladerunner's ONT `(CA)n` regression cases it fixes 2 of the 3 one-unit-long calls
+  (one of them in all 50 read orders) without moving a genuine length split; on the
+  run-length-noise benchmark exact calls rise 2086 -> 2094; on simulated GC-rich smeared
+  expansions it recovers 43 calls that previously lost a flank and loses none.
+  `validate.py` 20/20, `compare_callers.py` 16/16 and `--comprehensive` are unchanged.
+
+- **Per-base support quality: `Consensus::support_quality`** (CLI `--fastq`), and
+  `analysis::low_support_regions`. One Phred-scaled value per consensus base, capped at
+  60, saying how decisively the reads back that base over its strongest alternative.
+  Each read votes from its route through the graph; reads taking the same alternative
+  route (a substitution, a skip, an extra insertion) are pooled, and each base is scored
+  against its strongest alternative, so scattered sequencing errors do not add up but a
+  competing call does. With `a` reads for and `m` against, the value is
+  `-10 log10 P(Binomial(a + m + 1, 1/2) > a)`: Q33 for 10 agreeing reads, Q6 for a 6-4
+  split. On simulated ONT and HiFi GC-rich repeat ladders at 10 reads per haplotype, a
+  minimum below Q10 inside the repeat marked 98-99% of wrong repeat calls and 3-6% of
+  right ones, so Q10 is the suggested "not solid" cut. Computed from the reads' recorded
+  graph paths, so it adds no measurable CPU for heaviest-path calls; majority-frequency
+  calls and homopolymer splices are scored on a support graph seeded with the call.
+  Breaking for code that builds a `Consensus` with a struct literal: add the field.
+
+- **Homopolymer handling: `PoaConfig::homopolymer_min_run` and
+  `PoaConfig::homopolymer_gap`** (CLI `--homopolymer-min-run K`,
+  `--homopolymer-gap OPEN,EXTEND|off`, `--no-homopolymer`). They target a base between two
+  length-variable homopolymers (`A12 G A11`) and `(AAAAT)n`-type repeats. There the plain
+  engine's scoring prefers two mismatches over a deletion plus an insertion, splitting the
+  base across two MSA columns and sometimes miscounting repeat units.
+  `homopolymer_min_run` aligns runs of at least K identical bases as one symbol and
+  restores their lengths afterwards; `homopolymer_gap` makes indels inside a homopolymer
+  cheaper. Each candidate is spliced into the plain consensus only inside runs, and kept
+  only if it fits the reads strictly better. On a run-length-noise benchmark the default
+  gives 2089 exact calls against 982 for the plain engine. `validate.py` 20/20 and
+  `compare_callers.py` 16/16 still pass, HG002 ONT stays at 143/151 exact haplotypes, and
+  MUC1 calls are byte-identical. It costs about 2.4x the plain engine's CPU, which after
+  the DP speed-up below is still faster than v0.6.0's default. Single-allele only
+  (`consensus_multi` ignores both). Design and results: `design/homopolymer_compression.md`.
+
+### Fixed
+
+- **`BestFit` no longer picks a frame-broken majority consensus in dinucleotide repeats.**
+  On ONT `(CA)n` reads with real 19/20-unit length noise, the majority-frequency (MF)
+  candidate could split its column vote and emit `(CA)19` plus a stray base. The best-fit
+  selector scored candidates by indel *bases*, which a halfway length minimises, so it
+  chose that candidate over a correct heaviest path. The 1 bp change surfaced in
+  bladerunner as a spurious interruption. MF now replaces the heaviest path only when it
+  fits the reads strictly better on both measures: fewer indel bases AND a lower affine
+  indel penalty (a gap open per event plus a per-base extend). An affine score alone was
+  tried first and broke exact indel-base ties toward the shorter candidate (a read longer
+  than the candidate absorbs its differences into one insertion run), which turned
+  correct `(CA)n` calls one unit short and a homozygous 6-C HiFi DM1 call into 5 C.
+  Behaviour change: `consensus` output can differ wherever the two candidates disagreed.
+
+- **`adaptive_band: false` now gives a fixed band.** The half-width was
+  `max(band_width, adaptive_band_b + ceil(adaptive_band_f * L))` whether or not the adaptive
+  band was on, so `--no-adaptive-band` still widened the band on reads over ~4 kb. It is
+  now `band_width`, as documented. Default (adaptive) output is unchanged; on 10-20 kb
+  reads a fixed band of 50 is narrower than before, and less accurate than the default.
+- **Bubble sites and bubble statistics now use the allele-frequency floor as stated.**
+  An arm was reported at `floor(n_reads * min_allele_freq)` reads (e.g. 2 of 12 at 0.2,
+  below 20%); it is now `ceil(...)`, matching multi-allele bubble discovery. Consensus
+  sequences are unchanged; `bubble_sites`, `bubble_count`, `max_bubble_depth` and the
+  structural competing-allele note can report fewer sites (86 instead of 99 notes on 655
+  phased HG002 and simulated read sets, all of them single haplotypes).
+- **CLI: no spurious truncation warning with `--left-flank` / `--right-flank`.** The
+  output is sliced to the repeat, so it is naturally much shorter than the reads; the
+  length-ratio truncation check is now skipped in flank mode.
+- **The truncation warning's remedy now produces an unbanded run.** It said "retry with
+  band_width=0", but with the adaptive band on (the default) that stays banded. It now
+  says `band_width = 0` and `adaptive_band = false` (CLI `--band-width 0
+  --no-adaptive-band`).
+
+### Performance
+
+- **The alignment DP is 2.5-4x faster and uses up to 2.8x less peak memory, with
+  byte-identical output.** The fill now loops predecessor-outer / column-inner, taking a
+  running max over each predecessor's band slice instead of three bounds-checked lookups
+  per cell. Match/delete cells are computed in a branch-free pass, and only the insert
+  recurrence runs sequentially along the row. Backpointers are no longer stored: traceback
+  replays the fill's comparisons in the same order, so ties resolve exactly as before. That
+  cuts writes from 28 to 12 bytes per DP cell. The banded matrices are also reused across
+  reads instead of regrowing per read. Measured CPU per call (median, before -> after):
+  HG002 ONT 151 loci 11 -> 5 ms; simulated suites 58 -> 18 ms; MUC1 haplotypes
+  780 -> 226 ms. With homopolymer compression and gap costs on, the corresponding medians
+  are 28 -> 10, 176 -> 51 and 2025 -> 551 ms. Output was identical on all 251 HG002 /
+  simulated / MUC1 read sets and the 14 multi-kb long-tier sets, in both modes.
+
+---
+
 ## [0.6.0] - 2026-07-31
 
 Correctness, safety-default, API, and documentation pass following a full deep-dive

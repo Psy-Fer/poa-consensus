@@ -15,8 +15,12 @@ for (i, allele) in alleles.iter().enumerate() {
 }
 ```
 
-`consensus_multi` returns one `Consensus` per detected allele. If no heterozygous bubble
-is found the result is a single-element `Vec` equivalent to `consensus`.
+`consensus_multi` returns one `Consensus` per detected allele. If no second allele is
+found the result is a single-element `Vec`. This is close to, but not identical to,
+`consensus`: each multi-allele output (including the single-allele fallback) is the
+heaviest-path consensus of its read group, so `consensus_mode` (best-fit) and the
+homopolymer options do not apply, and `read_indices` is populated. Like `consensus`, the
+engine seeds on the median-length read; `seed_idx` is only bounds-checked.
 
 Phasing enforces the `min_allele_freq` frequency floor: an allele group whose read
 support falls below `min_allele_freq` of the locus is not called as a separate allele.
@@ -37,14 +41,20 @@ for (allele_id, allele) in alleles.iter().enumerate() {
 }
 ```
 
-For single-allele outputs (where `consensus_multi` found no bubble), `read_indices` is
-empty, meaning all reads contributed.
+`read_indices` is always populated by `consensus_multi`, including when it returns a
+single allele (then it lists every non-empty input read). It is empty only for outputs of
+`consensus()`, `consensus_flanked()` and `bridged_consensus()`. `consensus_multi_flanked`
+reports indices into the original `reads` slice even when it phases only the spanning
+subset.
 
 ## Depth requirements
 
-`min_reads` (default 3) is enforced **per allele**. If the minority allele has fewer than
-`min_reads` reads after phasing it is merged into the dominant group, producing a
-single-allele result. For reliable diploid calls, plan for at least 5-10 reads per allele.
+`min_reads` (default 3) applies twice. The whole input needs at least `min_reads` non-empty
+reads, or `consensus_multi` returns `Err(PoaError::InsufficientDepth)`. During phasing, a
+candidate group smaller than `min_reads` is normally rejected or merged into its
+neighbour, producing fewer alleles. If a confirmed group still ends up below `min_reads`,
+the call returns `Err(InsufficientDepth)` rather than a low-depth allele. For reliable
+diploid calls, plan for at least 5-10 reads per allele.
 
 ## Multi-allele with explicit config
 
@@ -77,7 +87,7 @@ for allele in &alleles {
 
 1. No bubble above `min_allele_freq` after building the graph (truly homozygous locus or
    insufficient depth to see the second allele).
-2. Only one phasing group has `>= min_reads` reads after partitioning.
-3. The graph is built with a narrow band that cannot represent a large Insert-arm bubble
-   for the allele-length difference. In this case `consensus_multi` automatically rebuilds
-   with unbanded alignment and tries again before falling back.
+2. Only one phasing group has `>= min_reads` reads after partitioning, or the confirmation
+   step finds that the groups do not yield genuinely different alleles (an over-split).
+3. No structural (length-changing) bubble appears on the banded graph. Before giving up on
+   a length split, `consensus_multi` rebuilds once fully unbanded and looks again.

@@ -58,6 +58,13 @@ struct Args {
     #[arg(short = 'q', long)]
     quiet: bool,
 
+    /// Write FASTQ instead of FASTA, with the per-base support quality as the
+    /// quality string: how decisively the reads back each base over its
+    /// strongest alternative (Phred, capped at 60). Below ~Q10 the reads
+    /// disagree there, e.g. on a repeat length.
+    #[arg(long)]
+    fastq: bool,
+
     // ── Band ──────────────────────────────────────────────────────────────────
     /// Fixed band width floor for banded DP (0 = unbanded).  Combined with
     /// adaptive band (default on), effective width is max(band_width, adaptive
@@ -133,6 +140,32 @@ struct Args {
     /// for cross-bubble phasing; below this uses single-bubble (SNP) partitioning.
     #[arg(long, default_value_t = 10, help_heading = "Multi-allele")]
     phasing_bubble_min_span: usize,
+
+    /// Homopolymer compression: align runs of >= N identical bases as one
+    /// symbol and re-estimate their lengths after consensus; the result is
+    /// spliced in only inside runs and kept only if it fits the reads better
+    /// (0 = off; 1 = pure HPC; 2 = A,C,G,T,polyA..polyT). Single-allele only.
+    #[arg(long, default_value_t = 2, help_heading = "Coverage / consensus")]
+    homopolymer_min_run: usize,
+
+    /// Homopolymer-aware gap costs, as OPEN,EXTEND, used instead of
+    /// --gap-open/--gap-extend for indels inside a homopolymer ("off" to
+    /// disable). Guarded like --homopolymer-min-run. Single-allele only.
+    #[arg(long, value_name = "OPEN,EXTEND", default_value = "-2,-1", value_parser = parse_hp_gap, allow_hyphen_values = true, help_heading = "Scoring")]
+    homopolymer_gap: HpGap,
+
+    /// Tandem-repeat gap costs, as OPEN,EXTEND ("off" to disable): an indel
+    /// that copies its neighbouring 2-6 base unit in a locally periodic part
+    /// of a read costs this instead of --gap-open/--gap-extend. Builds a
+    /// candidate only where the plain call is weakly supported, kept only if
+    /// it fits the reads better. Single-allele only.
+    #[arg(long, value_name = "OPEN,EXTEND", default_value = "-2,-1", value_parser = parse_hp_gap, allow_hyphen_values = true, help_heading = "Scoring")]
+    tandem_gap: HpGap,
+
+    /// Disable homopolymer handling entirely (same as --homopolymer-min-run 0
+    /// --homopolymer-gap off): the plain engine consensus only.
+    #[arg(long, help_heading = "Coverage / consensus")]
+    no_homopolymer: bool,
 
     // ── Flanking ────────────────────────────────────────────────────────────────
     /// Left flank sequence anchoring the repeat region (use with --right-flank).
@@ -217,9 +250,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if reads.len() == 1 && args.min_reads <= 1 {
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        writeln!(out, ">consensus reads=1 seed=0 band=unbanded")?;
-        out.write_all(&reads[0])?;
-        writeln!(out)?;
+        // A lone read has no consensus support: Q0 throughout.
+        let qual = vec![0u8; reads[0].len()];
+        write_record(
+            &mut out,
+            args.fastq,
+            "consensus reads=1 seed=0 band=unbanded",
+            &reads[0],
+            &qual,
+        )?;
         return Ok(());
     }
 
@@ -286,6 +325,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         consensus_mode: args.consensus_mode.into(),
         warn_on_long_unbanded: !args.no_long_unbanded_warning,
         phasing_bubble_min_span: args.phasing_bubble_min_span,
+        homopolymer_min_run: if args.no_homopolymer {
+            0
+        } else {
+            args.homopolymer_min_run
+        },
+        homopolymer_gap: if args.no_homopolymer {
+            None
+        } else {
+            args.homopolymer_gap.0
+        },
+        tandem_gap: args.tandem_gap.0,
     };
 
     // Diagnostic thresholds shared by both the single- and multi-allele paths.
@@ -296,7 +346,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         depth_allele_threshold: args.depth_allele_threshold,
         interior_support_threshold: args.interior_support_threshold,
         boundary_margin: args.boundary_margin,
-        truncation_ratio_threshold: args.truncation_ratio_threshold,
+        // With flanks the output is sliced to the repeat, so it is expected to
+        // be much shorter than the (flank-carrying) reads: the length-ratio
+        // truncation check would fire spuriously.
+        truncation_ratio_threshold: if args.left_flank.is_some() || args.right_flank.is_some() {
+            0.0
+        } else {
+            args.truncation_ratio_threshold
+        },
         is_allele_partition: false,
     };
 
@@ -341,16 +398,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             // allele.n_reads is the per-partition read count, not the total.
             // Callers use this to assess whether a minority allele has adequate depth.
-            writeln!(
-                out,
-                ">allele_{} reads={} total_reads={n} seed={seed_idx} band={band_desc} allele={}/{}",
+            let header = format!(
+                "allele_{} reads={} total_reads={n} seed={seed_idx} band={band_desc} allele={}/{}",
                 i + 1,
                 allele.n_reads,
                 i + 1,
                 total
+            );
+            write_record(
+                &mut out,
+                args.fastq,
+                &header,
+                &allele.sequence,
+                &allele.support_quality,
             )?;
-            out.write_all(&allele.sequence)?;
-            writeln!(out)?;
         }
     } else {
         // Single-allele: the clean poa2 engine (via `consensus()`). It seeds on
@@ -374,12 +435,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if !args.quiet {
             emit_warnings(&diagnose(&result, &diag_cfg), "consensus");
         }
-        writeln!(out, ">consensus reads={n} seed={med} band={band_desc}")?;
-        out.write_all(&result.sequence)?;
-        writeln!(out)?;
+        write_record(
+            &mut out,
+            args.fastq,
+            &format!("consensus reads={n} seed={med} band={band_desc}"),
+            &result.sequence,
+            &result.support_quality,
+        )?;
     }
 
     Ok(())
+}
+
+/// Write one output record: FASTA, or FASTQ with `qual` (Phred) as the
+/// quality string.
+fn write_record(
+    out: &mut impl Write,
+    fastq: bool,
+    header: &str,
+    seq: &[u8],
+    qual: &[u8],
+) -> io::Result<()> {
+    if !fastq {
+        writeln!(out, ">{header}")?;
+        out.write_all(seq)?;
+        return writeln!(out);
+    }
+    writeln!(out, "@{header}")?;
+    out.write_all(seq)?;
+    writeln!(out, "\n+")?;
+    // Every record should carry one quality per base; pad defensively with Q0.
+    let chars: Vec<u8> = (0..seq.len())
+        .map(|i| b'!' + qual.get(i).copied().unwrap_or(0).min(93))
+        .collect();
+    out.write_all(&chars)?;
+    writeln!(out)
 }
 
 // ── Diagnostic helpers ────────────────────────────────────────────────────────
@@ -488,4 +578,17 @@ fn first_byte<R: BufRead>(reader: &mut R) -> Result<Option<u8>, Box<dyn std::err
         }
         return Ok(Some(b));
     }
+}
+
+/// `--homopolymer-gap` / `--tandem-gap` value: `OPEN,EXTEND`, or `off`.
+#[derive(Clone, Copy, Debug)]
+struct HpGap(Option<(i32, i32)>);
+
+fn parse_hp_gap(s: &str) -> Result<HpGap, String> {
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(HpGap(None));
+    }
+    let (o, e) = s.split_once(',').ok_or("expected OPEN,EXTEND or off")?;
+    let p = |x: &str| x.trim().parse::<i32>().map_err(|e| e.to_string());
+    Ok(HpGap(Some((p(o)?, p(e)?))))
 }

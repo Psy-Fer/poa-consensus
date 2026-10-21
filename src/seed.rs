@@ -1,15 +1,20 @@
 use crate::error::PoaError;
 use std::collections::{HashMap, HashSet};
 
-/// Strategy for selecting the seed read used to initialise the POA graph.
+/// Strategy for [`select_seed`].
 ///
-/// The seed read is built into the graph as a linear chain of nodes.  All
-/// other reads are aligned into this backbone, so the choice affects bubble
-/// visibility: reads *longer* than the seed produce `Insert` operations
-/// (explicit bubble arms visible in `arm_sequences`), while reads *shorter*
-/// than the seed produce `Delete` operations (skip edges with empty
-/// `arm_sequences`).  Picking the shortest fully-spanning read as seed
-/// maximises `Insert`-type bubble coverage from all longer reads.
+/// Note: the consensus entry points ([`consensus`](crate::consensus),
+/// [`consensus_multi`](crate::consensus_multi) and the flanked variants)
+/// always seed the graph on the median-length read and treat `seed_idx` as a
+/// bounds-checked hint, so the index chosen here does not change their
+/// output.  `select_seed` remains useful as a spanning-read check: `Auto`
+/// detects read sets with no spanning read (see the table below) and as an
+/// orientation reference for [`auto_orient`](crate::auto_orient).
+///
+/// Background: a seed is built into a graph as a linear chain of nodes, and
+/// reads longer than it produce `Insert` arms (visible in `arm_sequences`)
+/// while shorter reads produce deletions (empty `arm_sequences`); `Auto` and
+/// `Shortest` pick a short seed for that reason.
 ///
 /// # Which strategy to use
 ///

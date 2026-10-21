@@ -1,6 +1,10 @@
+/// Orientation of a read relative to a reference read, as returned by
+/// [`orient_to_seed`](crate::orient_to_seed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strand {
+    /// Same strand as the reference (also returned when there is no k-mer evidence).
     Forward,
+    /// Opposite strand: reverse-complement the read before POA.
     Reverse,
 }
 
@@ -58,12 +62,15 @@ impl CoverageGap {
     }
 }
 
-/// One bubble site in the POA graph: a node on the consensus path that has two
-/// or more outgoing arms each supported by at least `min_allele_freq` of reads.
+/// One bubble site in the POA graph: a node on the heaviest path that has two
+/// or more outgoing arms each confirmed by at least
+/// `max(1, ceil(n_reads * min_allele_freq))` reads.
 ///
-/// The heaviest arm determines the consensus sequence.  Arms with fewer reads
-/// (but above the frequency threshold) are competing alleles or sequencing
-/// artefacts; callers use `arm_read_counts` and `arm_sequences` to decide which.
+/// Arms with fewer reads (but above the frequency threshold) are competing
+/// alleles or sequencing artefacts; callers use `arm_read_counts` and
+/// `arm_sequences` to decide which.  Sites are found on the heaviest path even
+/// when [`ConsensusMode`](crate::ConsensusMode) emits the majority-frequency
+/// sequence instead.
 ///
 /// `arm_sequences` is empty for arms longer than the internal cap (`ARM_SEQUENCE_CAP`
 /// = 256 bp); use `arm_read_counts` to assess support for large structural variants.
@@ -83,18 +90,16 @@ pub struct BubbleSite {
     /// Position in the consensus sequence (0-indexed) of the entry node just
     /// before the bubble branches.  Use this to locate the site in the output.
     pub consensus_pos: usize,
-    /// Number of reads that genuinely confirmed each arm (Match, or the
-    /// founding Insert that created it), in arm order.  The arm with the
-    /// highest count is the one chosen for the consensus sequence.
+    /// Number of reads that genuinely confirmed each arm (reached the arm's
+    /// first node directly from the branching node with no intervening
+    /// deletion), in arm order.
     ///
-    /// A read that merely *deleted through* an arm's starting node -- skipped
-    /// it without confirming any base there -- is **not** counted here, even
-    /// though it structurally traversed the same edge. Before this crate's
-    /// `EdgeWeight`/`edge_reads` Match/Delete split (see
-    /// `design/graph_data_model_rework.md`), this field conflated the two, so
-    /// a delete-heavy skip-through could inflate an arm's apparent support.
-    /// Counting only genuine confirmations is a behavior change from earlier
-    /// versions, even though the field's type is unchanged (`Vec<u32>`).
+    /// A read that merely *deleted through* the branch point (skipped nodes
+    /// without confirming any base there) is **not** counted here, so a
+    /// length variant's deletion bypass does not show up as a spurious arm.
+    /// Because the consensus path follows total edge weight (which does
+    /// include such reads), the highest-count arm is usually, but not always,
+    /// the one on the consensus.
     pub arm_read_counts: Vec<u32>,
     /// Sequence of each arm (from the first arm node up to but not including the
     /// exit/reconvergence node).  Empty `Vec` when the arm exceeds 256 bp or is
@@ -109,10 +114,16 @@ pub struct BubbleSite {
 /// Per-graph statistics computed in a single O(V+E) pass.
 #[derive(Debug, Clone, Default)]
 pub struct GraphStats {
+    /// Number of nodes in the graph.
     pub node_count: usize,
+    /// Number of edges in the graph.
     pub edge_count: usize,
-    /// Number of heterozygous nodes (nodes with 2+ successors each above min_allele_freq).
+    /// Number of fork nodes anywhere in the graph with 2+ outgoing arms each
+    /// confirmed by at least `max(1, ceil(n_reads * min_allele_freq))` reads.
     pub bubble_count: usize,
+    /// Largest minority-arm read count over those forks (the read count of the
+    /// second-best arm at the most balanced bubble), not a nesting depth.
+    /// 0 when there is no qualifying bubble.
     pub max_bubble_depth: usize,
     /// Mean coverage across all nodes.
     pub coverage_mean: f64,
@@ -138,15 +149,20 @@ pub struct GraphStats {
 /// Output of a consensus extraction pass.
 #[derive(Debug, Clone)]
 pub struct Consensus {
+    /// The consensus sequence.
     pub sequence: Vec<u8>,
-    /// Per-base match-read count along the consensus path.
+    /// Per-base count of reads occupying that position (node coverage on the
+    /// heaviest path, or column occupancy for a majority-frequency sequence).
     pub coverage: Vec<u32>,
-    /// Incoming edge weight on the heaviest path for each base.
-    /// For the first base (no incoming path edge) the node's coverage is used.
-    /// For `ConsensusMode::MajorityFrequency` every position uses node coverage.
+    /// Per-base support for the step into each base.  On the heaviest path:
+    /// the incoming edge weight (the first base uses its node coverage).  When
+    /// the majority-frequency sequence is emitted (forced, or chosen by
+    /// best-fit): `min(coverage[i-1], coverage[i])`, with `coverage[0]` for
+    /// the first base.
     pub path_weights: Vec<i32>,
-    /// Total reads used to build this consensus (seed + all `add_read` calls).
+    /// Total reads used to build this consensus (including the seed).
     pub n_reads: usize,
+    /// Statistics of the graph this consensus was extracted from.
     pub graph_stats: GraphStats,
     /// Coverage gaps detected in this consensus.  Empty when reads overlap
     /// throughout.  Each gap is either `Spanning` (seed-only bases, minimum
@@ -157,8 +173,7 @@ pub struct Consensus {
     /// read support above `min_allele_freq`.  Empty when all forks are
     /// single-arm (no competing allele above threshold).
     ///
-    /// Each site corresponds to one branching node on the heaviest-path
-    /// consensus.  Inspect `arm_read_counts` and `arm_sequences` to decide
+    /// Each site corresponds to one branching node on the heaviest path.  Inspect `arm_read_counts` and `arm_sequences` to decide
     /// whether to re-run with [`consensus_multi`](crate::consensus_multi).
     pub bubble_sites: Vec<BubbleSite>,
     /// Indices of the reads that contributed to this consensus, as indices into
@@ -171,6 +186,26 @@ pub struct Consensus {
     /// enabling the caller to assign per-read rows, pull reads for visualisation,
     /// or compute per-allele statistics without re-running alignment.
     pub read_indices: Vec<usize>,
+    /// Per-base support quality, Phred-scaled and capped at 60: how decisively
+    /// the reads back each consensus base over its strongest alternative.
+    ///
+    /// Each read votes from its route through the graph: following the
+    /// consensus into a base agrees with it; any other route (a substitution,
+    /// a skip, an extra insertion) counts against the bases it bypasses. Reads
+    /// taking the same alternative route are pooled, and each base is scored
+    /// only against its strongest alternative, so scattered sequencing errors
+    /// do not add up but a competing call does. With `a` reads for the base and
+    /// `m` for its strongest alternative, the value is
+    /// `-10 log10 P(Binomial(a + m + 1, 1/2) > a)`: about Q33 for 10 agreeing
+    /// reads with no alternative, Q60 (the cap) from about 20, Q6 for a 6-4
+    /// split and Q3 for a tie or no spanning reads.
+    ///
+    /// It measures agreement, not truth: an error every read shares (such as
+    /// a systematic homopolymer undercall) still scores high. Use it to mark
+    /// solid and weak stretches of a call, e.g. with
+    /// [`low_support_regions`](crate::analysis::low_support_regions) (Q10 is
+    /// a good cut).
+    pub support_quality: Vec<u8>,
 }
 
 impl Consensus {

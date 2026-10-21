@@ -1,0 +1,715 @@
+//! Homopolymer-compressed (HPC) consensus.
+//!
+//! Each read is rewritten in an extended alphabet before POA: a run of the
+//! same base of length `>= min_run` becomes a single "poly" symbol (e.g.
+//! `polyA`), shorter runs stay as plain bases. With `min_run = 1` this is pure
+//! homopolymer compression (every run is one symbol); with `min_run = 2` it is
+//! the 8-letter `A,C,G,T,polyA,polyC,polyG,polyT` vocabulary.
+//!
+//! The point: in raw space, a single base between two long, length-variable
+//! runs (`A{12}GA{11}` with reads carrying `A{11}GA{12}`, ...) has no fixed
+//! position, and with harsh affine gaps the DP prefers two G/A mismatches over
+//! a deletion + insertion, so node fusion splits the one biological base across
+//! two MSA columns. In compressed space every such read reads `polyA G polyA`,
+//! so the base has exactly one place to go.
+//!
+//! Run lengths are recovered after consensus: each consensus poly symbol takes
+//! the (lower) median run length of the reads carrying the same symbol in its
+//! graph column (`run_lengths_from_graph`). When that vote is weak, the whole
+//! call falls back to realigning every read to the compressed consensus
+//! (`estimate_run_lengths`).
+//!
+//! The compressed consensus (and the homopolymer-gap-cost consensus) is only a
+//! candidate: `consensus_homopolymer` splices it into the plain engine call
+//! only inside homopolymer runs (`splice`) and keeps the result only if it fits
+//! the reads strictly better (`raw_misfit`).
+
+use crate::config::{ConsensusMode, PoaConfig};
+use crate::poa2::{Op, Poa};
+use crate::types::Consensus;
+
+/// High bit marks a poly symbol; the low bits keep the base.
+const POLY: u8 = 0x80;
+
+fn is_poly(s: u8) -> bool {
+    s & POLY != 0
+}
+
+fn base_of(s: u8) -> u8 {
+    s & !POLY
+}
+
+/// Compress `read`: returns the symbol string and, per symbol, the raw run
+/// length it stands for (1 for plain bases).
+pub(crate) fn encode(read: &[u8], min_run: usize) -> (Vec<u8>, Vec<u32>) {
+    let min_run = min_run.max(1);
+    let mut syms = Vec::with_capacity(read.len());
+    let mut lens = Vec::with_capacity(read.len());
+    let mut i = 0;
+    while i < read.len() {
+        let b = read[i];
+        let mut j = i + 1;
+        while j < read.len() && read[j] == b {
+            j += 1;
+        }
+        let run = j - i;
+        if run >= min_run {
+            syms.push(b | POLY);
+            lens.push(run as u32);
+        } else {
+            for _ in 0..run {
+                syms.push(b);
+                lens.push(1);
+            }
+        }
+        i = j;
+    }
+    (syms, lens)
+}
+
+/// Median of a non-empty slice (lower median for even counts, so a 50/50 tie
+/// between n and n+1 calls the shorter run).
+fn median(v: &mut [u32]) -> u32 {
+    v.sort_unstable();
+    v[(v.len() - 1) / 2]
+}
+
+/// Per consensus symbol, the raw run length to expand it to. Plain symbols are
+/// always 1; a poly symbol takes the median run length over reads whose own
+/// symbol at that position is the same poly symbol.
+///
+/// Observations are "clean" when the read's neighbouring symbols also match the
+/// consensus neighbours. A substitution inside a run splits it (`A5 C A6`), and
+/// either fragment would otherwise vote a too-short length, so clean
+/// observations are preferred; all matching observations are the fallback.
+fn estimate_run_lengths(
+    cons: &[u8],
+    enc_reads: &[(Vec<u8>, Vec<u32>)],
+    cfg: &PoaConfig,
+) -> Vec<u32> {
+    let g = Poa::new(cons, cfg.clone());
+    let (topo, rank) = g.topo_order();
+    let n = cons.len();
+    let mut clean: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut all: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (syms, lens) in enc_reads {
+        // matched[rpos] = consensus position the read symbol matched exactly.
+        let mut matched: Vec<Option<usize>> = vec![None; syms.len()];
+        let mut rpos = 0usize;
+        for op in g.align(syms, &topo, &rank) {
+            match op {
+                Op::Match(node) => {
+                    // The seed chain's nodes are 0..cons.len(), one per symbol.
+                    if node < n && syms[rpos] == cons[node] {
+                        matched[rpos] = Some(node);
+                    }
+                    rpos += 1;
+                }
+                Op::Ins(_) => rpos += 1,
+                Op::Del(_) => {}
+            }
+        }
+        for (r, m) in matched.iter().enumerate() {
+            let Some(node) = *m else { continue };
+            if !is_poly(cons[node]) {
+                continue;
+            }
+            all[node].push(lens[r]);
+            // A neighbour that doesn't exist on either side (read or consensus
+            // end) can't disagree.
+            let left_ok = node == 0 || r == 0 || matched[r - 1] == Some(node - 1);
+            let right_ok = node + 1 == n || r + 1 == syms.len() || matched[r + 1] == Some(node + 1);
+            if left_ok && right_ok {
+                clean[node].push(lens[r]);
+            }
+        }
+    }
+    (0..n)
+        .map(|i| {
+            if !is_poly(cons[i]) {
+                1
+            } else if !clean[i].is_empty() {
+                median(&mut clean[i])
+            } else if !all[i].is_empty() {
+                median(&mut all[i])
+            } else {
+                // No read matched it exactly (should not happen for a consensus
+                // symbol); fall back to the poly floor.
+                1
+            }
+        })
+        .collect()
+}
+
+/// `estimate_run_lengths` without realigning: a read's symbol counts toward
+/// the consensus symbol in the same MSA column (same symbol), and is clean when
+/// its neighbours sit in the consensus neighbours' columns. `None` when the
+/// consensus can't be mapped to columns.
+fn run_lengths_from_graph(
+    g: &Poa,
+    cons: &[u8],
+    enc_reads: &[(Vec<u8>, Vec<u32>)],
+    path_reads: &[usize],
+) -> Option<Vec<u32>> {
+    let (node_col, pos_col) = g.consensus_columns(cons)?;
+    let n = cons.len();
+    let ncol = node_col.iter().max().map_or(0, |&c| c + 1);
+    let mut col_pos = vec![usize::MAX; ncol];
+    for (p, &c) in pos_col.iter().enumerate() {
+        col_pos[c] = p;
+    }
+    let mut clean: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut all: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (path, &ri) in g.read_paths().iter().zip(path_reads) {
+        let lens = &enc_reads[ri].1;
+        if path.len() != lens.len() {
+            return None;
+        }
+        // matched[r] = consensus position read symbol r sits on with the same symbol.
+        let matched: Vec<Option<usize>> = path
+            .iter()
+            .map(|&nd| {
+                let p = col_pos[node_col[nd]];
+                (p != usize::MAX && g.node_base(nd) == cons[p]).then_some(p)
+            })
+            .collect();
+        for (r, m) in matched.iter().enumerate() {
+            let Some(node) = *m else { continue };
+            if !is_poly(cons[node]) {
+                continue;
+            }
+            all[node].push(lens[r]);
+            let left_ok = node == 0 || r == 0 || matched[r - 1] == Some(node - 1);
+            let right_ok = node + 1 == n || r + 1 == path.len() || matched[r + 1] == Some(node + 1);
+            if left_ok && right_ok {
+                clean[node].push(lens[r]);
+            }
+        }
+    }
+    // The incremental graph alignment is a little noisier than realigning to
+    // the finished consensus: it flips close votes, and in a periodic repeat a
+    // read's run can sit a unit away from the consensus column. Give a close
+    // vote, or a run most reads don't vote on, back to the realignment (whole
+    // call: it is per read, not per position).
+    let n_reads = path_reads.len();
+    let decided = |v: &mut [u32]| {
+        if v.len() * 2 < n_reads {
+            return None;
+        }
+        v.sort_unstable();
+        let q = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize];
+        (q(0.4) == q(0.6)).then(|| median(v))
+    };
+    (0..n)
+        .map(|i| {
+            if !is_poly(cons[i]) {
+                Some(1)
+            } else if !clean[i].is_empty() {
+                decided(&mut clean[i])
+            } else if !all[i].is_empty() {
+                decided(&mut all[i])
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Repeat each per-position value across its run.
+fn repeat_runs<T: Copy>(v: &[T], runs: &[u32]) -> Vec<T> {
+    v.iter()
+        .zip(runs)
+        .flat_map(|(&x, &r)| std::iter::repeat_n(x, r as usize))
+        .collect()
+}
+
+/// Expand a compressed `Consensus` back to raw bases using per-symbol run
+/// lengths. Per-position fields are repeated across each run; positions in
+/// gaps and bubble sites are remapped. Bubble arm sequences are decoded with a
+/// run length of 1 per poly symbol (their own run lengths are not estimated).
+fn expand(mut c: Consensus, runs: &[u32], raw_reads: &[&[u8]]) -> Consensus {
+    let n = c.sequence.len();
+    debug_assert_eq!(runs.len(), n);
+    // starts[i] = raw position of compressed position i; starts[n] = raw length.
+    let mut starts = Vec::with_capacity(n + 1);
+    let mut acc = 0usize;
+    for &r in runs {
+        starts.push(acc);
+        acc += r as usize;
+    }
+    starts.push(acc);
+    let seq: Vec<u8> = c
+        .sequence
+        .iter()
+        .zip(runs)
+        .flat_map(|(&s, &r)| std::iter::repeat_n(base_of(s), r as usize))
+        .collect();
+    c.coverage = repeat_runs(&c.coverage, runs);
+    c.path_weights = repeat_runs(&c.path_weights, runs);
+    // Compressed-space support does not carry over to raw bases; a chosen
+    // splice is rescored on the raw reads (`consensus_homopolymer`).
+    c.support_quality = Vec::new();
+    c.sequence = seq;
+    let map = |p: usize| starts[p.min(n)];
+    for gap in &mut c.gaps {
+        gap.start = map(gap.start);
+        gap.end = map(gap.end);
+    }
+    for site in &mut c.bubble_sites {
+        site.consensus_pos = map(site.consensus_pos);
+        for arm in &mut site.arm_sequences {
+            for s in arm.iter_mut() {
+                *s = base_of(*s);
+            }
+        }
+    }
+    let mut lens: Vec<usize> = raw_reads.iter().map(|r| r.len()).collect();
+    lens.sort_unstable();
+    c.graph_stats.median_input_read_len = lens[lens.len() / 2];
+    c
+}
+
+/// Single-allele consensus in compressed space, expanded back to raw bases.
+/// Mirrors `crate::consensus`'s engine path (median-length backbone, then
+/// `consensus_mode`), with the compression applied around it.
+pub(crate) fn consensus_compressed(reads: &[&[u8]], config: &PoaConfig) -> Consensus {
+    let min_run = config.homopolymer_min_run;
+    let enc: Vec<(Vec<u8>, Vec<u32>)> = reads.iter().map(|r| encode(r, min_run)).collect();
+    let syms: Vec<&[u8]> = enc.iter().map(|(s, _)| s.as_slice()).collect();
+    let mut order: Vec<usize> = (0..syms.len()).collect();
+    order.sort_by_key(|&i| syms[i].len());
+    let med = order[order.len() / 2];
+    let mut g = Poa::new(syms[med], config.clone());
+    for (i, s) in syms.iter().enumerate() {
+        if i != med {
+            g.add_read(s);
+        }
+    }
+    let c = match config.consensus_mode {
+        ConsensusMode::MajorityFrequency => g.consensus_full_majority(),
+        ConsensusMode::BestFit => g.consensus_full_best_fit(&syms),
+    };
+    // read_paths order: the seed, then every other read in input order.
+    let path_reads: Vec<usize> = std::iter::once(med)
+        .chain((0..syms.len()).filter(|&i| i != med))
+        .collect();
+    let runs = run_lengths_from_graph(&g, &c.sequence, &enc, &path_reads)
+        .unwrap_or_else(|| estimate_run_lengths(&c.sequence, &enc, config));
+    expand(c, &runs, reads)
+}
+
+/// Raw-space misfit of `candidate` to `reads`: mismatches + inserted +
+/// deleted bases per read base (lower is better). Unlike the engine's
+/// indel-only `Poa::fit`, mismatches count: a G shifted within a homopolymer
+/// aligns as two G/A mismatches under harsh affine gaps, not as indels.
+fn raw_misfit(candidate: &[u8], reads: &[&[u8]], cfg: &PoaConfig) -> f64 {
+    if candidate.is_empty() {
+        return f64::MAX;
+    }
+    let g = Poa::new(candidate, cfg.clone());
+    let (topo, rank) = g.topo_order();
+    let (mut cost, mut bases) = (0usize, 0usize);
+    for r in reads {
+        let mut rpos = 0usize;
+        for op in g.align(r, &topo, &rank) {
+            match op {
+                Op::Match(node) => {
+                    if node < candidate.len() && candidate[node] != r[rpos] {
+                        cost += 1;
+                    }
+                    rpos += 1;
+                }
+                Op::Ins(_) => {
+                    cost += 1;
+                    rpos += 1;
+                }
+                Op::Del(_) => cost += 1,
+            }
+        }
+        bases += r.len();
+    }
+    cost as f64 / bases.max(1) as f64
+}
+
+/// Length of the identical-base run each position belongs to.
+fn run_len_at(seq: &[u8]) -> Vec<usize> {
+    let mut out = vec![0; seq.len()];
+    let mut i = 0;
+    while i < seq.len() {
+        let mut j = i + 1;
+        while j < seq.len() && seq[j] == seq[i] {
+            j += 1;
+        }
+        out[i..j].fill(j - i);
+        i = j;
+    }
+    out
+}
+
+/// Splice the two consensuses: align `hpc` to `raw`, and for each block where
+/// they differ take the compressed call only if the block touches a run of
+/// `>= min_run` bases and, on both sides, consists only of run bases and
+/// single interrupts between runs; elsewhere keep the raw call.
+/// Compression only claims to help inside homopolymers, and outside them the
+/// raw engine is the better-tested answer (e.g. a periodic repeat's unit
+/// count). Per-position fields come from whichever side each base came from;
+/// gaps and bubble sites are the raw call's, remapped.
+fn splice(raw: &Consensus, hpc: &Consensus, min_run: usize, config: &PoaConfig) -> Consensus {
+    let (r, h) = (&raw.sequence, &hpc.sequence);
+    let min_run = min_run.max(1);
+    let (rr, hr) = (run_len_at(r), run_len_at(h));
+    let touches = |runs: &[usize], a: usize, b: usize| {
+        let lo = a.saturating_sub(1);
+        let hi = (b + 1).min(runs.len());
+        runs[lo..hi.max(lo)].iter().any(|&x| x >= min_run)
+    };
+    // Every base of the block is in a run, or is a single base between two runs
+    // (the interrupt). Without this a GC-rich VNTR, where almost everything
+    // touches a GG/CC, could take a whole extra repeat unit from the candidate.
+    let local = |runs: &[usize], a: usize, b: usize| {
+        (a..b).all(|x| {
+            runs[x] >= min_run
+                || (x > 0 && x + 1 < runs.len() && runs[x - 1] >= min_run && runs[x + 1] >= min_run)
+        })
+    };
+    let cfg = PoaConfig {
+        alignment_mode: crate::config::AlignmentMode::Global,
+        ..config.clone()
+    };
+    let g = Poa::new(r, cfg);
+    let (topo, rank) = g.topo_order();
+    let ops = g.align(h, &topo, &rank);
+
+    // (from_hpc, index) per emitted base.
+    let mut src: Vec<(bool, usize)> = Vec::with_capacity(r.len().max(h.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut block: Option<(usize, usize)> = None; // (i1, j1) of an open diff block
+    let flush =
+        |block: &mut Option<(usize, usize)>, i2: usize, j2: usize, src: &mut Vec<(bool, usize)>| {
+            if let Some((i1, j1)) = block.take() {
+                if (touches(&rr, i1, i2) || touches(&hr, j1, j2))
+                    && local(&rr, i1, i2)
+                    && local(&hr, j1, j2)
+                {
+                    src.extend((j1..j2).map(|x| (true, x)));
+                } else {
+                    src.extend((i1..i2).map(|x| (false, x)));
+                }
+            }
+        };
+    for op in ops {
+        match op {
+            Op::Match(node) if node == i && h[j] == r[i] => {
+                flush(&mut block, i, j, &mut src);
+                src.push((false, i));
+                i += 1;
+                j += 1;
+            }
+            Op::Match(_) => {
+                block.get_or_insert((i, j));
+                i += 1;
+                j += 1;
+            }
+            Op::Ins(_) => {
+                block.get_or_insert((i, j));
+                j += 1;
+            }
+            Op::Del(_) => {
+                block.get_or_insert((i, j));
+                i += 1;
+            }
+        }
+    }
+    flush(&mut block, i, j, &mut src);
+
+    let mut out = raw.clone();
+    out.support_quality = Vec::new(); // rescored by the caller if chosen
+    out.sequence = src
+        .iter()
+        .map(|&(fh, x)| if fh { h[x] } else { r[x] })
+        .collect();
+    out.coverage = src
+        .iter()
+        .map(|&(fh, x)| if fh { hpc.coverage[x] } else { raw.coverage[x] })
+        .collect();
+    out.path_weights = src
+        .iter()
+        .map(|&(fh, x)| {
+            if fh {
+                hpc.path_weights[x]
+            } else {
+                raw.path_weights[x]
+            }
+        })
+        .collect();
+    // raw index -> first merged index at or after it.
+    let mut map = vec![out.sequence.len(); r.len() + 1];
+    for (k, &(fh, x)) in src.iter().enumerate().rev() {
+        if !fh {
+            map[x] = k;
+        }
+    }
+    for x in (0..r.len()).rev() {
+        map[x] = map[x].min(map[x + 1]);
+    }
+    for gap in &mut out.gaps {
+        gap.start = map[gap.start.min(r.len())];
+        gap.end = map[gap.end.min(r.len())];
+    }
+    for site in &mut out.bubble_sites {
+        site.consensus_pos = map[site.consensus_pos.min(r.len())];
+    }
+    out
+}
+
+/// Support quality below which the plain call counts as contested, so the
+/// tandem-gap candidate is worth building.
+const TANDEM_GATE_QUALITY: u8 = 10;
+
+/// The candidates, each with the run length its splice uses: the compressed
+/// consensus when `homopolymer_min_run > 0`, the engine run with homopolymer
+/// gap costs when `homopolymer_gap` is set (gap costs are not applied inside
+/// the compressed build: compressed reads have no runs), and, when
+/// `tandem_gap` is set and `raw` has a weakly supported base, the engine run
+/// with tandem gap costs (run length 0: competes unspliced).
+fn candidates(reads: &[&[u8]], config: &PoaConfig, raw: &Consensus) -> Vec<(Consensus, usize)> {
+    let k = config.homopolymer_min_run;
+    let mut cands = Vec::new();
+    if k > 0 {
+        let cfg = PoaConfig {
+            homopolymer_gap: None,
+            ..config.clone()
+        };
+        cands.push((consensus_compressed(reads, &cfg), k));
+    }
+    if config.homopolymer_gap.is_some() {
+        let cfg = PoaConfig {
+            homopolymer_min_run: 0,
+            ..config.clone()
+        };
+        cands.push((
+            crate::engine_consensus(reads, &cfg),
+            if k > 0 { k } else { 2 },
+        ));
+    }
+    // Tandem gap costs: built only where the plain call has weak support
+    // (somewhere the reads disagree), so clean loci pay nothing. It competes
+    // as a whole call (`min_run` 0: no homopolymer splice); the fit guard in
+    // `consensus_homopolymer` decides.
+    if let Some(tg) = config.tandem_gap {
+        if raw.support_quality.iter().any(|&q| q < TANDEM_GATE_QUALITY) {
+            let cfg = PoaConfig {
+                homopolymer_min_run: 0,
+                homopolymer_gap: None,
+                tandem_gap: None,
+                ..config.clone()
+            };
+            cands.push((crate::engine_consensus_with(reads, &cfg, Some(tg)), 0));
+        }
+    }
+    cands
+}
+
+/// Homopolymer-aware and tandem-gap candidates combined with the plain engine call `raw`
+/// (built with `base`: both homopolymer options off). Each candidate is
+/// spliced into `raw` only within homopolymer runs (`splice`), and the
+/// best-fitting splice is kept only if it fits the raw reads strictly better
+/// than `raw` (judged under `base` scoring).
+///
+/// Compression wins where run-length noise scatters an interrupting base; the
+/// fit check rejects it where substitutions inside runs pile up into fabricated
+/// compressed structure, and the splice keeps both options from changing calls
+/// outside homopolymers (e.g. a CAG repeat's unit count).
+pub(crate) fn consensus_homopolymer(
+    reads: &[&[u8]],
+    config: &PoaConfig,
+    base: &PoaConfig,
+    raw: Consensus,
+) -> Consensus {
+    // Scored lazily: most candidates splice back to `raw` unchanged, and this
+    // full realignment pass costs about as much as a candidate build.
+    let mut fr: Option<f64> = None;
+    let mut best: Option<(f64, Consensus)> = None;
+    for (cand, min_run) in candidates(reads, config, &raw) {
+        if cand.sequence == raw.sequence {
+            continue;
+        }
+        let merged = if min_run == 0 {
+            let mut c = cand;
+            c.support_quality = Vec::new(); // rescored if chosen
+            c
+        } else {
+            splice(&raw, &cand, min_run, base)
+        };
+        if merged.sequence == raw.sequence {
+            continue;
+        }
+        let fr = *fr.get_or_insert_with(|| raw_misfit(&raw.sequence, reads, base));
+        let fm = raw_misfit(&merged.sequence, reads, base);
+        if fm >= fr || best.as_ref().is_some_and(|(b, _)| fm >= *b) {
+            continue;
+        }
+        // A whole-call candidate may differ in length over the entire read, and
+        // a semi-global fit (free end gaps) lets a short read sit inside a long
+        // candidate for free while a long read pays for insertions against a
+        // short one: in a flankless repeat that alone favours the longer call.
+        // It must also fit better when every read accounts for both ends.
+        if min_run == 0 {
+            let global = PoaConfig {
+                alignment_mode: crate::config::AlignmentMode::Global,
+                ..base.clone()
+            };
+            if raw_misfit(&merged.sequence, reads, &global)
+                >= raw_misfit(&raw.sequence, reads, &global)
+            {
+                continue;
+            }
+        }
+        best = Some((fm, merged));
+    }
+    best.map_or(raw, |(_, mut c)| {
+        c.support_quality = crate::poa2::support_quality_by_realignment(&c.sequence, reads, base);
+        c
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_min_run_1_compresses_every_run() {
+        let (s, l) = encode(b"AAAGCCT", 1);
+        assert_eq!(s, vec![b'A' | POLY, b'G' | POLY, b'C' | POLY, b'T' | POLY]);
+        assert_eq!(l, vec![3, 1, 2, 1]);
+    }
+
+    #[test]
+    fn encode_min_run_3_keeps_short_runs_raw() {
+        let (s, l) = encode(b"AAAGCCT", 3);
+        assert_eq!(s, vec![b'A' | POLY, b'G', b'C', b'C', b'T']);
+        assert_eq!(l, vec![3, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn interrupt_between_variable_runs_lands_once() {
+        // Same compressed string for every read regardless of run lengths.
+        let a = encode(b"CTCAAAAAAAAAAAAGAAAAAAAAAAAGTT", 2).0;
+        let b = encode(b"CTCAAAAAAAAAAAGAAAAAAAAAAAAGTT", 2).0;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn roundtrip_recovers_median_run_lengths() {
+        let mk = |x: usize, y: usize| {
+            let mut r = b"TTCGCATGCC".to_vec();
+            r.extend(std::iter::repeat_n(b'A', x));
+            r.push(b'G');
+            r.extend(std::iter::repeat_n(b'A', y));
+            r.extend_from_slice(b"CGTCCATGCT");
+            r
+        };
+        let reads = [
+            mk(12, 11),
+            mk(11, 12),
+            mk(12, 11),
+            mk(13, 11),
+            mk(12, 10),
+            mk(12, 11),
+        ];
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        for min_run in [1, 2, 4] {
+            let cfg = PoaConfig {
+                homopolymer_min_run: min_run,
+                ..PoaConfig::default()
+            };
+            let c = consensus_compressed(&refs, &cfg);
+            assert_eq!(c.sequence, mk(12, 11), "min_run={min_run}");
+            assert_eq!(c.coverage.len(), c.sequence.len());
+        }
+    }
+
+    /// Graph-derived run lengths (`run_lengths_from_graph`) on `reads`, built
+    /// as `consensus_compressed` does, next to the realignment estimate.
+    fn graph_vs_align(reads: &[Vec<u8>]) -> (Option<Vec<u32>>, Vec<u32>) {
+        let cfg = PoaConfig {
+            homopolymer_min_run: 2,
+            ..PoaConfig::default()
+        };
+        let enc: Vec<(Vec<u8>, Vec<u32>)> = reads.iter().map(|r| encode(r, 2)).collect();
+        let syms: Vec<&[u8]> = enc.iter().map(|(s, _)| s.as_slice()).collect();
+        let mut g = Poa::new(syms[0], cfg.clone());
+        for s in &syms[1..] {
+            g.add_read(s);
+        }
+        let c = g.consensus_full_best_fit(&syms);
+        let order: Vec<usize> = (0..syms.len()).collect();
+        (
+            run_lengths_from_graph(&g, &c.sequence, &enc, &order),
+            estimate_run_lengths(&c.sequence, &enc, &cfg),
+        )
+    }
+
+    fn a_g_a(x: usize, y: usize) -> Vec<u8> {
+        let mut r = b"TTCGCATGCC".to_vec();
+        r.extend(std::iter::repeat_n(b'A', x));
+        r.push(b'G');
+        r.extend(std::iter::repeat_n(b'A', y));
+        r.extend_from_slice(b"CGTCCATGCT");
+        r
+    }
+
+    #[test]
+    fn graph_run_lengths_match_realignment() {
+        let reads: Vec<Vec<u8>> = [(12, 11), (11, 12), (12, 11), (12, 11), (13, 11), (12, 11)]
+            .iter()
+            .map(|&(x, y)| a_g_a(x, y))
+            .collect();
+        let (graph, align) = graph_vs_align(&reads);
+        assert_eq!(graph, Some(align));
+    }
+
+    #[test]
+    fn graph_run_lengths_defer_close_votes() {
+        // 12 vs 13 split 3/3 in the first run: too close to trust the graph.
+        let reads: Vec<Vec<u8>> = [(12, 11), (13, 11), (12, 11), (13, 11), (12, 11), (13, 11)]
+            .iter()
+            .map(|&(x, y)| a_g_a(x, y))
+            .collect();
+        assert_eq!(graph_vs_align(&reads).0, None);
+    }
+
+    fn splice_case(raw_seq: &[u8], hpc_seq: &[u8]) -> Vec<u8> {
+        let cfg = PoaConfig::default();
+        let raw = crate::engine_consensus(&[raw_seq, raw_seq, raw_seq], &cfg);
+        assert_eq!(raw.sequence, raw_seq);
+        let mut hpc = raw.clone();
+        hpc.sequence = hpc_seq.to_vec();
+        hpc.coverage = vec![3; hpc_seq.len()];
+        hpc.path_weights = vec![3; hpc_seq.len()];
+        splice(&raw, &hpc, 2, &cfg).sequence
+    }
+
+    #[test]
+    fn splice_takes_shifted_interrupt() {
+        let raw = b"TGCATGCCAAAAGAAAAAAACGTCCATGCT";
+        let hpc = b"TGCATGCCAAAAAAGAAAAACGTCCATGCT";
+        assert_eq!(splice_case(raw, hpc), hpc);
+    }
+
+    #[test]
+    fn splice_rejects_extra_unit_that_only_touches_runs() {
+        // GC-rich unit with GG/CC runs: an extra copy touches runs but is not a
+        // homopolymer edit, so the raw call must stand.
+        let unit = b"GGCTCAGGTGGCAGCG";
+        let mk = |n: usize| {
+            let mut v = b"ATGACTAGTATCAGAT".to_vec();
+            for _ in 0..n {
+                v.extend_from_slice(unit);
+            }
+            v.extend_from_slice(b"ATCTGATACTAGTCAT");
+            v
+        };
+        assert_eq!(splice_case(&mk(3), &mk(4)), mk(3));
+    }
+}

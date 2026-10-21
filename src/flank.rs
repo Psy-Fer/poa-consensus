@@ -4,7 +4,9 @@
 /// Returns a slice of `read` that begins immediately after the best-scoring position of
 /// `left_flank` and ends immediately before the best-scoring position of `right_flank`.
 /// Returns `None` if either flank cannot be located with sufficient confidence, or if the
-/// located positions are inconsistent (right starts before left ends).
+/// located positions are inconsistent (the right flank does not start strictly after the
+/// left flank ends, so an empty repeat segment also returns `None`). Matching is
+/// case-sensitive.
 ///
 /// The alignment is semi-global: the flank must be fully consumed (no free end gaps on
 /// the flank side), but the read may have unaligned prefix and suffix (free end gaps on

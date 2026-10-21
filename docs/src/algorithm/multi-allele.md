@@ -2,89 +2,124 @@
 
 A single graph built from reads covering two haplotypes contains both alleles
 simultaneously. The graph has **bubble** structures at every position where the haplotypes
-differ. Multi-allele extraction recovers per-allele consensuses by partitioning reads into
-haplotype groups before running per-group consensus extraction.
+differ. `consensus_multi` recovers per-allele consensuses by partitioning the reads into
+haplotype groups and rebuilding a separate consensus for each group.
 
-## Bubble detection
+The pipeline is a hybrid of two signals:
 
-A node is **heterozygous** if it has two or more outgoing edges where each target edge
-weight satisfies:
+1. **Structural proposal**: length-changing bubbles propose an initial split.
+2. **Linkage refinement**: each proposed group is searched for further splits using
+   differences that co-occur on the same reads.
+3. **Confirm and merge**: every pair of resulting groups must pass a distinctness test,
+   or the two are merged.
+4. **Per-allele rebuild**: each surviving group gets its own graph and consensus.
 
-```
-edge_weight >= ceil(n_reads * min_allele_freq)
-```
+## Read-support thresholds
 
-`min_allele_freq` defaults to 0.2. With 20 reads, an arm must have at least 4 reads to
-qualify. Arms below the threshold are treated as noise.
+Two floors are used, both derived from `min_allele_freq` (default 0.2) and the read count
+`n`:
 
-## Structural vs SNP bubbles
+| Floor | Formula | Used for |
+|---|---|---|
+| Bubble arm floor | `max(ceil(n * min_allele_freq), 1)` | finding structural and SNP bubbles for the proposal |
+| Phasing floor | `max(ceil(n * min_allele_freq), 2)` | het sites in linkage phasing, and the minimum size of a called allele |
 
-**Structural bubbles** are bubbles where at least one arm spans `phasing_bubble_min_span`
-bases (default 10). A CAG×20 vs CAG×30 allele difference creates a 30-node arm (30 × 3 =
-90 bp) that easily clears this threshold. An ONT substitution error at one position creates
-a 1-node arm that does not.
+With 20 reads both are 4: an arm or allele needs at least 4 reads. Arms below the floor
+are treated as noise. Bubble counting only uses *matched* adjacencies, so the edge a short
+allele takes to bypass a longer allele's extra sequence does not look like a competing arm.
+(The `GraphStats` / `bubble_sites` reporting on a single consensus uses the same
+`max(ceil(n * min_allele_freq), 1)` floor.)
 
-**SNP bubbles** are single-node forks caused by substitution errors or true SNPs.
+`min_allele_freq` is a hard sensitivity boundary: an allele below it is merged into the
+majority and does not appear in the output. Lower it to look for mosaics; raise it (~0.4)
+on noisy ONT data.
 
-The phasing strategy uses structural bubbles preferentially because they are far less likely
-to be noise. SNP bubble phasing is a fallback when no structural bubble is found.
+## 1. Structural proposal
 
-## Structural phasing (propose, then linkage-confirm)
+A **structural bubble** is one where at least one arm spans `phasing_bubble_min_span`
+bases (default 10). A CAG×20 vs CAG×30 difference creates a 30-base arm that easily
+clears this; a sequencing error creates a 1-node arm that does not.
 
-Phasing is a **propose-then-confirm** pipeline, so a noisy bubble cannot on its own
-manufacture an allele:
+- If structural bubbles exist, reads are clustered by the arms they take across all of
+  them, with length used to place ambiguous reads. Clusters smaller than `min_reads` are
+  merged into the largest cluster. When there are two or more structural bubbles, a
+  validation pass also keeps a cluster only if it is length-separated from, and cleanly
+  distinguished by a bubble from, every other cluster.
+- If none are found on the banded graph, the graph is rebuilt **unbanded** and the search
+  repeated once.
+- If there is still no structural bubble, the single SNP-scale bubble with the most
+  balanced support (largest minority arm) splits the reads by arm.
+- With no qualifying bubble at all, the proposal is one group containing every read.
 
-1. **Propose.** Structural bubbles (those with at least one arm ≥ `phasing_bubble_min_span`
-   bases) split the reads into candidate groups by which arm each read traversed. Structural
-   bubbles are preferred because a length-changing variant is far less likely to be noise
-   than a single-column SNP bubble.
-2. **Confirm by linkage.** A candidate split is trusted only if the two groups are genuinely
-   distinct: either **length-separated** by a real gap (median length difference ≥ a
-   repeat-unit-scale floor, robust to stutter), or **linkage-consistent** — the reads take
-   consistent sides across the het site(s) and the two per-group consensuses actually differ.
-   A real allele is a set of differences that *co-occur on the same reads*; independent
-   sequencing error does not.
-3. **Frequency floor.** A candidate group holding fewer reads than `min_allele_freq` of the
-   whole locus is not called as a distinct allele. This rejects the classic over-split where
-   a small stutter or partial-read cluster lands at an intermediate length in the *valley*
-   between two real alleles. (Lower `min_allele_freq` to call true low-frequency mosaics.)
+The proposal is only a starting point: steps 2 and 3 can split it further or undo it.
 
-This separates real CAG-length variants from error-induced SNP bubbles (the error bubbles are
-single-column and below the structural span threshold) and from stutter sub-clusters of a
-single allele (rejected by the frequency floor and the length/linkage confirmation).
+## 2. Linkage refinement
 
-## SNP fallback
+Each proposed group with at least `2 × min_reads` reads is rebuilt as its own graph and
+searched for a split:
 
-If no structural bubble exists after the initial banded graph build, `consensus_multi`
-rebuilds the graph **unbanded** and tries again. The banded aligner with w ≈ 13 cannot
-handle a 90 bp diagonal drift (e.g. CAG×20 vs CAG×50 = 90 bp length difference); unbanded
-creates the correct Insert-arm bubble, enabling structural phasing to succeed.
+- **Het-site matrix.** A het site is a fork with at least two branches each carrying the
+  phasing floor. Node fusion makes substitutions forks too, so SNPs, indels and length
+  differences are all captured. Each read's call at a site is the branch its path takes.
+  Paths here include the delete-bypass edges, because a shorter allele's divergence *is*
+  the bypass.
+- **Dominant bipartition.** A lightweight iterative two-way clustering finds the read
+  partition most consistent across all sites. A real allele is a set of differences that
+  co-occur on the same reads; independent sequencing errors do not line up this way.
+- The split is kept only if both sides have at least `min_reads` reads and the two sides
+  pass the distinctness test below. Accepted halves are refined again, up to three levels
+  deep, so more than two alleles can be found.
 
-If the unbanded graph still has no structural bubble, the single strongest SNP bubble
-(the one with the most-balanced arm support) is used to partition reads.
+Linkage refinement finds splits the structural step misses (for example a folded periodic
+repeat diploid where no long arm surfaces, or a third allele hiding inside a structural
+group).
 
-If there is no bubble at all, `consensus_multi` returns the single-allele consensus.
+## 3. Confirm and merge
 
-## Per-allele consensus
+Any two groups that are not **distinct** are merged, and the check repeats until every
+remaining pair is distinct. Two groups are distinct only if:
 
-After partitioning, each group builds its own sub-graph with only that group's reads and
-extracts an independent heaviest-path consensus. The sub-graph uses `min_cov` computed from
-the **per-group** read count, not the total. With 20 reads split 10/10, `min_cov` is based
-on 10, not 20.
+- **Frequency floor**: the smaller group has at least the phasing floor computed over the
+  whole locus. This rejects a small stutter or partial-read cluster whose length falls in
+  the valley between two real alleles.
+- and then **either** a length split:
+  - the median read lengths differ by at least 8 bp **and** by at least 3 × the larger
+    median absolute deviation (at least 3 bp), **and**
+  - the median gap is at least **12 bp**;
+- **or** a substitution split (same length, length gives no signal):
+  - the two per-group consensuses differ in length by at most 2 bp and differ by at least
+    one edit;
+  - on a pooled graph of both groups, there is at least one informative het site and the
+    partition's consistency is at least **0.85** (a clean haplotype split is near 1.0;
+    error sub-clusters of one allele are around 0.7).
 
-`read_indices` in each returned `Consensus` records which original read indices contributed
-to that allele, allowing the caller to assign per-read metadata (TSV rows, per-read lanes,
-statistics) to the correct haplotype.
+## 4. Per-allele consensus
+
+Each final group is rebuilt from scratch: its own median-length seed, its own graph, and
+the **heaviest-path** consensus with boundary trim. The coverage floor is computed from the
+**group's** read count, not the total: with 20 reads split 10/10 the floor is 6, not 11.
+
+Two behaviours differ from single-allele `consensus()`:
+
+- `consensus_mode` is ignored: per-allele calls are always heaviest path, never best fit
+  or majority frequency.
+- Homopolymer handling is switched off for multi-allele calls.
+
+`read_indices` in each returned `Consensus` lists (sorted) the input read indices assigned
+to that allele, so callers can attach per-read metadata to the correct haplotype. When only
+one group survives, a single consensus is returned with `read_indices` set to all
+non-empty reads.
 
 ## Depth requirements
 
-With `min_reads = 3` (the default), `consensus_multi` requires at least 3 reads **per
-allele**. If a group falls below this after phasing, it is merged into the largest group and
-the result is effectively single-allele.
+`consensus_multi` returns `Err(InsufficientDepth)` if fewer than `min_reads` (default 3)
+non-empty reads are given. Groups below `min_reads` are not normally produced (the
+proposal merges them away and linkage refinement will not create them); if one ever
+reaches the rebuild step, the call returns `Err(InsufficientDepth)` for that group rather
+than a low-depth allele.
 
 For reliable two-allele calls, a minimum per-allele depth of 5-10 is recommended. At
-depth 3, a single error read equals 33% frequency and can influence the minority-arm
-detection.
+depth 3, a single error read equals 33% frequency.
 
 ## Example: two-allele SNV bubble graph
 
@@ -102,9 +137,9 @@ through the bubble and which nodes it shares with allele A:
 ## Example: repeat expansion alleles
 
 For repeat loci, alleles differ in the number of repeat units rather than a single base.
-Each allele is processed separately by `consensus_multi` after phasing. The two graphs
-below compare normal and pathogenic CAG alleles (modelled at reduced scale for clarity;
-real HTT expansions reach 36+ units for disease onset).
+Each allele is rebuilt separately after phasing. The two graphs below compare normal and
+pathogenic CAG alleles (modelled at reduced scale for clarity; real HTT expansions reach
+36+ units for disease onset).
 
 **Normal allele: (CAG)×4 = 12 bp**
 
@@ -125,22 +160,40 @@ Disease range is >66 units; scaled to 4 vs 8 units here.
 
 ![GAA expanded allele: 24-node linear chain](../diagrams/poa_gaa_expanded.svg)
 
-## Example: unphased RFC1-style mixed read set
+Note that at this toy scale the length difference (9-12 bp) is at or below the 12 bp
+length-split floor; real expansions differ by tens of bases or more.
+
+## Example: RFC1-style mixed read set
 
 The CANVAS locus (RFC1 intron 2) is a 5-mer repeat where the normal allele is (AAAAG)×N
-and the most common pathogenic allele is (AAAGT)×N. The two motifs are 2 substitutions
-apart per 5-mer -- not a length difference -- so the aligner prefers mismatches over
-Insert/Delete pairs. The two motifs do not create bubble arms within the shared repeat
-region. However, if the pathogenic allele is also expanded (more repeat units), the extra
-units create Insert arm nodes that extend the spine.
+and a common pathogenic allele is (AAAGT)×N. The two motifs are 2 substitutions apart per
+5-mer, so within the shared region the aligner places mismatches (fused sibling nodes)
+rather than indels. The extra units of an expanded pathogenic allele extend past the end
+of the shorter reads.
 
 The graph below was built from 15 reads of (AAAAG)×4 (75%, normal) and 5 reads of
-(AAAGT)×6 (25%, pathogenic minority). The first 20 nodes come from the shared 4-unit region;
-the last 10 nodes are the 2 extra AAAGT units that only the pathogenic reads carry. Node
-sizes reflect coverage: the first 20 nodes are larger (depth 20) while the last 10 are
-smaller (depth 5, below min_cov = 10). The heaviest path extends through the expansion
-because each extra edge adds to the cumulative score. A single call to `consensus()` would
-return the expanded allele length; `consensus_multi` with structural phasing is required to
-recover both allele lengths correctly.
+(AAAGT)×6 (25%, pathogenic minority). The first 20 positions are shared by all reads; the
+last 10 come only from the 5 pathogenic reads.
 
 ![RFC1 mixed allele graph: 20 full-depth nodes then 10 low-coverage expansion nodes](../diagrams/poa_rfc1_mixed.svg)
+
+What the current engine returns for this read set (default configuration):
+
+- `consensus()` returns the 20 bp normal allele `(AAAAG)×4`. The 10-base tail has coverage
+  5, below the strict-majority floor of 11, so boundary trim removes it. Four bubble sites
+  (15 vs 5 reads) are reported at the motif substitutions.
+- `consensus_multi()` also returns a **single** allele. The minority group (5 reads) clears
+  the phasing floor of 4, but the median length gap is 10 bp, below the 12 bp length-split
+  floor, and the two groups' consensuses differ in length by more than 2 bp, so the
+  substitution test does not apply either. The groups are merged.
+
+At realistic scale (tens of extra units) the length gap clears the floor and the alleles
+split. For short or motif-only differences like this toy case, inspect `bubble_sites` and
+use flank anchoring (`consensus_multi_flanked`) where possible.
+
+## Known limitation
+
+Periodic-repeat phase ambiguity pollutes the het-site matrix, so SNP haplotypes on
+repeats, close repeat-count alleles and skewed minority alleles remain hard. Flank-anchored
+preprocessing is the intended fix; see
+[Flanking-Anchor Preprocessing](../library/flanking-anchor.md).

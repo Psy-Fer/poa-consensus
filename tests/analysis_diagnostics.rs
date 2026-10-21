@@ -78,6 +78,7 @@ fn clean_consensus(seq: &[u8], n_reads: usize) -> Consensus {
         gaps: vec![],
         bubble_sites: vec![],
         read_indices: vec![],
+        support_quality: vec![33; len],
     }
 }
 
